@@ -4,7 +4,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Button, Input, Label
 
-from api.client import ChatAPIError, OpenAIClient
+from api.client import ChatAPIError, ChatAPIClient
 from config import Settings
 from state.session_manager import SessionManager
 from ui.screens import ChatScreen, SettingsScreen
@@ -25,9 +25,9 @@ class ChatTUI(App[None]):
         super().__init__()
         self.settings = Settings.load()
         self.sessions = SessionManager(self.settings.sessions_path, self.settings.default_model)
-        self.client: OpenAIClient | None = None
+        self.client: ChatAPIClient | None = None
         if self.settings.has_api_key:
-            self.client = OpenAIClient(self.settings.openai_api_key, self.settings.openai_base_url)
+            self.client = ChatAPIClient(self.settings.gemini_api_key, self.settings.gemini_base_url)
         self.streaming_bubble: MessageBubble | None = None
 
     def compose(self) -> ComposeResult:
@@ -36,7 +36,7 @@ class ChatTUI(App[None]):
     def on_mount(self) -> None:
         self.refresh_view()
         if not self.settings.has_api_key:
-            self.notify("OPENAI_API_KEY is not configured. Add it to .env or your environment.", severity="warning", timeout=8)
+            self.notify("GEMINI_API_KEY is not configured. Add it to your settings.", severity="warning", timeout=8)
 
     def refresh_view(self) -> None:
         screen = self.query_one(ChatScreen)
@@ -65,11 +65,11 @@ class ChatTUI(App[None]):
             self.sessions.current.model = result["model"].strip() or self.settings.default_model
             self.sessions.current.system_prompt = result["system"].strip() or "You are a helpful assistant."
             if result["api_key"].strip():
-                self.settings.openai_api_key = result["api_key"].strip()
+                self.settings.gemini_api_key = result["api_key"].strip()
             if result["base_url"].strip():
-                self.settings.openai_base_url = result["base_url"].strip()
+                self.settings.gemini_base_url = result["base_url"].strip()
             if self.settings.has_api_key:
-                self.client = OpenAIClient(self.settings.openai_api_key, self.settings.openai_base_url)
+                self.client = ChatAPIClient(self.settings.gemini_api_key, self.settings.gemini_base_url)
             self.sessions.save()
             self.notify(f"Using {self.sessions.current.model}", severity="information")
 
@@ -116,7 +116,7 @@ class ChatTUI(App[None]):
 
     def send_message(self, value: str) -> None:
         if self.client is None:
-            self.notify("Configure OPENAI_API_KEY before sending messages.", severity="error")
+            self.notify("Configure GEMINI_API_KEY before sending messages.", severity="error")
             return
         self.sessions.add_message("user", value)
         self.query_one(ChatScreen).add_message("user", value)
@@ -134,7 +134,7 @@ class ChatTUI(App[None]):
                 response += token
                 if self.streaming_bubble:
                     self.streaming_bubble.update_content(response)
-                    await self.query_one("#conversation").scroll_end(animate=False)
+                    self.query_one("#conversation").scroll_end(animate=False)
             self.sessions.add_message("assistant", response)
             self.query_one("#status-line", Label).update("")
         except ChatAPIError as exc:

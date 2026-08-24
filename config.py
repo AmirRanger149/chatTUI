@@ -9,9 +9,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    openai_api_key: str | None = Field(default=None, validation_alias="OPENAI_API_KEY")
-    openai_base_url: str | None = Field(default=None, validation_alias="OPENAI_BASE_URL")
-    default_model: str = Field(default="gpt-4o-mini", validation_alias="OPENAI_MODEL")
+    gemini_api_key: str | None = Field(default=None, validation_alias="GEMINI_API_KEY")
+    gemini_base_url: str | None = Field(default=None, validation_alias="GEMINI_BASE_URL")
+    default_model: str = Field(default="gemini-3.5-flash", validation_alias="GEMINI_MODEL")
     sessions_path: Path = Path.home() / ".chat-tui" / "sessions.json"
     temperature: float = 0.7
 
@@ -35,7 +35,11 @@ class Settings(BaseSettings):
 
     @property
     def has_api_key(self) -> bool:
-        return bool(self.openai_api_key)
+        return bool(self.active_api_key)
+
+    @property
+    def active_api_key(self) -> str | None:
+        return self.gemini_api_key
 
     @classmethod
     def from_json(cls, path: Path) -> Settings:
@@ -50,11 +54,11 @@ class Settings(BaseSettings):
         if not isinstance(raw, dict):
             raise ValueError("The JSON root must be an object")
         values = dict(raw)
-        if "api_key" in values and "openai_api_key" not in values:
-            values["openai_api_key"] = values.pop("api_key")
-        if "base_url" in values and "openai_base_url" not in values:
-            values["openai_base_url"] = values.pop("base_url")
+        if "api_key" in values and "gemini_api_key" not in values:
+            values["gemini_api_key"] = values.pop("api_key")
+        if "base_url" in values and "gemini_base_url" not in values:
+            values["gemini_base_url"] = values.pop("base_url")
         if "model" in values and "default_model" not in values:
             values["default_model"] = values.pop("model")
-        allowed = {"openai_api_key", "openai_base_url", "default_model", "temperature", "sessions_path", "system_prompt"}
+        allowed = {"gemini_api_key", "gemini_base_url", "default_model", "temperature", "sessions_path", "system_prompt"}
         return cls(**{key: value for key, value in values.items() if key in allowed})

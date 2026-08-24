@@ -1,0 +1,3 @@
+httpx>=0.27.0
+pydantic-settings>=2.4.0
+textual>=0.70.0

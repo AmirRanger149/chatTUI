@@ -25,9 +25,9 @@ class ChatInput(TextArea):
 
 
 class ModelPicker(Select[str]):
-    def __init__(self, value: str = "gpt-4o-mini") -> None:
+    def __init__(self, value: str = "gemini-3.5-flash") -> None:
         super().__init__(
-            [(model, model) for model in ("gpt-4o-mini", "gpt-4o", "o3-mini")],
+            [(model, model) for model in ("gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash")],
             value=value,
             id="model-picker",
         )
@@ -43,9 +43,14 @@ class MessageBubble(Vertical):
         yield Label("YOU" if self.role == "user" else "ASSISTANT", classes="message-label")
         yield Markdown(self.content or "", id="message-content")
 
+    def on_mount(self) -> None:
+        self.query_one("#message-content", Markdown).update(self.content or " ")
+
     def update_content(self, content: str) -> None:
         self.content = content
-        self.query_one("#message-content", Markdown).update(content or " " )
+        markdown = self.query("#message-content")
+        if markdown:
+            markdown.first().update(content or " ")
 
 
 class SessionItem(ListItem):

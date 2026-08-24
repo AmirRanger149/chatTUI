@@ -23,7 +23,7 @@ class SettingsScreen(ModalScreen[None]):
             yield Label("Model")
             yield Input(value=self.model, id="settings-model")
             yield Label("API file (.json or plain text)")
-            yield Input(placeholder="/path/to/openai.json or key.txt", id="settings-api-file")
+            yield Input(placeholder="/path/to/gemini.json or key.txt", id="settings-api-file")
             yield Button("Import API", id="settings-import-api")
             yield Label("API key (or paste it directly)")
             yield Input(value="", password=True, placeholder="Imported key is kept in memory", id="settings-api-key")
@@ -40,8 +40,10 @@ class SettingsScreen(ModalScreen[None]):
             path = self.query_one("#settings-api-file", Input).value.strip()
             try:
                 imported = Settings.from_json(Path(path).expanduser())
-                self.query_one("#settings-api-key", Input).value = imported.openai_api_key or ""
-                self.query_one("#settings-base-url", Input).value = imported.openai_base_url or ""
+                self.query_one("#settings-api-key", Input).value = imported.active_api_key or ""
+                self.query_one("#settings-base-url", Input).value = (
+                    imported.gemini_base_url
+                ) or ""
                 if imported.default_model:
                     self.query_one("#settings-model", Input).value = imported.default_model
                 self.notify("API settings imported", severity="information")
@@ -70,7 +72,7 @@ class ChatScreen(Container):
                 yield VerticalScroll(id="conversation")
                 yield Label("", id="status-line")
                 with Horizontal(id="composer"):
-                    yield ChatInput("", placeholder="Message ChatGPT...", id="chat-input")
+                    yield ChatInput("", placeholder="Message Gemini...", id="chat-input")
                     yield Button("Send", id="send-message", variant="primary")
         yield Footer()
 
