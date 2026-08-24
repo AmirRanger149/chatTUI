@@ -77,6 +77,8 @@ Button {
 #conversation {
     height: 1fr;
     padding: 2 0;
+    overflow-y: scroll;
+    scrollbar-size-vertical: 1;
 }
 
 .message {

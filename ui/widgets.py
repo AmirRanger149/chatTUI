@@ -41,7 +41,9 @@ class MessageBubble(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Label("YOU" if self.role == "user" else "ASSISTANT", classes="message-label")
-        yield Markdown(self.content or "", id="message-content")
+        markdown = Markdown(self.content or "", id="message-content")
+        markdown.disabled = True
+        yield markdown
 
     def on_mount(self) -> None:
         self.query_one("#message-content", Markdown).update(self.content or " ")
