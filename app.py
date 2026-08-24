@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Input, Label
+from textual.widgets import Button, Input, Label
 
 from api.client import ChatAPIError, OpenAIClient
 from config import Settings
@@ -60,13 +60,28 @@ class ChatTUI(App[None]):
         session = self.sessions.current
         self.push_screen(SettingsScreen(session.model, session.system_prompt), self.apply_settings)
 
-    def apply_settings(self, result: tuple[str, str] | None) -> None:
+    def apply_settings(self, result: dict[str, str] | None) -> None:
         if result:
-            model, system_prompt = result
-            self.sessions.current.model = model.strip() or self.settings.default_model
-            self.sessions.current.system_prompt = system_prompt.strip() or "You are a helpful assistant."
+            self.sessions.current.model = result["model"].strip() or self.settings.default_model
+            self.sessions.current.system_prompt = result["system"].strip() or "You are a helpful assistant."
+            if result["api_key"].strip():
+                self.settings.openai_api_key = result["api_key"].strip()
+            if result["base_url"].strip():
+                self.settings.openai_base_url = result["base_url"].strip()
+            if self.settings.has_api_key:
+                self.client = OpenAIClient(self.settings.openai_api_key, self.settings.openai_base_url)
             self.sessions.save()
             self.notify(f"Using {self.sessions.current.model}", severity="information")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "open-settings":
+            self.action_settings()
+        elif event.button.id == "send-message":
+            input_widget = self.query_one("#chat-input", ChatInput)
+            value = input_widget.text.strip()
+            if value:
+                input_widget.clear()
+                self.handle_input(value)
 
     def on_sidebar_new_requested(self, event: Sidebar.NewRequested) -> None:
         self.action_new_session()

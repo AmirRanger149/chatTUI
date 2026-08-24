@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from textual.app import ComposeResult
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Header, Input, Label, Markdown, Select
+from textual.widgets import Button, Footer, Header, Input, Label, Markdown
 
+from config import Settings
 from ui.widgets import ChatInput, MessageBubble, Sidebar
 
 
@@ -19,6 +22,13 @@ class SettingsScreen(ModalScreen[None]):
             yield Label("Session settings", id="settings-title")
             yield Label("Model")
             yield Input(value=self.model, id="settings-model")
+            yield Label("API file (.json or plain text)")
+            yield Input(placeholder="/path/to/openai.json or key.txt", id="settings-api-file")
+            yield Button("Import API", id="settings-import-api")
+            yield Label("API key (or paste it directly)")
+            yield Input(value="", password=True, placeholder="Imported key is kept in memory", id="settings-api-key")
+            yield Label("Base URL (optional)")
+            yield Input(value="", id="settings-base-url")
             yield Label("System prompt")
             yield Input(value=self.system_prompt, id="settings-system")
             with Horizontal(classes="modal-actions"):
@@ -26,8 +36,24 @@ class SettingsScreen(ModalScreen[None]):
                 yield Button("Apply", id="settings-apply", variant="primary")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "settings-apply":
-            self.dismiss((self.query_one("#settings-model", Input).value, self.query_one("#settings-system", Input).value))
+        if event.button.id == "settings-import-api":
+            path = self.query_one("#settings-api-file", Input).value.strip()
+            try:
+                imported = Settings.from_json(Path(path).expanduser())
+                self.query_one("#settings-api-key", Input).value = imported.openai_api_key or ""
+                self.query_one("#settings-base-url", Input).value = imported.openai_base_url or ""
+                if imported.default_model:
+                    self.query_one("#settings-model", Input).value = imported.default_model
+                self.notify("API settings imported", severity="information")
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                self.notify(f"Could not import API JSON: {exc}", severity="error")
+        elif event.button.id == "settings-apply":
+            self.dismiss({
+                "model": self.query_one("#settings-model", Input).value,
+                "system": self.query_one("#settings-system", Input).value,
+                "api_key": self.query_one("#settings-api-key", Input).value,
+                "base_url": self.query_one("#settings-base-url", Input).value,
+            })
         elif event.button.id == "settings-cancel":
             self.dismiss(None)
 
@@ -43,7 +69,9 @@ class ChatScreen(Container):
                     yield Button("Settings", id="open-settings")
                 yield VerticalScroll(id="conversation")
                 yield Label("", id="status-line")
-                yield ChatInput("", placeholder="Message ChatGPT...", id="chat-input")
+                with Horizontal(id="composer"):
+                    yield ChatInput("", placeholder="Message ChatGPT...", id="chat-input")
+                    yield Button("Send", id="send-message", variant="primary")
         yield Footer()
 
     def render_messages(self, messages: list[tuple[str, str]]) -> None:

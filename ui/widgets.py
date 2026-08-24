@@ -12,8 +12,8 @@ class ChatInput(TextArea):
             super().__init__()
             self.value = value
 
-    def _on_key(self, event: TextArea.Key) -> None:
-        if event.key == "ctrl+enter":
+    async def _on_key(self, event: TextArea.Key) -> None:
+        if event.key in ("enter", "ctrl+enter"):
             event.prevent_default()
             event.stop()
             value = self.text.strip()
@@ -21,7 +21,7 @@ class ChatInput(TextArea):
                 self.post_message(self.Submitted(value))
                 self.clear()
         else:
-            super()._on_key(event)
+            await super()._on_key(event)
 
 
 class ModelPicker(Select[str]):

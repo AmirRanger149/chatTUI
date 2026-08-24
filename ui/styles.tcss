@@ -112,9 +112,21 @@ Button {
 
 #chat-input {
     height: 5;
+    width: 1fr;
     margin: 1 0 2 0;
     border: tall #385453;
     background: #182022;
+}
+
+#composer {
+    height: 7;
+    align: left middle;
+}
+
+#send-message {
+    height: 5;
+    min-width: 12;
+    margin: 1 0 2 1;
 }
 
 #settings-dialog {
@@ -123,7 +135,7 @@ Button {
     padding: 2 3;
     background: #1c2728;
     border: round #62c8b8;
-    margin: 8 0;
+    margin: 0 0;
 }
 
 #settings-title {
@@ -133,7 +145,7 @@ Button {
 }
 
 #settings-dialog Input {
-    margin: 1 0 2 0;
+    margin: 0 0 1 0;
 }
 
 .modal-actions {
