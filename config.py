@@ -31,7 +31,23 @@ class Settings(BaseSettings):
                 values = json.loads(config_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 values = {}
+        if not values:
+            for candidate in (Path.cwd() / "gemini.json", Path(__file__).resolve().parent / "gemini.json"):
+                if candidate.is_file():
+                    try:
+                        discovered = cls.from_json(candidate)
+                        discovered.save(config_path)
+                        return discovered
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        continue
         return cls(**values)
+
+    def save(self, path: Path | None = None) -> None:
+        config_path = path or Path.home() / ".chat-tui" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        values = self.model_dump(exclude_none=True)
+        values["sessions_path"] = str(self.sessions_path)
+        config_path.write_text(json.dumps(values, indent=2), encoding="utf-8")
 
     @property
     def has_api_key(self) -> bool:

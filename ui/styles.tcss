@@ -105,6 +105,23 @@ Button {
     width: 100%;
     background: transparent;
     padding: 0;
+    max-height: 18;
+    overflow-y: hidden;
+}
+
+.message.expanded Markdown {
+    max-height: 9999;
+    overflow-y: auto;
+}
+
+.expand-message {
+    display: none;
+    min-width: 14;
+    width: 14;
+    margin: 1 0 0 0;
+    color: #80d6c7;
+    text-style: bold;
+    padding: 0 1;
 }
 
 #status-line {

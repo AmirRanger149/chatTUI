@@ -86,3 +86,6 @@ class ChatScreen(Container):
         bubble = MessageBubble(role, content)
         self.query_one("#conversation", VerticalScroll).mount(bubble)
         return bubble
+
+    def scroll_to_latest(self) -> None:
+        self.query_one("#conversation", VerticalScroll).scroll_end(animate=False)

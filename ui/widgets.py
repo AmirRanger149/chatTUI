@@ -33,26 +33,58 @@ class ModelPicker(Select[str]):
         )
 
 
+class ExpandControl(Button):
+    def __init__(self, toggle: object) -> None:
+        super().__init__("Show more", id="expand-message", classes="expand-message")
+        self.toggle = toggle
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.toggle()
+
+
 class MessageBubble(Vertical):
     def __init__(self, role: str, content: str = "", **kwargs: object) -> None:
         self.role = role
         super().__init__(classes=f"message {role}", **kwargs)
         self.content = content
+        self.is_expanded = False
 
     def compose(self) -> ComposeResult:
         yield Label("YOU" if self.role == "user" else "ASSISTANT", classes="message-label")
+        yield ExpandControl(self.toggle_expanded)
         markdown = Markdown(self.content or "", id="message-content")
         markdown.disabled = True
         yield markdown
 
     def on_mount(self) -> None:
         self.query_one("#message-content", Markdown).update(self.content or " ")
+        self._update_expand_control()
+
+    def _update_expand_control(self) -> None:
+        button = self.query_one("#expand-message", Button)
+        if self.role != "assistant" or len(self.content) < 1200:
+            button.display = False
+        else:
+            button.display = True
+            button.label = "Show less" if self.is_expanded else "Show more"
+            self.set_class(self.is_expanded, "expanded")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "expand-message":
+            self.toggle_expanded()
+
+    def toggle_expanded(self) -> None:
+        self.is_expanded = not self.is_expanded
+        self._update_expand_control()
 
     def update_content(self, content: str) -> None:
         self.content = content
         markdown = self.query("#message-content")
         if markdown:
             markdown.first().update(content or " ")
+        if self.is_mounted:
+            self._update_expand_control()
 
 
 class SessionItem(ListItem):

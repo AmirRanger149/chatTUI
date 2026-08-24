@@ -70,6 +70,7 @@ class ChatTUI(App[None]):
                 self.settings.gemini_base_url = result["base_url"].strip()
             if self.settings.has_api_key:
                 self.client = ChatAPIClient(self.settings.gemini_api_key, self.settings.gemini_base_url)
+                self.settings.save()
             self.sessions.save()
             self.notify(f"Using {self.sessions.current.model}", severity="information")
 
@@ -82,6 +83,8 @@ class ChatTUI(App[None]):
             if value:
                 input_widget.clear()
                 self.handle_input(value)
+        elif event.button.id == "expand-message" and isinstance(event.button.parent, MessageBubble):
+            event.button.parent.toggle_expanded()
 
     def on_sidebar_new_requested(self, event: Sidebar.NewRequested) -> None:
         self.action_new_session()
@@ -119,8 +122,10 @@ class ChatTUI(App[None]):
             self.notify("Configure GEMINI_API_KEY before sending messages.", severity="error")
             return
         self.sessions.add_message("user", value)
-        self.query_one(ChatScreen).add_message("user", value)
-        self.streaming_bubble = self.query_one(ChatScreen).add_message("assistant")
+        screen = self.query_one(ChatScreen)
+        screen.add_message("user", value)
+        self.streaming_bubble = screen.add_message("assistant")
+        screen.scroll_to_latest()
         self.query_one("#status-line", Label).update("Thinking...")
         self.run_worker(self.stream_response(), exclusive=True, group="chat")
 
@@ -134,7 +139,7 @@ class ChatTUI(App[None]):
                 response += token
                 if self.streaming_bubble:
                     self.streaming_bubble.update_content(response)
-                    self.query_one("#conversation").scroll_end(animate=False)
+                    self.query_one(ChatScreen).scroll_to_latest()
             self.sessions.add_message("assistant", response)
             self.query_one("#status-line", Label).update("")
         except ChatAPIError as exc:
