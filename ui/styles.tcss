@@ -1,0 +1,141 @@
+Screen {
+    background: #101417;
+    color: #dce7e5;
+}
+
+#workspace {
+    height: 1fr;
+}
+
+#sidebar {
+    width: 29;
+    background: #171e21;
+    border-right: solid #2d3a3c;
+    padding: 1 1;
+}
+
+.brand {
+    color: #80d6c7;
+    text-style: bold;
+    padding: 0 1 1 1;
+}
+
+.section-label, .message-label {
+    color: #819694;
+    text-style: bold;
+    padding: 1 1 0 1;
+}
+
+#session-list {
+    height: 1fr;
+    margin: 1 0;
+}
+
+SessionItem {
+    height: 3;
+    padding: 1;
+    color: #a9b9b7;
+}
+
+SessionItem.active {
+    background: #243c3b;
+    color: #a7efe0;
+    border-left: thick #62c8b8;
+}
+
+Button {
+    margin: 0 0 1 0;
+    min-width: 16;
+}
+
+.shortcuts {
+    color: #687b7a;
+    padding: 1;
+}
+
+#chat-column {
+    width: 1fr;
+    padding: 0 3;
+}
+
+#chat-heading {
+    height: 4;
+    align: left middle;
+    border-bottom: solid #2d3a3c;
+}
+
+#session-title {
+    width: 1fr;
+    color: #f0faf7;
+    text-style: bold;
+}
+
+#open-settings {
+    min-width: 12;
+}
+
+#conversation {
+    height: 1fr;
+    padding: 2 0;
+}
+
+.message {
+    width: 100%;
+    padding: 1 2;
+    margin: 0 0 1 0;
+}
+
+.message.user {
+    background: #192a2b;
+    border-left: thick #62c8b8;
+}
+
+.message.assistant {
+    background: #151a1c;
+    border-left: thick #4f6665;
+}
+
+.message-label {
+    padding: 0 0 1 0;
+}
+
+.message Markdown {
+    width: 100%;
+    background: transparent;
+    padding: 0;
+}
+
+#status-line {
+    height: 1;
+    color: #f2bd74;
+}
+
+#chat-input {
+    height: 5;
+    margin: 1 0 2 0;
+    border: tall #385453;
+    background: #182022;
+}
+
+#settings-dialog {
+    width: 60;
+    height: auto;
+    padding: 2 3;
+    background: #1c2728;
+    border: round #62c8b8;
+    margin: 8 0;
+}
+
+#settings-title {
+    color: #a7efe0;
+    text-style: bold;
+    padding-bottom: 2;
+}
+
+#settings-dialog Input {
+    margin: 1 0 2 0;
+}
+
+.modal-actions {
+    align: right middle;
+}
