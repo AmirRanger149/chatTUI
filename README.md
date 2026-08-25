@@ -1,48 +1,75 @@
 # chatTUI
 
-A fast, keyboard-first terminal chat client written in Rust. It uses
-`ratatui`, `crossterm`, `tokio`, and `reqwest` to stream Gemini-compatible
-responses without blocking the terminal.
+`chatTUI` is a small, fast terminal chat client for Google Gemini. It is built
+in Rust and designed for people who prefer a focused keyboard workflow over a
+browser window.
 
-## Features
+The app uses `ratatui` for the interface, `crossterm` for terminal input,
+`tokio` for asynchronous work, and `reqwest` for native Gemini SSE streaming.
 
+## What You Get
+
+- Live responses as Gemini generates them
 - Vim-style `NORMAL` and `INSERT` modes
-- Live asynchronous SSE streaming
-- Scrollable chat history
-- Local JSON conversation persistence
-- History drawer and session switching
-- Configurable Gemini model, endpoint, and temperature
-- Markdown-friendly response rendering
-- No OpenAI SDK or Python runtime required
+- Scrollable conversation view
+- Local conversation history saved as JSON
+- History drawer for returning to previous chats
+- Configurable Gemini model, temperature, and API endpoint
+- Markdown-friendly response output
+- A single native Rust binary with no Python or OpenAI SDK dependency
 
-## Requirements
+## Before You Start
 
-- Rust stable toolchain
-- A Gemini API key
+You need:
 
-## Install And Run
+- Rust and Cargo from [rustup.rs](https://rustup.rs/)
+- A Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey)
+
+Check your Rust installation:
 
 ```bash
-cargo run --release
+rustc --version
+cargo --version
 ```
 
-Set the API key before launching:
+## Install
+
+Clone the repository and enter the project directory:
+
+```bash
+git clone https://github.com/AmirRanger149/chatTUI.git
+cd chatTUI
+```
+
+Build the optimized release binary:
+
+```bash
+cargo build --release
+```
+
+Or run directly while developing:
+
+```bash
+cargo run
+```
+
+## Configure Your Gemini Key
+
+### Environment variable
+
+This is the quickest option:
 
 ```bash
 export GEMINI_API_KEY="AIza-your-key"
 cargo run --release
 ```
 
-The binary can be built with:
+You can put the export in your shell profile if you use the app regularly.
 
-```bash
-cargo build --release
-```
+### Configuration file
 
-## Configuration
-
-Configuration is stored in the platform config directory under
-`chat-tui/config.json`. The default values are:
+The app reads a JSON file from the platform configuration directory. Its
+contents can look like this:
 
 ```json
 {
@@ -53,7 +80,17 @@ Configuration is stored in the platform config directory under
 }
 ```
 
-Environment variables override the key settings:
+The exact location is managed by the Rust `directories` crate. On Linux it is
+normally:
+
+```text
+~/.config/chatTUI/chat-tui/config.json
+```
+
+The API key is kept in the file so you do not need to enter it each time. Keep
+this file private and never commit it.
+
+Environment variables take priority for the key-related values:
 
 ```text
 GEMINI_API_KEY
@@ -61,36 +98,97 @@ GEMINI_BASE_URL
 GEMINI_MODEL
 ```
 
-Conversation history is stored in the platform data directory under
-`chat-tui/sessions.json`.
+### Gemini JSON file
 
-## Controls
+You can also prepare a separate `gemini.json` and copy its values into the
+configuration file before running the app:
 
-### Normal Mode
+```json
+{
+  "api_key": "AIza-your-key",
+  "model": "gemini-3.5-flash"
+}
+```
+
+The Rust version currently loads the platform configuration file directly; it
+does not scan arbitrary project files automatically.
+
+## Using chatTUI
+
+The app starts in `NORMAL` mode. Press `i` to begin writing a prompt.
+
+### Normal mode
 
 | Key | Action |
 | --- | --- |
 | `i` | Enter Insert mode |
-| `j` / `Down` | Scroll down |
-| `k` / `Up` | Scroll up |
-| `h` | Toggle history drawer |
-| `n` | Start a new chat |
-| `?` | Show help |
+| `j` or `Down` | Scroll down |
+| `k` or `Up` | Scroll up |
+| `h` | Toggle the history drawer |
+| `n` | Start a new conversation |
+| `?` | Show a help hint |
 | `q` | Quit |
 
-### Insert Mode
+### Insert mode
 
 | Key | Action |
 | --- | --- |
-| Any character | Add to prompt |
-| `Enter` | Send prompt |
-| `Backspace` | Delete a character |
+| Any character | Add it to the prompt |
+| `Enter` | Submit the prompt |
+| `Backspace` | Delete the previous character |
 | `Esc` | Return to Normal mode |
 
-## API Compatibility
+## Models And Endpoints
 
-The client targets Gemini's native streaming endpoint. `base_url` may be
-changed for a compatible Gemini gateway or proxy, but the endpoint must support
-`models/{model}:streamGenerateContent` with SSE responses.
+The default model is `gemini-3.5-flash`. Change it with `GEMINI_MODEL` or the
+`model` value in your config file. The model name must be available to your
+Gemini account.
 
-Keep API keys private. If a key is exposed, revoke it and create a replacement.
+The default endpoint is:
+
+```text
+https://generativelanguage.googleapis.com/v1beta
+```
+
+You may set `GEMINI_BASE_URL` for a compatible gateway or proxy. The endpoint
+must support:
+
+```text
+POST /models/{model}:streamGenerateContent?alt=sse&key={api_key}
+```
+
+## Saved Data
+
+Conversation history is stored in the platform data directory, normally:
+
+```text
+~/.local/share/chatTUI/chat-tui/sessions.json
+```
+
+The history file contains your saved messages. Back it up if you need to keep
+your conversations, and protect it if they contain private information.
+
+## Troubleshooting
+
+**The app says the API key is missing**
+
+Set `GEMINI_API_KEY` or create the JSON configuration file in the location
+above.
+
+**The model is rejected**
+
+Check the spelling and confirm that the model is available to your Gemini API
+account.
+
+**The request fails or times out**
+
+Check your network connection, API quota, endpoint URL, and API key. A proxy
+must support Gemini's streaming response format.
+
+**A key was exposed**
+
+Revoke it immediately in Google AI Studio and create a replacement.
+
+## License
+
+See [LICENSE](LICENSE).
