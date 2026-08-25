@@ -8,7 +8,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, Input, Label, Markdown
 
 from config import Settings
-from ui.widgets import ChatInput, MessageBubble, Sidebar
+from ui.widgets import ChatInput, MessageBubble, Sidebar, WelcomePanel
 
 
 class SettingsScreen(ModalScreen[None]):
@@ -67,24 +67,37 @@ class ChatScreen(Container):
             yield Sidebar(id="sidebar")
             with Vertical(id="chat-column"):
                 with Horizontal(id="chat-heading"):
-                    yield Label("New conversation", id="session-title")
-                    yield Button("Settings", id="open-settings")
+                    with Vertical(id="heading-copy"):
+                        yield Label("New conversation", id="session-title")
+                        yield Label("A private space for your next good idea", id="session-subtitle")
+                    with Horizontal(id="heading-actions"):
+                        yield Label("gemini-3.5-flash", id="model-label")
+                        yield Button("Settings", id="open-settings")
                 yield VerticalScroll(id="conversation")
-                yield Label("", id="status-line")
+                with Horizontal(id="status-row"):
+                    yield Label("Ready when you are", id="status-line")
+                    yield Label("Enter to send  |  Shift+Enter for a new line", id="input-hint")
                 with Horizontal(id="composer"):
-                    yield ChatInput("", placeholder="Message Gemini...", id="chat-input")
+                    yield ChatInput("", placeholder="Write a message to Gemini...", id="chat-input")
                     yield Button("Send", id="send-message", variant="primary")
         yield Footer()
 
     def render_messages(self, messages: list[tuple[str, str]]) -> None:
         conversation = self.query_one("#conversation", VerticalScroll)
         conversation.remove_children()
-        for role, content in messages:
-            conversation.mount(MessageBubble(role, content))
+        if not messages:
+            conversation.mount(WelcomePanel(id="welcome-panel"))
+        else:
+            for role, content in messages:
+                conversation.mount(MessageBubble(role, content))
 
     def add_message(self, role: str, content: str = "") -> MessageBubble:
         bubble = MessageBubble(role, content)
-        self.query_one("#conversation", VerticalScroll).mount(bubble)
+        conversation = self.query_one("#conversation", VerticalScroll)
+        welcome = conversation.query("#welcome-panel")
+        if welcome:
+            welcome.first().remove()
+        conversation.mount(bubble)
         return bubble
 
     def scroll_to_latest(self) -> None:

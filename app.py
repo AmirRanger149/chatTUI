@@ -8,7 +8,7 @@ from api.client import ChatAPIError, ChatAPIClient
 from config import Settings
 from state.session_manager import SessionManager
 from ui.screens import ChatScreen, SettingsScreen
-from ui.widgets import ChatInput, Sidebar, MessageBubble
+from ui.widgets import ChatInput, Sidebar, MessageBubble, WelcomePanel
 
 
 class ChatTUI(App[None]):
@@ -42,6 +42,7 @@ class ChatTUI(App[None]):
         screen = self.query_one(ChatScreen)
         session = self.sessions.current
         screen.query_one("#session-title", Label).update(session.title)
+        screen.query_one("#model-label", Label).update(session.model)
         screen.render_messages([(message.role, message.content) for message in session.messages])
         screen.query_one("#sidebar", Sidebar).refresh_sessions(
             [(item.id, item.title) for item in self.sessions.sessions], session.id
@@ -85,6 +86,11 @@ class ChatTUI(App[None]):
                 self.handle_input(value)
         elif event.button.id == "expand-message" and isinstance(event.button.parent, MessageBubble):
             event.button.parent.toggle_expanded()
+
+    def on_welcome_panel_prompt_selected(self, event: WelcomePanel.PromptSelected) -> None:
+        input_widget = self.query_one("#chat-input", ChatInput)
+        input_widget.text = event.prompt
+        input_widget.focus()
 
     def on_sidebar_new_requested(self, event: Sidebar.NewRequested) -> None:
         self.action_new_session()

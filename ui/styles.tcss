@@ -1,6 +1,6 @@
 Screen {
-    background: #101417;
-    color: #dce7e5;
+    background: #0f1718;
+    color: #dce8e4;
 }
 
 #workspace {
@@ -8,16 +8,16 @@ Screen {
 }
 
 #sidebar {
-    width: 29;
-    background: #171e21;
-    border-right: solid #2d3a3c;
-    padding: 1 1;
+    width: 31;
+    background: #142021;
+    border-right: solid #294042;
+    padding: 2 2;
 }
 
 .brand {
-    color: #80d6c7;
+    color: #8be1cb;
     text-style: bold;
-    padding: 0 1 1 1;
+    padding: 0 1 2 1;
 }
 
 .section-label, .message-label {
@@ -55,13 +55,32 @@ Button {
 
 #chat-column {
     width: 1fr;
-    padding: 0 3;
+    padding: 0 4;
 }
 
 #chat-heading {
-    height: 4;
+    height: 6;
     align: left middle;
-    border-bottom: solid #2d3a3c;
+    border-bottom: solid #294042;
+}
+
+#heading-copy {
+    width: 1fr;
+}
+
+#session-subtitle, #input-hint {
+    color: #75908d;
+}
+
+#heading-actions {
+    align: right middle;
+}
+
+#model-label {
+    color: #8be1cb;
+    background: #1c3533;
+    padding: 0 1;
+    margin-right: 2;
 }
 
 #session-title {
@@ -76,29 +95,78 @@ Button {
 
 #conversation {
     height: 1fr;
-    padding: 2 0;
+    padding: 3 1;
     overflow-y: scroll;
     scrollbar-size-vertical: 1;
 }
 
+#welcome-panel {
+    width: 100%;
+    min-width: 1;
+    margin: 8 0 0 2;
+    padding: 2 3;
+    border-left: thick #73d4bd;
+    background: #152527;
+}
+
+.welcome-kicker {
+    color: #73d4bd;
+    text-style: bold;
+}
+
+.welcome-title {
+    color: #f0faf5;
+    text-style: bold;
+    padding: 1 0;
+}
+
+.welcome-copy {
+    color: #9bb0ad;
+    width: 62;
+    padding-bottom: 2;
+}
+
+.prompt-row {
+    height: auto;
+    layout: horizontal;
+    overflow-x: hidden;
+}
+
+.prompt-row Button {
+    width: 1fr;
+    min-width: 10;
+    margin-right: 1;
+}
+
 .message {
     width: 100%;
-    padding: 1 2;
-    margin: 0 0 1 0;
+    padding: 1 2 2 2;
+    margin: 0 0 2 0;
+    border-left: thick #3c5555;
 }
 
 .message.user {
-    background: #192a2b;
-    border-left: thick #62c8b8;
+    background: #19302e;
+    border-left: thick #73d4bd;
 }
 
 .message.assistant {
-    background: #151a1c;
-    border-left: thick #4f6665;
+    background: #152022;
+    border-left: thick #6f8b88;
+}
+
+.message-meta {
+    height: 2;
+    align: left middle;
 }
 
 .message-label {
-    padding: 0 0 1 0;
+    padding: 0 1 0 0;
+    color: #b7cfca;
+}
+
+.message-state {
+    color: #627d79;
 }
 
 .message Markdown {
@@ -126,15 +194,21 @@ Button {
 
 #status-line {
     height: 1;
-    color: #f2bd74;
+    width: 1fr;
+    color: #8db4aa;
+}
+
+#status-row {
+    height: 2;
+    align: left middle;
 }
 
 #chat-input {
     height: 5;
     width: 1fr;
     margin: 1 0 2 0;
-    border: tall #385453;
-    background: #182022;
+    border: tall #3e6560;
+    background: #142021;
 }
 
 #composer {
@@ -146,6 +220,8 @@ Button {
     height: 5;
     min-width: 12;
     margin: 1 0 2 1;
+    background: #73d4bd;
+    color: #10201f;
 }
 
 #settings-dialog {

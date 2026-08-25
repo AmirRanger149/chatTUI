@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from textual.app import ComposeResult
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.widgets import Button, Label, ListItem, ListView, Markdown, Select, Static, TextArea
 
@@ -43,6 +43,35 @@ class ExpandControl(Button):
         self.toggle()
 
 
+class QuickPrompt(Button):
+    def __init__(self, prompt: str, **kwargs: object) -> None:
+        self.prompt = prompt
+        super().__init__(prompt.split(":", 1)[0], **kwargs)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.post_message(WelcomePanel.PromptSelected(self.prompt))
+
+
+class WelcomePanel(Vertical):
+    class PromptSelected(Message):
+        def __init__(self, prompt: str) -> None:
+            super().__init__()
+            self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        yield Static("A clear space to think", classes="welcome-kicker")
+        yield Label("What would you like to explore?", classes="welcome-title")
+        yield Static(
+            "Ask Gemini to explain an idea, shape a plan, review some code, or help you find the next step.",
+            classes="welcome-copy",
+        )
+        with Horizontal(classes="prompt-row"):
+            yield QuickPrompt("Explain a topic: ", id="prompt-explain")
+            yield QuickPrompt("Help me plan: ", id="prompt-plan")
+            yield QuickPrompt("Review code: ", id="prompt-code")
+
+
 class MessageBubble(Vertical):
     def __init__(self, role: str, content: str = "", **kwargs: object) -> None:
         self.role = role
@@ -51,7 +80,10 @@ class MessageBubble(Vertical):
         self.is_expanded = False
 
     def compose(self) -> ComposeResult:
-        yield Label("YOU" if self.role == "user" else "ASSISTANT", classes="message-label")
+        with Horizontal(classes="message-meta"):
+            yield Label("YOU" if self.role == "user" else "GEMINI", classes="message-label")
+            if self.role == "assistant":
+                yield Static("streaming", classes="message-state")
         yield ExpandControl(self.toggle_expanded)
         markdown = Markdown(self.content or "", id="message-content")
         markdown.disabled = True
