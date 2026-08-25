@@ -3,9 +3,21 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf};
 
+fn default_base_url() -> String {
+    "https://generativelanguage.googleapis.com/v1beta".into()
+}
+
+fn is_default_base_url(value: &String) -> bool {
+    value == "https://generativelanguage.googleapis.com/v1beta"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub api_key: Option<String>,
+    #[serde(
+        default = "default_base_url",
+        skip_serializing_if = "is_default_base_url"
+    )]
     pub base_url: String,
     pub model: String,
     pub temperature: f32,
@@ -15,7 +27,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             api_key: env::var("GEMINI_API_KEY").ok(),
-            base_url: env::var("GEMINI_BASE_URL").unwrap_or_else(|_| "https://generativelanguage.googleapis.com/v1beta".into()),
+            base_url: env::var("GEMINI_BASE_URL").unwrap_or_else(|_| default_base_url()),
             model: env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-3.5-flash".into()),
             temperature: 0.7,
         }
@@ -45,7 +57,9 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         let path = Self::path();
-        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(path, serde_json::to_vec_pretty(self)?)?;
         Ok(())
     }

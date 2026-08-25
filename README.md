@@ -74,7 +74,6 @@ contents can look like this:
 ```json
 {
   "api_key": "AIza-your-key",
-  "base_url": "https://generativelanguage.googleapis.com/v1beta",
   "model": "gemini-3.5-flash",
   "temperature": 0.7
 }
@@ -144,7 +143,8 @@ The default model is `gemini-3.5-flash`. Change it with `GEMINI_MODEL` or the
 `model` value in your config file. The model name must be available to your
 Gemini account.
 
-The default endpoint is:
+The client uses this endpoint internally by default, so it does not need to be
+present in `config.json`:
 
 ```text
 https://generativelanguage.googleapis.com/v1beta

@@ -1,13 +1,17 @@
+mod api;
 mod app;
 mod config;
-mod api;
 mod session;
 mod ui;
 
 use anyhow::Result;
 use app::{Action, App, Mode};
 use config::Config;
-use crossterm::{event::{self, Event, KeyCode, KeyEvent}, execute, terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::{self, stdout};
 use tokio::time::{self, Duration};
@@ -25,7 +29,11 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App, input: &mut String) -> Result<()> {
+async fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    input: &mut String,
+) -> Result<()> {
     let mut tick = time::interval(Duration::from_millis(50));
     loop {
         terminal.draw(|frame| ui::render(frame, app, input))?;
@@ -33,7 +41,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
         app.receive_token().await;
         if event::poll(Duration::from_millis(1))? {
             if let Event::Key(key) = event::read()? {
-                if !handle_key(app, input, key).await? { break; }
+                if !handle_key(app, input, key).await? {
+                    break;
+                }
             }
         }
     }
@@ -43,28 +53,68 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
 async fn handle_key(app: &mut App, input: &mut String, key: KeyEvent) -> Result<bool> {
     match app.mode {
         Mode::Normal => match key.code {
-            KeyCode::Char('i') => { app.dispatch(Action::EnterInsert); Ok(true) }
-            KeyCode::Char('j') | KeyCode::Down => { app.dispatch(Action::ScrollDown); Ok(true) }
-            KeyCode::Char('k') | KeyCode::Up => { app.dispatch(Action::ScrollUp); Ok(true) }
-            KeyCode::Char('h') => { app.dispatch(Action::ToggleHistory); Ok(true) }
-            KeyCode::Char('n') => { app.dispatch(Action::NewChat); Ok(true) }
-            KeyCode::Char('?') => { app.dispatch(Action::Help); Ok(true) }
+            KeyCode::Char('i') => {
+                app.dispatch(Action::EnterInsert);
+                Ok(true)
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.dispatch(Action::ScrollDown);
+                Ok(true)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.dispatch(Action::ScrollUp);
+                Ok(true)
+            }
+            KeyCode::PageDown => {
+                app.dispatch(Action::ScrollDown);
+                Ok(true)
+            }
+            KeyCode::PageUp => {
+                app.dispatch(Action::ScrollUp);
+                Ok(true)
+            }
+            KeyCode::Char('h') => {
+                app.dispatch(Action::ToggleHistory);
+                Ok(true)
+            }
+            KeyCode::Char('n') => {
+                app.dispatch(Action::NewChat);
+                Ok(true)
+            }
+            KeyCode::Char('?') => {
+                app.dispatch(Action::Help);
+                Ok(true)
+            }
             KeyCode::Char('q') => Ok(app.dispatch(Action::Quit)),
-            KeyCode::Char('d') => { app.dispatch(Action::DeleteChat); Ok(true) }
+            KeyCode::Char('d') => {
+                app.dispatch(Action::DeleteChat);
+                Ok(true)
+            }
             _ => Ok(true),
         },
         Mode::Insert => match key.code {
-            KeyCode::Esc => { app.dispatch(Action::EnterNormal); Ok(true) }
+            KeyCode::Esc => {
+                app.dispatch(Action::EnterNormal);
+                Ok(true)
+            }
             KeyCode::Enter => {
                 if !input.trim().is_empty() {
                     let text = std::mem::take(input);
                     app.dispatch(Action::Submit(text));
-                    if let Err(error) = app.start_stream().await { app.error = Some(error.to_string()); }
+                    if let Err(error) = app.start_stream().await {
+                        app.error = Some(error.to_string());
+                    }
                 }
                 Ok(true)
             }
-            KeyCode::Backspace => { input.pop(); Ok(true) }
-            KeyCode::Char(ch) if key.modifiers.is_empty() => { input.push(ch); Ok(true) }
+            KeyCode::Backspace => {
+                input.pop();
+                Ok(true)
+            }
+            KeyCode::Char(ch) if key.modifiers.is_empty() => {
+                input.push(ch);
+                Ok(true)
+            }
             _ => Ok(true),
         },
     }
