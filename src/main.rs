@@ -15,6 +15,7 @@ use tokio::time::{self, Duration};
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::load()?;
+    config.save()?;
     let sessions = session::manager::SessionManager::load()?;
     let mut app = App::new(config, sessions);
     let mut input = String::new();
@@ -48,7 +49,8 @@ async fn handle_key(app: &mut App, input: &mut String, key: KeyEvent) -> Result<
             KeyCode::Char('h') => { app.dispatch(Action::ToggleHistory); Ok(true) }
             KeyCode::Char('n') => { app.dispatch(Action::NewChat); Ok(true) }
             KeyCode::Char('?') => { app.dispatch(Action::Help); Ok(true) }
-            KeyCode::Char('q') => Ok(false),
+            KeyCode::Char('q') => Ok(app.dispatch(Action::Quit)),
+            KeyCode::Char('d') => { app.dispatch(Action::DeleteChat); Ok(true) }
             _ => Ok(true),
         },
         Mode::Insert => match key.code {

@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{self, Receiver};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode { Normal, Insert }
 
-pub enum Action { Quit, EnterInsert, EnterNormal, Submit(String), NewChat, ToggleHistory, ScrollUp, ScrollDown, Help, SelectHistory(usize) }
+pub enum Action { Quit, EnterInsert, EnterNormal, Submit(String), NewChat, DeleteChat, ToggleHistory, ScrollUp, ScrollDown, Help }
 
 pub struct App { pub config: Config, pub sessions: SessionManager, pub mode: Mode, pub show_history: bool, pub scroll: u16, pub streaming: bool, pub error: Option<String>, pub response: String, pub tokens: Option<Receiver<Result<String>>> }
 
@@ -18,11 +18,11 @@ impl App {
             Action::EnterInsert => self.mode = Mode::Insert,
             Action::EnterNormal => self.mode = Mode::Normal,
             Action::NewChat => { self.sessions.new_session(); self.response.clear(); self.error = None; },
+            Action::DeleteChat => { self.sessions.delete_current(); self.response.clear(); self.error = None; },
             Action::ToggleHistory => self.show_history = !self.show_history,
             Action::ScrollUp => self.scroll = self.scroll.saturating_add(2),
             Action::ScrollDown => self.scroll = self.scroll.saturating_sub(2),
             Action::Help => self.error = Some("i insert  Esc normal  Enter send  j/k scroll  h history  n new chat  q quit".into()),
-            Action::SelectHistory(index) => { self.sessions.select(index); self.show_history = false; self.response.clear(); },
             Action::Submit(text) => { self.mode = Mode::Normal; self.response.clear(); self.sessions.add_message("user", text); },
         }
         true
