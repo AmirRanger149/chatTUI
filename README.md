@@ -1,198 +1,96 @@
 # chatTUI
 
-`chatTUI` is a lightweight, keyboard-friendly terminal chat application for
-Google Gemini. It is written in Python with Textual and uses Gemini's REST API
-directly, so it does not depend on the OpenAI Python library.
+A fast, keyboard-first terminal chat client written in Rust. It uses
+`ratatui`, `crossterm`, `tokio`, and `reqwest` to stream Gemini-compatible
+responses without blocking the terminal.
 
 ## Features
 
-- Live streaming Gemini responses
-- Markdown rendering for formatted answers and code
-- Local conversation history stored as JSON
-- Create, switch, and delete conversations
-- Gemini model selection per conversation
-- System prompts per conversation
-- Slash commands for common actions
-- API key setup through environment variables, JSON files, plain-text files, or the Settings screen
-- Custom Gemini-compatible base URLs for supported proxies or gateways
+- Vim-style `NORMAL` and `INSERT` modes
+- Live asynchronous SSE streaming
+- Scrollable chat history
+- Local JSON conversation persistence
+- History drawer and session switching
+- Configurable Gemini model, endpoint, and temperature
+- Markdown-friendly response rendering
+- No OpenAI SDK or Python runtime required
 
 ## Requirements
 
-- Python 3.11 or newer
-- A Google Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey)
+- Rust stable toolchain
+- A Gemini API key
 
-## Installation
-
-Clone the project and create a virtual environment:
+## Install And Run
 
 ```bash
-git clone https://github.com/AmirRanger149/chatTUI.git
-cd chatTUI
-python3 -m venv .venv
-source .venv/bin/activate
+cargo run --release
 ```
 
-Install the dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-You can also install the project itself:
-
-```bash
-python -m pip install -e .
-```
-
-## Start The App
-
-```bash
-python app.py
-```
-
-The app will display a warning if no Gemini key is configured. You can add a
-key using any of the methods below.
-
-## API Key Setup
-
-### Option 1: Environment Variable
-
-Set the key before starting the app:
+Set the API key before launching:
 
 ```bash
 export GEMINI_API_KEY="AIza-your-key"
-python app.py
+cargo run --release
 ```
 
-You may also create a `.env` file in the project directory:
+The binary can be built with:
 
-```env
-GEMINI_API_KEY=AIza-your-key
-GEMINI_MODEL=gemini-3.5-flash
+```bash
+cargo build --release
 ```
 
-### Option 2: Paste The Key In Settings
+## Configuration
 
-1. Start the app with `python app.py`.
-2. Press `Ctrl+S` or select **Settings**.
-3. Paste the key into the **API key** field.
-4. Optionally change the model or base URL.
-5. Select **Apply**.
-
-The key is kept in memory for the current run. Do not paste keys into source
-files or commit them to Git.
-
-### Option 3: Import A JSON File
-
-Create a file such as `gemini.json`:
+Configuration is stored in the platform config directory under
+`chat-tui/config.json`. The default values are:
 
 ```json
 {
-	"api_key": "AIza-your-key",
-	"model": "gemini-3.5-flash"
+  "api_key": "AIza-your-key",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "model": "gemini-3.5-flash",
+  "temperature": 0.7
 }
 ```
 
-Then open **Settings**, enter the path to the file under **API file**, select
-**Import API**, and select **Apply**.
-
-The longer field names are also accepted:
-
-```json
-{
-	"gemini_api_key": "AIza-your-key",
-	"gemini_base_url": "https://generativelanguage.googleapis.com/v1beta",
-	"default_model": "gemini-3.5-flash"
-}
-```
-
-### Option 4: Import A Plain-Text Key File
-
-Put only the key in a text file, for example `gemini-key.txt`:
+Environment variables override the key settings:
 
 ```text
-AIza-your-key
+GEMINI_API_KEY
+GEMINI_BASE_URL
+GEMINI_MODEL
 ```
 
-Enter that file's path in **Settings** and select **Import API**. JSON files
-containing only a string are supported too:
+Conversation history is stored in the platform data directory under
+`chat-tui/sessions.json`.
 
-```json
-"AIza-your-key"
-```
+## Controls
 
-## Models
+### Normal Mode
 
-The default model is `gemini-3.5-flash`. You can enter another available Gemini
-model in Settings or change it during a conversation:
-
-```text
-/model gemini-2.5-flash
-```
-
-The model name must be available to your Gemini API account.
-
-## Commands And Controls
-
-| Control | Action |
+| Key | Action |
 | --- | --- |
-| `Enter` | Send the message |
-| `Shift+Enter` | Add a new line |
-| `Ctrl+N` | Create a new conversation |
-| `Ctrl+D` | Delete the current conversation |
-| `Ctrl+S` | Open Settings |
-| `Ctrl+C` | Quit |
-| `/model <name>` | Change the active Gemini model |
-| `/system <prompt>` | Change the current system prompt |
-| `/clear` | Clear the current conversation context |
+| `i` | Enter Insert mode |
+| `j` / `Down` | Scroll down |
+| `k` / `Up` | Scroll up |
+| `h` | Toggle history drawer |
+| `n` | Start a new chat |
+| `?` | Show help |
+| `q` | Quit |
 
-You can also click the **Send** button instead of pressing Enter.
+### Insert Mode
 
-## Custom Base URL
+| Key | Action |
+| --- | --- |
+| Any character | Add to prompt |
+| `Enter` | Send prompt |
+| `Backspace` | Delete a character |
+| `Esc` | Return to Normal mode |
 
-Gemini normally uses:
+## API Compatibility
 
-```text
-https://generativelanguage.googleapis.com/v1beta
-```
+The client targets Gemini's native streaming endpoint. `base_url` may be
+changed for a compatible Gemini gateway or proxy, but the endpoint must support
+`models/{model}:streamGenerateContent` with SSE responses.
 
-To use a compatible gateway or proxy, add `gemini_base_url` to the JSON file:
-
-```json
-{
-	"api_key": "AIza-your-key",
-	"base_url": "https://your-gemini-gateway.example/v1beta",
-	"model": "gemini-3.5-flash"
-}
-```
-
-## Conversation Storage
-
-Conversations are stored locally at:
-
-```text
-~/.chat-tui/sessions.json
-```
-
-The file is created automatically. It contains your conversation history, so
-protect it if your chats contain private information.
-
-## Troubleshooting
-
-**`GEMINI_API_KEY is not configured`**
-
-Set `GEMINI_API_KEY`, paste a key in Settings, or import a key file.
-
-**Authentication or invalid model errors**
-
-Check that the API key is active and that the model name is available to your
-account.
-
-**Network or timeout errors**
-
-Check your connection and confirm that the configured base URL is correct.
-
-**Never share an API key**
-
-If a key is accidentally posted publicly or committed, revoke it in Google AI
-Studio and create a replacement.
+Keep API keys private. If a key is exposed, revoke it and create a replacement.

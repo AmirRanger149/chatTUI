@@ -1,0 +1,22 @@
+[package]
+name = "chat-tui"
+version = "0.1.0"
+edition = "2021"
+description = "A keyboard-first terminal interface for Gemini-compatible chat APIs"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.28"
+directories = "5.0"
+futures-util = "0.3"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["full"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
