@@ -65,6 +65,17 @@ impl SessionManager {
         &self.store.sessions
     }
 
+    pub fn current_index(&self) -> usize {
+        self.store.current
+    }
+
+    pub fn next_session(&mut self) {
+        if !self.store.sessions.is_empty() {
+            self.store.current = (self.store.current + 1) % self.store.sessions.len();
+            let _ = self.save();
+        }
+    }
+
     pub fn new_session(&mut self) {
         let id = self.store.sessions.last().map(|s| s.id + 1).unwrap_or(1);
         self.store.sessions.insert(

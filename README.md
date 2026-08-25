@@ -66,9 +66,10 @@ cargo run --release
 
 You can put the export in your shell profile if you use the app regularly.
 
-### Configuration file
+### `gemini.json`
 
-The app reads a JSON file from the platform configuration directory. Its
+The app looks for `gemini.json` beside the compiled application first. When
+running with `cargo run`, it also checks the current working directory. Its
 contents can look like this:
 
 ```json
@@ -79,15 +80,8 @@ contents can look like this:
 }
 ```
 
-The exact location is managed by the Rust `directories` crate. On Linux it is
-normally:
-
-```text
-~/.config/chatTUI/chat-tui/config.json
-```
-
-The API key is kept in the file so you do not need to enter it each time. Keep
-this file private and never commit it.
+The API key is read from this file so you do not need to enter it each time.
+Keep this file private and never commit it.
 
 Environment variables take priority for the key-related values:
 
@@ -97,10 +91,7 @@ GEMINI_BASE_URL
 GEMINI_MODEL
 ```
 
-### Gemini JSON file
-
-You can also prepare a separate `gemini.json` and copy its values into the
-configuration file before running the app:
+### Example file
 
 ```json
 {
@@ -109,8 +100,6 @@ configuration file before running the app:
 }
 ```
 
-The Rust version currently loads the platform configuration file directly; it
-does not scan arbitrary project files automatically.
 
 ## Using chatTUI
 
@@ -124,6 +113,7 @@ The app starts in `NORMAL` mode. Press `i` to begin writing a prompt.
 | `j` or `Down` | Scroll down |
 | `k` or `Up` | Scroll up |
 | `h` | Toggle the history drawer |
+| `Shift+H` | Switch to the next saved conversation |
 | `n` | Start a new conversation |
 | `?` | Show a help hint |
 | `q` | Quit |

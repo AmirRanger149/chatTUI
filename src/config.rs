@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf};
 
@@ -35,32 +34,28 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn path() -> PathBuf {
-        ProjectDirs::from("", "chatTUI", "chat-tui")
-            .map(|dirs| dirs.config_dir().join("config.json"))
-            .unwrap_or_else(|| PathBuf::from("config.json"))
-    }
-
     pub fn load() -> Result<Self> {
-        let path = Self::path();
-        if path.exists() {
-            let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            let mut config: Self = serde_json::from_slice(&bytes).context("parsing config.json")?;
-            if config.api_key.is_none() {
-                config.api_key = env::var("GEMINI_API_KEY").ok();
+        let executable_dir = env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(PathBuf::from));
+        let candidates = [
+            executable_dir.map(|dir| dir.join("gemini.json")),
+            Some(PathBuf::from("gemini.json")),
+        ];
+        for candidate in candidates {
+            if let Some(path) = candidate {
+                if path.exists() {
+                    let bytes =
+                        fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+                    let mut config: Self =
+                        serde_json::from_slice(&bytes).context("parsing gemini.json")?;
+                    if config.api_key.is_none() {
+                        config.api_key = env::var("GEMINI_API_KEY").ok();
+                    }
+                    return Ok(config);
+                }
             }
-            Ok(config)
-        } else {
-            Ok(Self::default())
         }
-    }
-
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, serde_json::to_vec_pretty(self)?)?;
-        Ok(())
+        Ok(Self::default())
     }
 }

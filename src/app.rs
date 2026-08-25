@@ -20,6 +20,7 @@ pub enum Action {
     ScrollUp,
     ScrollDown,
     Help,
+    CycleHistory,
 }
 
 pub struct App {
@@ -64,6 +65,11 @@ impl App {
                 self.error = None;
             }
             Action::ToggleHistory => self.show_history = !self.show_history,
+            Action::CycleHistory => {
+                self.sessions.next_session();
+                self.response.clear();
+                self.error = None;
+            }
             Action::ScrollUp => self.scroll = self.scroll.saturating_sub(2),
             Action::ScrollDown => self.scroll = self.scroll.saturating_add(2),
             Action::Help => {
@@ -128,6 +134,7 @@ impl App {
         if !self.response.is_empty() {
             self.sessions
                 .add_message("assistant", self.response.clone());
+            self.response.clear();
         }
     }
 }

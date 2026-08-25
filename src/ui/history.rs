@@ -5,11 +5,20 @@ use ratatui::{
 };
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
+    let current = app.sessions.current_index();
     let items = app
         .sessions
         .sessions()
         .iter()
-        .map(|session| ListItem::new(session.title.clone()))
+        .enumerate()
+        .map(|(index, session)| {
+            let title = if index == current {
+                format!("> {}", session.title)
+            } else {
+                format!("  {}", session.title)
+            };
+            ListItem::new(title)
+        })
         .collect::<Vec<_>>();
     frame.render_widget(
         List::new(items)
