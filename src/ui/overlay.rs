@@ -1,6 +1,6 @@
 //! Full-screen overlays: the keyboard-shortcuts popup (`?` / `/help`) and the
-//! conversation-history picker (`ctrl+t` / `/history`). Both use codex's dim
-//! rounded card style, centered over the interface.
+//! conversation-history picker (`ctrl+t` / `/history`). Both are dim rounded
+//! cards centered over the interface.
 
 use crate::app::{App, Overlay};
 use crate::ui::theme;
@@ -267,8 +267,8 @@ const PREVIEW_WIDTH: usize = 48;
 /// list: tabs become spaces (a raw tab would jump to the terminal's next tab
 /// stop and blow past the card edge), other control characters become `�`,
 /// and the line is capped at [`PREVIEW_WIDTH`] cells without splitting
-/// graphemes. Persian/Arabic text — including ZWNJ — passes through
-/// untouched; only layout-breaking characters are replaced.
+/// graphemes. Persian/Arabic text, ZWNJ included, passes through untouched;
+/// only layout-breaking characters are replaced.
 fn preview_text(code: &str) -> String {
     let line = code.lines().next().unwrap_or("");
     let mut out = String::new();
@@ -311,12 +311,12 @@ fn render_card(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
         height: height as u16,
     };
     // Erase the card's rows across the full screen width first. Without this,
-    // content drawn behind the popup — especially shaded code blocks in the
-    // transcript — bleeds into the card and the two layers visually fight each
-    // other. Clearing full rows (rather than just the card rect) additionally
-    // keeps terminal bidirectional text away from the card: if RTL transcript
-    // text remained on the same rows, bidi-capable terminals would reorder the
-    // card together with the background and the two would visibly interfere.
+    // content drawn behind the popup (shaded code blocks in the transcript are
+    // the worst offender) bleeds into the card and the two layers fight each
+    // other. Clearing whole rows instead of just the card rect also keeps
+    // bidirectional text away from the card: if RTL transcript text stayed on
+    // the same rows, a bidi-capable terminal would reorder the card along with
+    // the background and the two would visibly interfere.
     let scrim = Rect {
         x: area.x,
         y: rect.y,

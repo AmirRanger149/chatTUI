@@ -1,5 +1,5 @@
-//! Codex-style visual primitives: dim rounded cards, hanging-indent word wrap,
-//! spinner glyphs, and small formatting helpers shared across the UI.
+//! Small visual helpers the rest of the UI leans on: dim rounded cards, word
+//! wrap with a hanging indent, spinner glyphs, and a bit of formatting.
 
 use ratatui::prelude::*;
 use unicode_segmentation::UnicodeSegmentation;
@@ -22,16 +22,16 @@ pub fn user_prefix() -> Span<'static> {
     Span::styled("› ", Style::new().bold().dim())
 }
 
-/// Visible width of `text` in terminal cells, measured exactly the way
-/// ratatui lays out buffer cells: per-grapheme widths.
+/// Visible width of `text` in terminal cells, counted per grapheme the way
+/// ratatui fills its buffer.
 ///
-/// Whole-string `UnicodeWidthStr::width` must not be used for UI geometry:
-/// unicode-width 0.2 applies multi-character ligature rules (notably Arabic
-/// Lam-Alef `لا`, which appears all over Persian text) that collapse a whole
-/// sequence to a single cell. Ratatui packs cells per grapheme — and real
-/// terminals render the ligature across two cells — so whole-string widths
-/// undercount, padded rows overflow their area, and ratatui clips the
-/// trailing border (most visibly in the code overlay).
+/// Don't reach for `UnicodeWidthStr::width` on the whole string when doing
+/// layout maths. unicode-width 0.2 applies multi-character ligature rules,
+/// and the Arabic Lam-Alef `لا` (which turns up constantly in Persian text)
+/// gets collapsed to a single cell. Ratatui places one grapheme at a time and
+/// terminals draw the ligature across two cells, so whole-string widths come
+/// out too small: padded rows overflow their area and ratatui clips the
+/// trailing border. The code overlay is where that bit us first.
 pub fn cell_width(text: &str) -> usize {
     text.graphemes(true).map(UnicodeWidthStr::width).sum()
 }
@@ -44,8 +44,7 @@ pub fn spans_width(spans: &[Span<'_>]) -> usize {
     spans.iter().map(|span| cell_width(&span.content)).sum()
 }
 
-/// Render `lines` inside a dim rounded border that hugs the widest line —
-/// a port of codex's `with_border` history-cell helper.
+/// Wrap `lines` in a dim rounded border sized to fit the widest one.
 pub fn with_border(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let inner = lines.iter().map(line_width).max().unwrap_or(0);
     let rule = "─".repeat(inner + 2);
@@ -167,7 +166,7 @@ fn tokenize(spans: Vec<Span<'static>>) -> Vec<(String, Style)> {
     words
 }
 
-/// `12s`, `1m 02s`, `1h 00m 00s` — the codex compact elapsed format.
+/// Compact elapsed time: `12s`, `1m 02s`, `1h 00m 00s`.
 pub fn fmt_elapsed(secs: u64) -> String {
     if secs < 60 {
         return format!("{secs}s");
@@ -225,7 +224,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn elapsed_format_matches_codex_style() {
+    fn elapsed_format_is_compact() {
         assert_eq!(fmt_elapsed(12), "12s");
         assert_eq!(fmt_elapsed(62), "1m 02s");
         assert_eq!(fmt_elapsed(3723), "1h 02m 03s");

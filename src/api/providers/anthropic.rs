@@ -52,7 +52,7 @@ impl AnthropicBackend {
     }
 
     /// Best-effort lookup of a model's `context_window` from `GET /models`.
-    /// `None` on any failure — callers fall back to a constant.
+    /// Returns `None` on any failure; callers fall back to a constant.
     async fn resolve_context_window(&self, model: &str) -> Option<u64> {
         let response = self
             .http
@@ -192,7 +192,7 @@ impl AnthropicBackend {
                         }
                     }
                     // message_start, content_block_start, message_delta,
-                    // message_stop, ping — nothing to emit.
+                    // message_stop, ping: nothing to emit for these.
                     _ => {}
                 }
             }

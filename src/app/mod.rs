@@ -5,12 +5,12 @@
 //! open overlay. The feature modules add behaviour to `App` through their own
 //! `impl App` blocks:
 //!
-//! - [`composer`] — text editing, cursor movement, paste and history recall
-//! - [`commands`] — slash commands and the slash popup
-//! - [`streaming`] — running a chat request and consuming its tokens
-//! - [`models`] — the `/model` picker and availability-based default models
-//! - [`providers`] — the `/provider` picker and switching
-//! - [`overlay`] — the full-screen popups (shortcuts, history, code, models)
+//! - [`composer`]: text editing, cursor movement, paste and history recall
+//! - [`commands`]: slash commands and the slash popup
+//! - [`streaming`]: running a chat request and consuming its tokens
+//! - [`models`]: the `/model` picker and availability-based default models
+//! - [`providers`]: the `/provider` picker and switching
+//! - [`overlay`]: the full-screen popups (shortcuts, history, code, models)
 
 pub mod commands;
 pub mod composer;
@@ -204,7 +204,7 @@ impl App {
         self.cells.push(Cell::Notice(message));
     }
 
-    /// Right-hand footer summary, codex-style context indicator.
+    /// The context summary shown on the right-hand side of the footer.
     pub fn context_summary(&self) -> String {
         let session = self.sessions.current();
         let messages = session.messages.len();

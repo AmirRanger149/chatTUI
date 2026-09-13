@@ -1,5 +1,5 @@
-//! Root layout, codex-style: a scrollback transcript filling the screen with
-//! a borderless bottom pane beneath it — slash-command popup, optional
+//! Root layout: a scrollback transcript filling the screen, with a borderless
+//! bottom pane beneath it holding the slash-command popup, the optional
 //! `Working` row, the `› ` composer, and a hint/context footer.
 
 pub mod composer;

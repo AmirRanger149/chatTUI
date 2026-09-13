@@ -1,5 +1,5 @@
-//! The `• Working (12s • esc to interrupt)` row rendered above the composer
-//! while a response streams, matching codex's status indicator.
+//! The `• Working (12s • esc to interrupt)` row drawn above the composer
+//! while a response is streaming.
 
 use crate::app::App;
 use crate::ui::theme::{self, SPINNER};

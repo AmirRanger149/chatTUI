@@ -1,10 +1,10 @@
 //! Reasoning ("thinking") support.
 //!
-//! Some models — `MiniMaxAI/MiniMax-M2.7` among them — stream their private
-//! chain of thought wrapped in `<think> … </think>` before the real answer.
-//! This module splits that out of the message body and renders it as its own
-//! animated cell: a shimmering `✻ Thinking…` header while the tokens arrive,
-//! collapsing into a quiet `✻ Thought for 12s` card once the answer starts.
+//! Some models (MiniMax-M2.7 is one) stream their private chain of thought
+//! wrapped in `<think> … </think>` ahead of the real answer. This module splits
+//! that out of the message body and renders it as its own animated cell: a
+//! shimmering `✻ Thinking…` header while the tokens arrive, collapsing into a
+//! quiet `✻ Thought for 12s` card once the answer starts.
 
 use crate::ui::theme;
 use ratatui::prelude::*;
@@ -73,7 +73,7 @@ fn strip_partial_tag(text: &str) -> &str {
     }
 }
 
-/// The message with every `<think>` block removed — what gets replayed to the API.
+/// The message with every `<think>` block removed. This is what we replay to the API.
 pub fn strip(src: &str) -> String {
     let answer: String = split(src)
         .into_iter()
@@ -104,7 +104,7 @@ fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
-/// A shimmering wave of light travelling through `text`, codex-style.
+/// Sweep a bright highlight along `text`, one character per tick.
 pub fn shimmer(text: &str, tick: u64, base: Style) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
     let span = chars.len() as u64 + 8;

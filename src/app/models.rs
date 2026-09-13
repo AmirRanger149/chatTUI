@@ -31,9 +31,9 @@ impl App {
 
     /// Resolve a `/model <arg>` argument against the cached model list:
     /// exact (case-insensitive) first, then a unique prefix, then a unique
-    /// suffix — so `minimaxai/minimax-m2.7` and even `minimax-m2.7` both
-    /// find `MiniMaxAI/MiniMax-M2.7`. Anything ambiguous or unknown comes
-    /// back as typed.
+    /// suffix, so `minimaxai/minimax-m2.7` and even `minimax-m2.7` both find
+    /// `MiniMaxAI/MiniMax-M2.7`. Anything ambiguous or unknown comes back
+    /// exactly as typed.
     pub(crate) fn lookup_model(&self, argument: &str) -> String {
         if let Some(id) = self
             .models
@@ -135,9 +135,9 @@ impl App {
     /// a custom provider whose config entry omits `model` gets its active
     /// model resolved against the endpoint's live list (a free model first,
     /// e.g. `free/deepseek-v4-flash-0731` on APInex-style gateways). When it
-    /// finishes, the active model is set to the best available match —
-    /// provided the user has not explicitly chosen one. Failures are
-    /// silent: the send-time model fallback still covers an empty choice.
+    /// finishes, the active model is set to the best available match, unless
+    /// the user has picked one themselves. Failures stay quiet: the send-time
+    /// model fallback still covers an empty choice.
     pub(crate) fn request_available_default(&mut self) {
         // Custom providers are the availability-based ones; the built-ins
         // (OpenAI, Anthropic, Gemini) keep their static default models.
@@ -205,7 +205,7 @@ impl App {
                     return;
                 }
                 Err(TryRecvError::Empty) => {
-                    // Still in flight — poll again next frame.
+                    // Still in flight; poll again next frame.
                     self.models_rx = Some(rx);
                     return;
                 }
@@ -237,10 +237,10 @@ impl App {
     }
 
     /// After a background fetch, set the active model to the best model the
-    /// endpoint currently offers — a free model first (`free/…`), then the
-    /// provider's configured default if one is set and still listed,
-    /// otherwise the first model in the list. No-ops when the user has since
-    /// picked a model explicitly.
+    /// endpoint currently offers: a free model first (`free/…`), then the
+    /// provider's configured default if one is set and still listed, and
+    /// failing that the first model in the list. Does nothing if the user has
+    /// picked a model themselves in the meantime.
     fn apply_available_default(&mut self) {
         let Some(provider) = self.config.find_provider(&self.config.provider) else {
             return;
@@ -365,8 +365,8 @@ mod tests {
         // The selection jumped to the active model, `b/2`.
         assert!(matches!(app.overlay, Some(Overlay::Models { selected: 1 })));
 
-        // A later poll sees the fetch's closed channel — it must NOT be
-        // mistaken for a failure and wipe the freshly loaded list.
+        // A later poll sees the fetch's closed channel. It must NOT be read
+        // as a failure and wipe the freshly loaded list.
         app.receive_models();
         assert!(app.models.error.is_none());
         assert_eq!(app.models.ids, vec!["a/1", "b/2", "c/3"]);

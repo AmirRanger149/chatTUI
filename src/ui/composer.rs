@@ -1,7 +1,7 @@
-//! The codex-style bottom pane: a borderless `› ` composer that grows with
-//! content, the slash-command popup anchored above it, and the hint/context
-//! footer row. The composer keeps a real editing cursor, so typing,
-//! backspace and cursor/word navigation all act at the cursor position.
+//! The bottom pane: a borderless `› ` composer that grows with the text in
+//! it, the slash-command popup anchored above it, and the hint/context footer
+//! row. The composer tracks a real editing cursor, so typing, backspace and
+//! cursor/word navigation all happen where the cursor is.
 
 use crate::app::{App, MAX_COMPOSER_ROWS};
 use crate::ui::theme;

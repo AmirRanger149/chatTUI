@@ -1,6 +1,5 @@
-//! A compact markdown renderer for assistant messages, in the spirit of
-//! codex's transcript: bold headings, `•` bullets with hanging indents,
-//! dim blockquotes and shaded code blocks.
+//! A compact markdown renderer for assistant messages: bold headings, `•`
+//! bullets with hanging indents, dim blockquotes and shaded code blocks.
 
 use crate::ui::theme::{self, wrap_styled};
 use ratatui::prelude::*;
@@ -95,7 +94,7 @@ pub fn render(src: &str, width: usize) -> Vec<Line<'static>> {
             continue;
         }
 
-        // Ordered list — keep the original marker, indent the wrap.
+        // Ordered list: keep the original marker, indent the wrapped rows.
         if let Some(marker_end) = ordered_marker_len(trimmed) {
             let marker = trimmed[..marker_end].to_string();
             let content = trimmed[marker_end..].trim_start();
@@ -307,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn bullets_use_codex_glyph_and_hanging_indent() {
+    fn bullets_use_the_dot_glyph_and_hanging_indent() {
         let lines = render("- first item\n- second item", 40);
         let text = plain(&lines);
         assert_eq!(text[0], "• first item");

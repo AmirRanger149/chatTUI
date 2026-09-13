@@ -9,8 +9,8 @@ use std::{env, fs, path::PathBuf};
 ///
 /// There are two kinds: the three built-ins (`openai`, `anthropic`, `gemini`)
 /// and user-defined custom gateways declared under `custom_providers` in
-/// `config.json` (Dahl, APInex, Ollama, Groq, … — anything that speaks the
-/// OpenAI-compatible protocol).
+/// `config.json` (Dahl, APInex, Ollama, Groq, and anything else that speaks
+/// the OpenAI-compatible protocol).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provider {
     pub id: String,
@@ -254,8 +254,8 @@ impl Config {
     /// built-in providers with dedicated `dahl_api_key` / `apinex_api_key`
     /// fields (and, before that, a single `api_key`). They are now regular
     /// custom providers, so old fields are quietly migrated into
-    /// `custom_providers` — preserving each gateway's endpoint and default
-    /// model. Dahl keeps its pinned MiniMax default; APInex keeps its
+    /// `custom_providers`, keeping each gateway's endpoint and default model.
+    /// Dahl keeps its pinned MiniMax default; APInex keeps its
     /// availability-based default (no `model`, resolved from the live list).
     fn migrate_legacy_fields(&mut self) {
         const DAHL_URL: &str = "https://inference.dahl.global/v1";
@@ -402,8 +402,8 @@ impl Config {
             // `custom_providers` so old config files keep working.
             config.migrate_legacy_fields();
 
-            // Environment keys always override the file's values — for the
-            // built-ins and, via `{ID}_API_KEY`, for custom providers too.
+            // Environment keys always win over the file's values, both for
+            // the built-ins and, via `{ID}_API_KEY`, for custom providers.
             for provider in builtin_providers() {
                 if let Ok(key) = env::var(&provider.env_key) {
                     if !key.trim().is_empty() {

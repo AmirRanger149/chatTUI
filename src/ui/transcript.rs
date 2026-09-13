@@ -1,6 +1,6 @@
-//! The scrollback-style transcript: a codex session header card, `› `-prefixed
-//! user turns, markdown assistant turns, notices and errors — auto-pinned to
-//! the bottom with manual scrollback.
+//! The scrollback transcript: a session header card, `› `-prefixed user turns,
+//! markdown assistant turns, notices and errors. It stays pinned to the bottom
+//! until the user scrolls back.
 
 use crate::app::{App, Cell};
 use crate::ui::{markdown, theme, thinking};
@@ -32,11 +32,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).scroll((skip as u16, 0)), area);
 }
 
-/// The `>_ chatTUI (vX)` card shown at the top of every session.
+/// The `>_< chatTUI (vX)` card shown at the top of every session.
 fn header_lines(app: &App, max_inner: usize) -> Vec<Line<'static>> {
     let inner = max_inner.min(56);
     let title = vec![
-        Span::styled(">_ ", theme::dim()),
+        Span::styled(">_< ", theme::dim()),
         Span::styled("chatTUI", Style::new().bold()),
         Span::styled(" ", theme::dim()),
         Span::styled(format!("(v{})", crate::app::VERSION), theme::dim()),

@@ -209,9 +209,9 @@ impl GeminiBackend {
                         any_text = true;
                     }
                 } else if !full.is_empty() {
-                    // The stream did not continue where we left off (should
-                    // not happen for cumulative responses) — send it whole
-                    // rather than silently dropping the answer.
+                    // The stream did not continue where we left off, which
+                    // should not happen for cumulative responses. Send it
+                    // whole rather than quietly dropping the answer.
                     tx.send(StreamEvent::Delta(full.clone()))
                         .await
                         .map_err(|_| Failure::Fatal("stream receiver closed".into()))?;
@@ -220,7 +220,7 @@ impl GeminiBackend {
                 }
             }
         }
-        // The stream ended without ever carrying text — say why instead of
+        // The stream ended without ever carrying text. Say why instead of
         // leaving the transcript silently empty.
         if !any_text {
             if !finish_reason.is_empty() && finish_reason != "STOP" && finish_reason != "MAX_TOKENS" {

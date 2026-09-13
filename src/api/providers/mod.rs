@@ -1,7 +1,7 @@
 //! Chat backends: one trait over the wire protocols, plus a dispatch enum so
 //! callers build a backend by provider kind.
 //!
-//! Each backend is a pure protocol adapter — it translates a
+//! Each backend is a pure protocol adapter: it translates a
 //! [`CompletionRequest`] into its vendor's request schema and parses the
 //! stream back into [`StreamEvent::Delta`]s. Everything protocol-agnostic
 //! (model fallback, retries, family-first ordering) lives in
@@ -52,10 +52,10 @@ impl ProviderKind {
 /// The orchestrator in [`crate::api::client`] retries a failed attempt with a
 /// different model only when [`stream_completion`] returns
 /// [`Failure::Retryable`]. A backend must therefore return [`Failure::Fatal`]
-/// whenever any text was already emitted before the failure — splicing a
-/// second model into a half-written answer would produce one Frankenstein
-/// reply. (This mirrors the old single-backend behaviour, now stated as a
-/// contract so new backends honour it.)
+/// whenever it has already emitted some text. Splicing a second model into a
+/// half-written answer gives you one Frankenstein reply. (This is how the old
+/// single-backend code behaved; it is written down here so new backends keep
+/// doing it.)
 ///
 /// [`stream_completion`]: ChatBackend::stream_completion
 pub trait ChatBackend: Send + Sync {

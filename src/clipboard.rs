@@ -2,10 +2,10 @@
 //!
 //! Strategy: copy through a real system-clipboard utility whenever one works
 //! (its exit status proves the bytes landed), and only then fall back to the
-//! terminal's OSC 52 escape sequence. OSC 52 is fire-and-forget — the terminal
-//! may silently ignore it (missing tmux/screen passthrough, permission
-//! prompts, length limits) — so that path is always reported as best-effort,
-//! with a hint on how to get reliable copies.
+//! terminal's OSC 52 escape sequence. OSC 52 is fire and forget: the terminal
+//! may quietly ignore it (missing tmux/screen passthrough, permission prompts,
+//! length limits), so that path is always reported as best-effort, with a hint
+//! on how to get reliable copies.
 
 use anyhow::Result;
 use std::borrow::Cow;
@@ -23,8 +23,8 @@ pub struct CopyOutcome {
     /// Short description of the method used, e.g. `"system clipboard (wl-copy)"`.
     pub method: String,
     /// True only when bytes verifiably reached a clipboard the user can paste
-    /// from. The OSC 52 fallback is one-way — the terminal never confirms —
-    /// so it is always unverified.
+    /// from. The OSC 52 fallback is one-way and the terminal never confirms
+    /// anything, so it is always unverified.
     pub verified: bool,
     /// Advice shown when the copy is best-effort (OSC 52 may have been ignored).
     pub hint: Option<String>,
@@ -37,7 +37,7 @@ pub fn copy(text: &str) -> Result<CopyOutcome> {
 
     if env.ssh {
         // Over SSH a remote clipboard utility copies to the *remote* machine,
-        // which the user cannot paste from — but the terminal forwards OSC 52
+        // which the user cannot paste from, but the terminal forwards OSC 52
         // to the machine in front of them. So always emit OSC 52 there, even
         // when a remote tool also succeeded.
         write_osc52(text, &env)?;
@@ -190,7 +190,7 @@ fn clipboard_payload<'a>(program: &str, text: &'a str) -> Cow<'a, str> {
 
 /// Pipe `text` into a clipboard utility; report the method on success.
 /// Returns `None` when the tool is missing, fails, or hangs past
-/// [`COMMAND_TIMEOUT`] — the caller then tries the next candidate.
+/// [`COMMAND_TIMEOUT`]; the caller then tries the next candidate.
 fn try_command(argv: &[String], text: &str) -> Option<String> {
     let (program, args) = argv.split_first()?;
     let mut child = Command::new(program)
@@ -201,8 +201,8 @@ fn try_command(argv: &[String], text: &str) -> Option<String> {
         .spawn()
         .ok()?;
     if let Some(mut stdin) = child.stdin.take() {
-        // Ignore pipe errors: the tool may have exited early (successfully or
-        // not) — its exit status below is the verdict, not the pipe.
+        // Ignore pipe errors: the tool may have exited early, successfully or
+        // not. Its exit status below is the verdict, not the pipe.
         let _ = stdin.write_all(clipboard_payload(program, text).as_bytes());
     }
     let started = Instant::now();
@@ -225,7 +225,7 @@ fn try_command(argv: &[String], text: &str) -> Option<String> {
 }
 
 /// OSC 52: ask the terminal itself to store the text in the system clipboard.
-/// Best-effort — the terminal may ignore it — so callers must report this
+/// Best-effort: the terminal may ignore it, so callers have to report this
 /// path as unverified.
 fn write_osc52(text: &str, env: &Env) -> Result<()> {
     let sequence = osc52_sequence(&base64(text.as_bytes()), env);
@@ -249,7 +249,7 @@ fn osc52_sequence(payload: &str, env: &Env) -> Vec<u8> {
     }
 }
 
-/// Minimal standard base64 encoder — avoids pulling in an extra dependency.
+/// Minimal standard base64 encoder, so we do not need another dependency.
 fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

@@ -37,7 +37,7 @@ impl App {
             .current()
             .messages
             .iter()
-            // Reasoning is private to the turn that produced it — never replay
+            // Reasoning belongs to the turn that produced it, so never replay
             // `<think>` blocks back to the model.
             .map(|m| {
                 Message::new(
@@ -70,7 +70,7 @@ impl App {
         loop {
             match rx.try_recv() {
                 Ok(StreamEvent::Delta(token)) => self.response.push_str(&token),
-                // Fallback announcements etc. — the stream keeps going.
+                // Fallback announcements and the like; the stream keeps going.
                 Ok(StreamEvent::Notice(message)) => self.push_notice(message),
                 Ok(StreamEvent::Error(error)) => {
                     self.finish_partial();

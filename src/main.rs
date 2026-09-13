@@ -159,7 +159,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         _ => {}
     }
 
-    // The composer is always active, like codex.
+    // Nothing else claimed the key, so it belongs to the composer.
     match key.code {
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
             app.insert_newline();

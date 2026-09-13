@@ -36,8 +36,8 @@ pub(crate) fn classify_failure(status: u16, body: &str) -> Failure {
         return Failure::Retryable(compact_failure("the model rejected the request", status, body));
     }
 
-    // Other statuses can still mean "model busy / gone" by their text —
-    // the classic "currently experiencing high demand" line.
+    // Any other status can still mean "model busy / gone" if the body says so,
+    // like the usual "currently experiencing high demand" line.
     const MODEL_TROUBLE: &[&str] = &[
         "high demand",
         "overload",
