@@ -321,7 +321,6 @@ fn pick_available_default(ids: &[String], builtin_default: &str) -> Option<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::app::{App, Cell, Overlay};
     use crate::config::Config;
     use crate::session::manager::SessionManager;

@@ -24,6 +24,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(""));
     }
 
+    // Show pending tool calls during streaming
+    if !app.pending_tool_calls.is_empty() {
+        for tc in &app.pending_tool_calls {
+            lines.extend(tool_call_lines(&tc.name, &tc.arguments, &tc.id, width));
+            lines.push(Line::from(""));
+        }
+    }
+
     let total = lines.len();
     let height = area.height as usize;
     let skip = total
@@ -65,12 +73,36 @@ fn header_lines(app: &App, max_inner: usize) -> Vec<Line<'static>> {
     let dir_label = "directory: ";
     let dir = theme::display_path(&current_dir(), inner.saturating_sub(dir_label.len()));
     let dir_line = vec![Span::styled(dir_label, theme::dim()), Span::raw(dir)];
+    
+    let sandbox_label = "sandbox: ";
+    let (sandbox_status, sandbox_color) = if !app.config.sandbox.enabled {
+        ("off".to_string(), Color::DarkGray)
+    } else if app.sandbox.has_target() {
+        (
+            format!(
+                "on ({})",
+                theme::display_path(
+                    app.sandbox.config.workspace_root.to_string_lossy().as_ref(),
+                    30,
+                )
+            ),
+            Color::Green,
+        )
+    } else {
+        ("no target — /sandbox <dir>".to_string(), Color::Yellow)
+    };
+    let sandbox_line = vec![
+        Span::styled(sandbox_label, theme::dim()),
+        Span::styled(sandbox_status, Style::new().fg(sandbox_color)),
+    ];
+    
     vec![
         Line::from(title),
         Line::from(""),
         Line::from(provider_line),
         Line::from(model_line),
         Line::from(dir_line),
+        Line::from(sandbox_line),
     ]
 }
 
@@ -105,6 +137,72 @@ fn assistant_lines(text: &str, width: usize, app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+fn tool_call_lines(name: &str, args: &str, id: &str, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    // Header: 🔧 tool_call
+    let header_style = Style::new().fg(Color::Yellow).bold();
+    lines.push(Line::from(vec![
+        Span::styled("🔧 ", header_style),
+        Span::styled(format!("{} ", name), header_style),
+        Span::styled(format!("[{}]", &id[..id.len().min(12)]), theme::dim()),
+    ]));
+    
+    // Args - try to pretty print JSON
+    let pretty_args = if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+        serde_json::to_string_pretty(&v).unwrap_or_else(|_| args.to_string())
+    } else {
+        args.to_string()
+    };
+    
+    for line in pretty_args.lines().take(10) {
+        lines.extend(theme::wrap_styled(
+            vec![Span::styled(theme::clamp_text(line, 500), Style::new().fg(Color::DarkGray))],
+            width,
+            Span::raw("  "),
+            Span::raw("  "),
+        ));
+    }
+    if pretty_args.lines().count() > 10 {
+        lines.push(Line::from(Span::styled("  ... (truncated)", theme::dim())));
+    }
+    
+    lines
+}
+
+fn tool_result_lines(id: &str, content: &str, is_error: bool, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let (icon, style) = if is_error {
+        ("❌ ", Style::new().fg(theme::ERROR_COLOR))
+    } else {
+        ("✓ ", Style::new().fg(Color::Green))
+    };
+    
+    lines.push(Line::from(vec![
+        Span::styled(icon, style),
+        Span::styled("tool result ", Style::new().fg(Color::DarkGray)),
+        Span::styled(format!("[{}]", &id[..id.len().min(12)]), theme::dim()),
+    ]));
+    
+    // Content - clamp and wrap
+    let clamped = theme::clamp_text(content, 2000);
+    for line in clamped.lines().take(15) {
+        lines.extend(theme::wrap_styled(
+            vec![Span::raw(line.to_string())],
+            width,
+            Span::raw("  "),
+            Span::raw("  "),
+        ));
+    }
+    if clamped.lines().count() > 15 {
+        lines.push(Line::from(Span::styled(
+            format!("  ... ({} more lines)", clamped.lines().count() - 15),
+            theme::dim(),
+        )));
+    }
+    
+    lines
+}
+
 fn cell_lines(cell: &Cell, width: usize, app: &App) -> Vec<Line<'static>> {
     match cell {
         Cell::User(text) => theme::wrap_styled(
@@ -132,5 +230,7 @@ fn cell_lines(cell: &Cell, width: usize, app: &App) -> Vec<Line<'static>> {
             Span::styled("• ", Style::new().fg(theme::ACCENT)),
             Span::raw("  "),
         ),
+        Cell::ToolCall { name, args, id } => tool_call_lines(name, args, id, width),
+        Cell::ToolResult { id, content, is_error } => tool_result_lines(id, content, *is_error, width),
     }
 }

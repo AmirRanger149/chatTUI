@@ -1,12 +1,14 @@
+mod sandbox;
+mod tools;
 mod api;
-mod app;
 mod clipboard;
 mod code;
 mod config;
 mod session;
+mod app;
 mod ui;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use app::App;
 use config::Config;
 use crossterm::{
@@ -16,18 +18,45 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use session::manager::SessionManager;
+use std::env;
 use std::io::{self, stdout};
 use tokio::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+    apply_cli_args(&mut config)?;
     let sessions = SessionManager::load()?;
     let mut app = App::new(config, sessions);
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app).await;
     restore_terminal(&mut terminal)?;
     result
+}
+
+fn apply_cli_args(config: &mut Config) -> Result<()> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--sandbox" | "--target" | "--workspace" => {
+                let path = args
+                    .next()
+                    .context("--sandbox / --target requires a directory path")?;
+                config.sandbox.workspace_root = path;
+            }
+            "--help" | "-h" => {
+                eprintln!(
+                    "chatTUI\n  --sandbox <dir>   Agent target directory (required for file tools)\n  --target <dir>    Same as --sandbox\n"
+                );
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => {
+                anyhow::bail!("unknown flag {other} — try --help");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {

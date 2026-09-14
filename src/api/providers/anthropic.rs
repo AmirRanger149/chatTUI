@@ -7,15 +7,18 @@
 //!   model list when available);
 //! - streaming deltas arrive as `content_block_delta` events with
 //!   `delta.text`, and the model list is `{"data":[{"id": …}]}`.
+//! - Tool calling uses `tools` + `tool_use` blocks and `tool_result` in user messages.
 
 use super::ChatBackend;
 use crate::api::error::{classify_failure, error_detail};
 use crate::api::sse::SseReader;
-use crate::api::types::{CompletionRequest, Failure, Role, StreamEvent};
+use crate::api::types::{CompletionRequest, Failure, Role, StreamEvent, ToolCall};
+use crate::tools;
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -34,7 +37,7 @@ impl AnthropicBackend {
     pub fn new(api_key: String, base_url: String) -> Self {
         Self {
             http: Client::builder()
-                .timeout(Duration::from_secs(90))
+                .timeout(Duration::from_secs(120))
                 .build()
                 .expect("HTTP client"),
             api_key,
@@ -115,24 +118,61 @@ impl AnthropicBackend {
         let mut system: Option<String> = None;
         let mut messages = Vec::with_capacity(request.messages.len());
         for message in &request.messages {
-            if message.role == Role::System {
-                let mut prompt = system.take().unwrap_or_default();
-                if !prompt.is_empty() {
-                    prompt.push_str("\n\n");
+            match message.role {
+                Role::System => {
+                    let mut prompt = system.take().unwrap_or_default();
+                    if !prompt.is_empty() {
+                        prompt.push_str("\n\n");
+                    }
+                    prompt.push_str(&message.content);
+                    system = Some(prompt);
                 }
-                prompt.push_str(&message.content);
-                system = Some(prompt);
-                continue;
+                Role::Assistant => {
+                    // Check if assistant has tool_calls
+                    if let Some(tool_calls) = &message.tool_calls {
+                        let mut content_blocks = Vec::new();
+                        if !message.content.is_empty() {
+                            content_blocks.push(json!({ "type": "text", "text": message.content }));
+                        }
+                        for tc in tool_calls {
+                            let input: Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+                            content_blocks.push(json!({
+                                "type": "tool_use",
+                                "id": tc.id,
+                                "name": tc.name,
+                                "input": input
+                            }));
+                        }
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": content_blocks
+                        }));
+                    } else {
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": [{ "type": "text", "text": message.content }],
+                        }));
+                    }
+                }
+                Role::User => {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": [{ "type": "text", "text": message.content }],
+                    }));
+                }
+                Role::Tool => {
+                    // Tool result -> user message with tool_result block
+                    let tool_use_id = message.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string());
+                    messages.push(json!({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": message.content
+                        }]
+                    }));
+                }
             }
-            let role = if message.role == Role::Assistant {
-                "assistant"
-            } else {
-                "user"
-            };
-            messages.push(json!({
-                "role": role,
-                "content": [{ "type": "text", "text": message.content }],
-            }));
         }
         let mut body = json!({
             "model": request.model,
@@ -144,6 +184,17 @@ impl AnthropicBackend {
         if let Some(text) = system {
             body["system"] = Value::String(text);
         }
+
+        // Add tools if present
+        if !request.tools.is_empty() {
+            let tool_defs: Vec<crate::tools::ToolDefinition> = request
+                .tools
+                .iter()
+                .map(|t| crate::tools::ToolDefinition::new(&t.name, &t.description, t.parameters.clone()))
+                .collect();
+            body["tools"] = tools::to_anthropic_tools(&tool_defs);
+        }
+
         let url = format!("{}/messages", self.base_url);
         let response = self
             .http
@@ -162,9 +213,11 @@ impl AnthropicBackend {
         let mut stream = response.bytes_stream();
         let mut reader = SseReader::new();
         let mut emitted = false;
+        let mut tool_builders: HashMap<usize, AnthropicToolBuilder> = HashMap::new();
+
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| {
-                if emitted {
+                if emitted || !tool_builders.is_empty() {
                     Failure::Fatal(format!("stream interrupted after output started: {error}"))
                 } else {
                     Failure::Retryable(format!("stream interrupted before any output: {error}"))
@@ -174,13 +227,44 @@ impl AnthropicBackend {
                 let value: Value = serde_json::from_str(&data)
                     .map_err(|error| Failure::Fatal(format!("parsing streaming response failed: {error}")))?;
                 match value["type"].as_str() {
-                    // `content_block_delta` carries the token text.
+                    Some("content_block_start") => {
+                        let index = value["index"].as_u64().unwrap_or(0) as usize;
+                        if let Some(block_type) = value["content_block"]["type"].as_str() {
+                            if block_type == "tool_use" {
+                                let id = value["content_block"]["id"].as_str().unwrap_or("").to_string();
+                                let name = value["content_block"]["name"].as_str().unwrap_or("").to_string();
+                                tool_builders.insert(
+                                    index,
+                                    AnthropicToolBuilder {
+                                        id,
+                                        name,
+                                        input_json: String::new(),
+                                    },
+                                );
+                            }
+                        }
+                    }
                     Some("content_block_delta") => {
+                        let index = value["index"].as_u64().unwrap_or(0) as usize;
                         if let Some(text) = value["delta"]["text"].as_str() {
                             tx.send(StreamEvent::Delta(text.into()))
                                 .await
                                 .map_err(|_| Failure::Fatal("stream receiver closed".into()))?;
                             emitted = true;
+                        }
+                        if let Some(partial) = value["delta"]["partial_json"].as_str() {
+                            if let Some(builder) = tool_builders.get_mut(&index) {
+                                builder.input_json.push_str(partial);
+                            }
+                        }
+                    }
+                    Some("content_block_stop") => {
+                        let index = value["index"].as_u64().unwrap_or(0) as usize;
+                        if let Some(builder) = tool_builders.remove(&index) {
+                            if !builder.name.is_empty() {
+                                let tc = ToolCall::new(builder.id, builder.name, builder.input_json);
+                                let _ = tx.send(StreamEvent::ToolCall(tc)).await;
+                            }
                         }
                     }
                     Some("error") => {
@@ -191,14 +275,27 @@ impl AnthropicBackend {
                             return Err(classify_failure(0, message));
                         }
                     }
-                    // message_start, content_block_start, message_delta,
-                    // message_stop, ping: nothing to emit for these.
                     _ => {}
                 }
             }
         }
+
+        // Emit any remaining builders
+        for (_, builder) in tool_builders.drain() {
+            if !builder.name.is_empty() {
+                let tc = ToolCall::new(builder.id, builder.name, builder.input_json);
+                let _ = tx.send(StreamEvent::ToolCall(tc)).await;
+            }
+        }
+
         Ok(())
     }
+}
+
+struct AnthropicToolBuilder {
+    id: String,
+    name: String,
+    input_json: String,
 }
 
 impl ChatBackend for AnthropicBackend {

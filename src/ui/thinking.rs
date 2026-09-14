@@ -88,6 +88,21 @@ pub fn is_thinking(src: &str) -> bool {
     split(src).last().is_some_and(|seg| seg.open)
 }
 
+/// Inner text of reasoning segments, used when a model never emits a
+/// non-thinking answer.
+pub fn reasoning_text(src: &str) -> Option<String> {
+    let inner: String = split(src)
+        .into_iter()
+        .filter(|segment| segment.thinking)
+        .map(|segment| segment.text)
+        .collect();
+    if inner.trim().is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
 /// The most recent non-empty line of live reasoning, for the status row.
 pub fn latest_thought(src: &str) -> Option<String> {
     let last = split(src).into_iter().rev().find(|seg| seg.open)?;
@@ -250,6 +265,15 @@ mod tests {
     fn strip_removes_reasoning() {
         assert_eq!(strip("<think>hidden</think>Hi there"), "Hi there");
         assert_eq!(strip("plain"), "plain");
+    }
+
+    #[test]
+    fn reasoning_text_recovers_think_only_messages() {
+        assert_eq!(
+            reasoning_text("<think>only this</think>").as_deref(),
+            Some("only this")
+        );
+        assert!(reasoning_text("just an answer").is_none());
     }
 
     #[test]

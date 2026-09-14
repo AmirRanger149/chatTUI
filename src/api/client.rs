@@ -6,7 +6,7 @@
 //! translates requests into its protocol and parses deltas back out.
 
 use crate::api::providers::ChatBackend;
-use crate::api::types::{Failure, MAX_MODELS_PER_SEND, Message, StreamEvent};
+use crate::api::types::{CompletionRequest, Failure, Message, StreamEvent, ToolDefinition, MAX_MODELS_PER_SEND};
 use anyhow::{anyhow, Result};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -44,6 +44,7 @@ impl ApiClient {
         messages: &[Message],
         model: &str,
         temperature: f32,
+        tools: Vec<ToolDefinition>,
         tx: Sender<StreamEvent>,
     ) -> Result<()> {
         let mut tried: Vec<String> = vec![model.to_string()];
@@ -51,11 +52,10 @@ impl ApiClient {
 
         loop {
             let current = tried.last().cloned().unwrap_or_default();
-            let request = crate::api::types::CompletionRequest {
-                messages: messages.to_vec(),
-                model: current.clone(),
-                temperature,
-            };
+            let mut request = CompletionRequest::new(messages.to_vec(), current.clone(), temperature);
+            if !tools.is_empty() {
+                request = request.with_tools(tools.clone());
+            }
             match self
                 .backend
                 .stream_completion(&request, tx.clone())

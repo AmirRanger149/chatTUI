@@ -23,10 +23,12 @@ pub use commands::SLASH_COMMANDS;
 pub use models::ModelCatalog;
 pub use overlay::Overlay;
 
-use crate::api::types::StreamEvent;
+use crate::api::types::{StreamEvent, ToolCall};
 use crate::config::Config;
+use crate::sandbox::{Sandbox, SandboxConfig};
 use crate::session::manager::SessionManager;
 use anyhow::Result;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Receiver;
 
@@ -37,6 +39,7 @@ pub const MAX_COMPOSER_ROWS: usize = 8;
 /// the page size for pgup/pgdn navigation within an overlay.
 pub const OVERLAY_ROWS: usize = 12;
 const QUIT_PRIME_WINDOW: Duration = std::time::Duration::from_secs(2);
+pub const MAX_AGENT_ITERATIONS: usize = 10;
 
 /// A rendered entry of the conversation transcript.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +48,8 @@ pub enum Cell {
     Assistant(String),
     Error(String),
     Notice(String),
+    ToolCall { name: String, args: String, id: String },
+    ToolResult { id: String, content: String, is_error: bool },
 }
 
 pub struct App {
@@ -73,10 +78,31 @@ pub struct App {
     pub show_thinking: bool,
     pub quit_primed_at: Option<Instant>,
     pub should_quit: bool,
+    // Agent / Sandbox state
+    pub sandbox: Sandbox,
+    pub pending_tool_calls: Vec<ToolCall>,
+    pub agent_iterations: usize,
+    pub agent_mode: bool,
 }
 
 impl App {
     pub fn new(config: Config, sessions: SessionManager) -> Self {
+        // Build sandbox from config — never default to process cwd.
+        let sandbox_config = SandboxConfig {
+            enabled: config.sandbox.enabled,
+            workspace_root: PathBuf::new(),
+            auto_approve: config.sandbox.auto_approve,
+            allow_shell: config.sandbox.allow_shell,
+            max_file_size: 1024 * 1024,
+        };
+        let mut sandbox = Sandbox::new(sandbox_config);
+        let mut target_error = None;
+        if !config.sandbox.workspace_root.trim().is_empty() {
+            if let Err(error) = sandbox.set_target(&config.sandbox.workspace_root) {
+                target_error = Some(error.to_string());
+            }
+        }
+
         let mut app = Self {
             config,
             sessions,
@@ -98,8 +124,15 @@ impl App {
             show_thinking: false,
             quit_primed_at: None,
             should_quit: false,
+            sandbox,
+            pending_tool_calls: Vec::new(),
+            agent_iterations: 0,
+            agent_mode: true, // Agent mode enabled by default when sandbox enabled
         };
         app.rebuild_cells();
+        if let Some(error) = target_error {
+            app.push_error(format!("sandbox target from config is invalid: {error}"));
+        }
         // For providers whose default model is availability-based (custom
         // providers without an explicit `model`),
         // resolve the default against the endpoint's live model list in the
@@ -110,16 +143,42 @@ impl App {
     }
 
     pub(crate) fn rebuild_cells(&mut self) {
-        self.cells = self
-            .sessions
-            .current()
-            .messages
-            .iter()
-            .map(|message| match message.role.as_str() {
-                "assistant" => Cell::Assistant(message.content.clone()),
-                _ => Cell::User(message.content.clone()),
-            })
-            .collect();
+        self.cells = Vec::new();
+        for message in self.sessions.current().messages.iter() {
+            match message.role.as_str() {
+                "assistant" => {
+                    if let Some(tool_calls) = &message.tool_calls {
+                        // Show tool calls as cells
+                        for tc in tool_calls {
+                            self.cells.push(Cell::ToolCall {
+                                name: tc.name.clone(),
+                                args: tc.arguments.clone(),
+                                id: tc.id.clone(),
+                            });
+                        }
+                        if !message.content.is_empty() {
+                            self.cells.push(Cell::Assistant(message.content.clone()));
+                        }
+                    } else {
+                        self.cells.push(Cell::Assistant(message.content.clone()));
+                    }
+                }
+                "tool" => {
+                    let id = message.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string());
+                    self.cells.push(Cell::ToolResult {
+                        id,
+                        content: message.content.clone(),
+                        is_error: false,
+                    });
+                }
+                "user" => {
+                    self.cells.push(Cell::User(message.content.clone()));
+                }
+                _ => {
+                    self.cells.push(Cell::User(message.content.clone()));
+                }
+            }
+        }
     }
 
     // -- transient UI actions -------------------------------------------------
@@ -142,6 +201,8 @@ impl App {
         self.tokens = None;
         self.streaming = false;
         self.stream_started = None;
+        self.pending_tool_calls.clear();
+        self.agent_iterations = 0;
         self.finish_partial();
     }
 
@@ -191,6 +252,15 @@ impl App {
             if crate::ui::thinking::is_thinking(&text) {
                 text.push_str(crate::ui::thinking::CLOSE_TAG);
             }
+            // If the model only streamed reasoning (MiniMax-style), still
+            // surface that text as the visible answer instead of an empty cell.
+            if crate::ui::thinking::strip(&text).is_empty() {
+                if let Some(inner) = crate::ui::thinking::reasoning_text(&text) {
+                    if !inner.trim().is_empty() {
+                        text = inner;
+                    }
+                }
+            }
             self.cells.push(Cell::Assistant(text.clone()));
             self.sessions.add_message("assistant", text);
         }
@@ -204,13 +274,32 @@ impl App {
         self.cells.push(Cell::Notice(message));
     }
 
+    pub(crate) fn push_tool_call(&mut self, tc: &ToolCall) {
+        self.cells.push(Cell::ToolCall {
+            name: tc.name.clone(),
+            args: tc.arguments.clone(),
+            id: tc.id.clone(),
+        });
+    }
+
+    pub(crate) fn push_tool_result(&mut self, id: String, content: String, is_error: bool) {
+        self.cells.push(Cell::ToolResult { id, content, is_error });
+    }
+
     /// The context summary shown on the right-hand side of the footer.
     pub fn context_summary(&self) -> String {
         let session = self.sessions.current();
         let messages = session.messages.len();
         let chars: usize = session.messages.iter().map(|m| m.content.len()).sum();
+        let sandbox_status = if !self.config.sandbox.enabled {
+            " · sandbox:off"
+        } else if self.sandbox.has_target() {
+            " · sandbox:on"
+        } else {
+            " · sandbox:no-target"
+        };
         format!(
-            "{messages} msgs · ~{} tok",
+            "{messages} msgs · ~{} tok{sandbox_status}",
             crate::ui::theme::human_tokens(chars / 4)
         )
     }

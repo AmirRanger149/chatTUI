@@ -16,10 +16,19 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let glyph = SPINNER[(app.elapsed_ms() / 120) as usize % SPINNER.len()];
+    
+    let working_text = if app.agent_iterations > 0 {
+        format!("Agent working (step {}/{})", app.agent_iterations, crate::app::MAX_AGENT_ITERATIONS)
+    } else if app.agent_mode && app.config.sandbox.enabled {
+        "Working (agent)".to_string()
+    } else {
+        "Working".to_string()
+    };
+    
     let line = Line::from(vec![
         Span::styled(glyph, Style::new().fg(theme::ACCENT).bold()),
         Span::raw(" "),
-        Span::styled("Working", Style::new().bold()),
+        Span::styled(working_text, Style::new().bold()),
         Span::raw(" "),
         Span::styled(
             format!("({} • ", theme::fmt_elapsed(app.elapsed_secs())),

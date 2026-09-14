@@ -183,7 +183,6 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::app::App;
     use crate::config::Config;
     use crate::session::manager::SessionManager;

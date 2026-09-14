@@ -15,6 +15,9 @@ pub const SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd { name: "/code", desc: "Browse & copy code blocks" },
     SlashCmd { name: "/model", desc: "Pick a model from the API's list" },
     SlashCmd { name: "/provider", desc: "Select API provider" },
+    SlashCmd { name: "/agent", desc: "Toggle agent mode (sandbox tools)" },
+    SlashCmd { name: "/sandbox", desc: "Show or set agent target dir" },
+    SlashCmd { name: "/target", desc: "Set agent target directory" },
     SlashCmd { name: "/quit", desc: "Exit chatTUI" },
 ];
 
@@ -108,13 +111,42 @@ impl App {
 
     fn run_command(&mut self, text: &str) {
         let mut parts = text.splitn(2, char::is_whitespace);
-        let command = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let command = parts
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(':')
+            .to_ascii_lowercase();
         let argument = parts.next().unwrap_or("").trim().to_string();
         match command.as_str() {
             "/help" => self.overlay = Some(Overlay::Shortcuts),
             "/new" => self.new_chat(),
             "/history" => self.open_history(),
             "/code" => self.open_code(),
+            "/agent" => {
+                self.agent_mode = !self.agent_mode;
+                let status = if self.agent_mode { "enabled" } else { "disabled" };
+                self.push_notice(format!("agent mode {}", status));
+                if self.agent_mode && !self.config.sandbox.enabled {
+                    self.push_notice("sandbox is disabled in config.json - tools will not work".into());
+                } else if self.agent_mode && !self.sandbox.has_target() {
+                    self.push_notice(
+                        "no target directory — set one with /sandbox <path> before agent writes".into(),
+                    );
+                }
+            }
+            "/sandbox" | "/target" => {
+                if argument.is_empty() {
+                    self.push_sandbox_status();
+                } else if let Err(error) = self.set_sandbox_target(&argument) {
+                    self.push_error(error);
+                } else {
+                    self.push_notice(format!(
+                        "sandbox target set to {}",
+                        self.sandbox.config.workspace_root.display()
+                    ));
+                }
+            }
             "/model" => {
                 if argument.is_empty() {
                     self.open_models();
@@ -160,6 +192,35 @@ impl App {
         }
     }
 
+    pub fn set_sandbox_target(&mut self, raw: &str) -> Result<(), String> {
+        match self.sandbox.set_target(raw) {
+            Ok(path) => {
+                self.config.sandbox.workspace_root = path.display().to_string();
+                Ok(())
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn push_sandbox_status(&mut self) {
+        let root = if self.sandbox.has_target() {
+            self.sandbox.config.workspace_root.display().to_string()
+        } else {
+            "(unset — /sandbox <path>)".to_string()
+        };
+        let status = if self.sandbox.config.enabled { "enabled" } else { "disabled" };
+        let agent = if self.agent_mode { "on" } else { "off" };
+        self.push_notice(format!(
+            "sandbox: {status} | agent: {agent} | root: {root} | shell: {} | auto-approve: {}",
+            self.sandbox.config.allow_shell, self.sandbox.config.auto_approve
+        ));
+        if !self.sandbox.has_target() {
+            self.push_notice(
+                "agent tools will not write until a target is set with /sandbox <dir>".into(),
+            );
+        }
+    }
+
     pub fn new_chat(&mut self) {
         if self.sessions.current().messages.is_empty() {
             self.push_notice("already in a new conversation".into());
@@ -168,6 +229,8 @@ impl App {
         self.sessions.new_session();
         self.rebuild_cells();
         self.scroll_from_bottom = 0;
+        self.agent_iterations = 0;
+        self.pending_tool_calls.clear();
     }
 }
 
@@ -256,5 +319,56 @@ mod tests {
         app.composer = "/provider unknown_prov".into();
         app.submit();
         assert!(matches!(app.cells.last(), Some(Cell::Error(_))));
+    }
+
+    #[test]
+    fn agent_toggle_works() {
+        let mut app = test_app();
+        let initial = app.agent_mode;
+        app.composer = "/agent".into();
+        app.submit();
+        assert_ne!(app.agent_mode, initial);
+        assert!(matches!(app.cells.last(), Some(Cell::Notice(_))));
+    }
+
+    #[test]
+    fn sandbox_status_does_not_default_to_crate_root() {
+        let app = test_app();
+        assert!(!app.sandbox.has_target());
+        let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_ne!(app.sandbox.config.workspace_root, crate_root);
+    }
+
+    #[test]
+    fn sandbox_command_sets_explicit_target() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!("chatTUI_cmd_dst_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        app.composer = format!("/sandbox {}", dir.display());
+        app.submit();
+        assert!(app.sandbox.has_target());
+        let root = app.sandbox.config.workspace_root.canonicalize().unwrap();
+        let expected = dir.canonicalize().unwrap();
+        assert_eq!(root, expected);
+        let crate_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap();
+        assert_ne!(root, crate_root);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandbox_colon_syntax_sets_target() {
+        let mut app = test_app();
+        let dir = std::env::temp_dir().join(format!("chatTUI_cmd_colon_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        app.composer = format!("/sandbox: {}", dir.display());
+        app.submit();
+        assert!(app.sandbox.has_target());
+        assert_eq!(
+            app.sandbox.config.workspace_root.canonicalize().unwrap(),
+            dir.canonicalize().unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

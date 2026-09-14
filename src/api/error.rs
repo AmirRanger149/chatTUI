@@ -63,6 +63,13 @@ pub(crate) fn classify_failure(status: u16, body: &str) -> Failure {
         return Failure::Retryable(compact_failure("the model is not available", status, body));
     }
 
+    // Project/key valid but this model is not enabled (common on 403).
+    if status == 403
+        && (lower.contains("model") || lower.contains("does not have access"))
+    {
+        return Failure::Retryable(compact_failure("the model rejected the request", status, body));
+    }
+
     Failure::Fatal(compact_failure("the request failed", status, body))
 }
 
@@ -132,6 +139,13 @@ mod tests {
             Failure::Fatal(_)
         ));
         assert!(matches!(classify_failure(405, "method not allowed"), Failure::Fatal(_)));
+        assert!(matches!(
+            classify_failure(
+                403,
+                "Project `proj_x` does not have access to model `gpt-4o-mini`"
+            ),
+            Failure::Retryable(_)
+        ));
         // Mid-stream failure texts follow the same rules.
         assert!(matches!(
             classify_failure(0, "Model is currently getting high demand, try later"),

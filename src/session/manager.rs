@@ -4,9 +4,20 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallRecord>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,10 +117,13 @@ impl SessionManager {
         self.store.current = 0;
         let _ = self.save();
     }
+
     pub fn add_message(&mut self, role: impl Into<String>, content: impl Into<String>) {
         let message = Message {
             role: role.into(),
             content: content.into(),
+            tool_call_id: None,
+            tool_calls: None,
         };
         let session = self.current_mut();
         if session.title == "New conversation" && message.role == "user" {
@@ -123,6 +137,28 @@ impl SessionManager {
                 .collect();
         }
         session.messages.push(message);
+        let _ = self.save();
+    }
+
+    pub fn add_tool_result(&mut self, tool_call_id: impl Into<String>, content: impl Into<String>) {
+        let message = Message {
+            role: "tool".into(),
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_calls: None,
+        };
+        self.current_mut().messages.push(message);
+        let _ = self.save();
+    }
+
+    pub fn add_assistant_with_tools(&mut self, content: impl Into<String>, tool_calls: Vec<ToolCallRecord>) {
+        let message = Message {
+            role: "assistant".into(),
+            content: content.into(),
+            tool_call_id: None,
+            tool_calls: Some(tool_calls),
+        };
+        self.current_mut().messages.push(message);
         let _ = self.save();
     }
 }

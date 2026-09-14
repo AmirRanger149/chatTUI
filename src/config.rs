@@ -112,6 +112,33 @@ fn is_default_temperature(val: &f32) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfigFile {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default, alias = "target_dir")]
+    pub workspace_root: String,
+    #[serde(default = "default_true")]
+    pub auto_approve: bool,
+    #[serde(default = "default_true")]
+    pub allow_shell: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for SandboxConfigFile {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            workspace_root: String::new(),
+            auto_approve: true,
+            allow_shell: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_api_key: Option<String>,
@@ -139,6 +166,12 @@ pub struct Config {
     pub temperature: f32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
+    #[serde(default, skip_serializing_if = "is_default_sandbox")]
+    pub sandbox: SandboxConfigFile,
+}
+
+fn is_default_sandbox(cfg: &SandboxConfigFile) -> bool {
+    cfg.enabled && cfg.workspace_root.is_empty() && cfg.auto_approve && cfg.allow_shell
 }
 
 impl Default for Config {
@@ -155,6 +188,7 @@ impl Default for Config {
             model: String::new(),
             temperature: 0.7,
             provider: String::new(),
+            sandbox: SandboxConfigFile::default(),
         };
         // Pick up every provider's key from its environment variable.
         for provider in builtin_providers() {
