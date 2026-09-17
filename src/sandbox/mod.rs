@@ -448,7 +448,7 @@ impl Sandbox {
 
     /// Shared pre-flight checks for shell execution; returns the trimmed
     /// command on success.
-    fn prepare_shell(&self, command: &str) -> Result<&str> {
+    fn prepare_shell<'a>(&self, command: &'a str) -> Result<&'a str> {
         if !self.has_target() {
             return Err(anyhow!(
                 "no target directory set — use /sandbox <path> or --sandbox <path>"
@@ -737,8 +737,8 @@ fn run_isolated_shell(
 
     // Drain both pipes concurrently so a chatty child can never fill them
     // and deadlock while `wait()` runs.
-    let stdout_pipe = child.stdout.take().ok_or_else(|| "stdout unavailable".to_string())?;
-    let stderr_pipe = child.stderr.take().ok_or_else(|| "stderr unavailable".to_string())?;
+    let mut stdout_pipe = child.stdout.take().ok_or_else(|| "stdout unavailable".to_string())?;
+    let mut stderr_pipe = child.stderr.take().ok_or_else(|| "stderr unavailable".to_string())?;
     let stdout_reader = std::thread::spawn(move || {
         let mut buffer = Vec::new();
         let _ = stdout_pipe.read_to_end(&mut buffer);

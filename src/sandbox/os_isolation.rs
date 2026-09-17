@@ -167,14 +167,19 @@ pub(crate) fn writable_roots(_workspace: &std::path::Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
-#[cfg(unix)]
-const WRITE_ONLY_DEVICES: &[&str] = &[
+#[cfg(target_os = "linux")]
+pub(crate) const WRITE_ONLY_DEVICES: &[&str] = &[
     "/dev/null",
     "/dev/full",
     "/dev/zero",
     "/dev/random",
     "/dev/urandom",
 ];
+
+/// Non-Linux platforms have no Landlock layer, so there is nothing to
+/// grant; the constant exists so callers compile unchanged.
+#[cfg(not(target_os = "linux"))]
+pub(crate) const WRITE_ONLY_DEVICES: &[&str] = &[];
 
 // ---------------------------------------------------------------------------
 // libc plumbing shared by both facilities
@@ -200,7 +205,7 @@ fn set_no_new_privs() -> Result<(), std::io::Error> {
 mod landlock {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
     const SYS_LANDLOCK_ADD_RULE: libc::c_long = 445;
@@ -450,6 +455,7 @@ mod seccomp {
         recvmsg: 47,
         shutdown: 48,
         bind: 49,
+        listen: 50,
         clone: 56,
         ptrace: 101,
         mount: 165,
@@ -473,6 +479,7 @@ mod seccomp {
         bpf: 321,
         userfaultfd: 323,
         sendmmsg: 307,
+        setns: 308,
     };
 
     #[cfg(target_arch = "aarch64")]
@@ -512,6 +519,7 @@ mod seccomp {
         bpf: 386,
         userfaultfd: 282,
         sendmmsg: 269,
+        setns: 268,
     };
 
     // Syscalls >= 424 share one table across architectures.
