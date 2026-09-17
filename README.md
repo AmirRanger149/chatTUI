@@ -410,15 +410,29 @@ and a shell. What is actually enforced — and what is not:
   (`.env`, `*.env`), key material (`*.pem`, `*.key`, `*.p12`, `*.pfx`,
   `*.jks`, SSH private keys), `.git/config`, and every write under `.git/`.
   Add names via `sandbox.extra_sensitive_names` in `config.json`.
-- **The `bash` tool is NOT a sandbox.** Commands run via `sh -c` with the
-  workspace as the current directory only. They run with your full user
-  privileges and can read or write files outside the workspace, reach the
-  network, and spawn processes. Treat model-generated shell commands with
-  the same caution you would treat any script from an LLM.
-- **Shell hardening that is applied:** a hard timeout (default 30s,
+- **The `bash` tool has a hard timeout** (default 30s,
   `sandbox.shell_timeout_secs`; the command's process group is killed when
-  it expires) and a reduced environment — credential-like variables such as
-  API keys are not passed to shell commands.
+  it expires) and a **reduced environment** — credential-like variables such
+  as API keys are not passed to shell commands.
+- **Kernel-level isolation for shell commands** (Linux, on by default via
+  `sandbox.os_isolation: "auto"`): before a command runs, the kernel is
+  told to confine it — Landlock rules allow reads everywhere but restrict
+  *writes* to the workspace plus a small set of scratch roots (`/tmp`,
+  `$TMPDIR`, `/dev/shm`, `$CARGO_HOME`, `$CARGO_TARGET_DIR`), and a seccomp
+  filter denies network sockets, `ptrace`/process-memory injection,
+  kernel-module loading, and namespace/mount tricks. The restrictions
+  cannot be undone by the command. On kernels older than 5.13 (or with the
+  facilities unavailable), `"auto"` runs the command unrestricted and says
+  so in the tool output; `"require"` refuses to run instead; `"off"`
+  restores the previous, unrestricted behavior.
+- **What isolation does not cover, by design:** reads outside the workspace
+  stay possible (toolchains must read system files), so secret-*read*
+  protection remains the application-level sensitive-file policy described
+  above; Unix-socket `connect()` is denied, so tools that talk to local
+  daemons fail; a kernel vulnerability could defeat any in-process
+  sandbox; and if your user account can access privileged host resources
+  (e.g. a container-daemon socket), remove that access on the host — no
+  in-process sandbox can close it.
 - **Permissions:** `sandbox.permission_mode` selects `read-only`,
   `workspace-write`, `ask-before-write`, `ask-before-shell` or `full-auto`.
   When unset, the legacy `auto_approve` / `allow_shell` flags decide.
@@ -427,9 +441,10 @@ and a shell. What is actually enforced — and what is not:
 - **Agent loop:** tool-call rounds are capped (`MAX_AGENT_ITERATIONS = 10`),
   and `Esc` aborts the in-flight model request.
 
-True isolation (seccomp/landlock, containers, VMs) is not implemented; until
-it is, this system is accurately described as *workspace-restricted tool
-execution*, not a sandbox.
+When kernel isolation is unavailable or disabled, this system is accurately
+described as *workspace-restricted tool execution*, not a sandbox; with
+isolation active, the shell boundary is kernel-enforced for writes, network,
+and process access.
 
 ## Saved Data
 

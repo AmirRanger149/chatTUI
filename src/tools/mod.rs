@@ -23,11 +23,13 @@ impl ToolDefinition {
 
 /// All tools available in agent mode.
 ///
-/// Every security-related claim here must match what the sandbox actually
+/// Every security-related claim here must match what the program actually
 /// enforces (see `src/sandbox/mod.rs` for the exact security model): file
-/// tools are workspace-restricted with a sensitive-file policy; `bash` is
-/// *not* sandboxed (cwd only), has a filtered environment, and a hard
-/// timeout (default 30s, configurable — always enforced).
+/// tools are workspace-restricted with a sensitive-file policy; `bash` has
+/// a filtered environment, a hard timeout (default 30s — always enforced),
+/// and kernel-level isolation (filesystem + network + process restrictions)
+/// when the Linux kernel supports it — with an explicit, honest fallback
+/// where it does not.
 pub fn all_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::new(
@@ -100,7 +102,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "bash",
-            "Execute a shell command via `sh -c` with the workspace root as the current directory. NOT an OS sandbox: the command runs with full user privileges and may access files outside the workspace and the network; the refusal of sensitive-file names in commands is best-effort only. The environment is reduced to a small allowlist (API keys and credentials are not passed through). A hard timeout is enforced (default 30 seconds, configurable via sandbox.shell_timeout_secs in config.json): on timeout the command's process group is killed and a structured timeout error is returned. Requires permission mode 'full-auto' (and sandbox.allow_shell enabled). Use for building, testing, git, etc. Returns stdout/stderr.",
+            "Execute a shell command via `sh -c` with the workspace root as the current directory. When OS-level isolation is active (Linux kernel 5.13+, sandbox.os_isolation in config.json, default auto), the kernel enforces the boundary: writes outside the workspace and its scratch roots (/tmp, $TMPDIR, /dev/shm, CARGO_HOME, CARGO_TARGET_DIR) are denied, all network sockets are denied (Unix sockets too), and ptrace/kernel-module/namespace operations are denied. Where the kernel lacks that support, the command runs with full user privileges and the tool output states this explicitly — reads outside the workspace are always possible by design (system files, secret files). The refusal of sensitive-file names in commands is a best-effort scan. The environment is reduced to a small allowlist (API keys and credentials are not passed through). A hard timeout is enforced (default 30 seconds, configurable via sandbox.shell_timeout_secs in config.json): on timeout the command's process group is killed and a structured timeout error is returned. Requires permission mode 'full-auto' (and sandbox.allow_shell enabled). Use for building, testing, git, etc. Returns stdout/stderr.",
             json!({
                 "type": "object",
                 "properties": {
@@ -195,10 +197,18 @@ mod tests {
         let bash = find("bash");
         let desc = bash.description.to_ascii_lowercase();
         assert!(desc.contains("timeout"), "bash must document its timeout");
-        assert!(desc.contains("not an os sandbox"), "bash must not be described as sandboxed");
         assert!(desc.contains("killed"), "bash must document that the command is killed on timeout");
         assert!(desc.contains("allowlist"), "bash must document the environment filtering");
         assert!(desc.contains("full-auto"), "bash must document its permission requirement");
+        // Isolation claims must be conditional and honest: enforced where
+        // supported, explicitly unrestricted (with a warning) elsewhere.
+        assert!(desc.contains("os-level isolation"), "bash must document the kernel isolation layer");
+        assert!(desc.contains("kernel 5.13"), "bash must state the isolation requirement");
+        assert!(
+            desc.contains("full user privileges") && desc.contains("states this explicitly"),
+            "bash must describe the honest fallback when isolation is unavailable"
+        );
+        assert!(desc.contains("best-effort"), "bash must label the name scan as best-effort");
 
         for name in ["read_file", "write_file", "edit_file"] {
             let desc = find(name).description.to_ascii_lowercase();

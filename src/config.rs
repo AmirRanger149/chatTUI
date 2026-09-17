@@ -132,6 +132,12 @@ pub struct SandboxConfigFile {
     /// flags exactly as in earlier versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
+    /// Kernel-level isolation for shell commands: "auto" (default — apply
+    /// it when the Linux kernel supports it, warn honestly otherwise),
+    /// "require" (refuse shell commands when unavailable), or "off"
+    /// (never apply; commands run with full user privileges).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_isolation: Option<String>,
     /// Extra sensitive file names appended to the built-in policy. An entry
     /// starting with "." matches any file name ending with it; anything
     /// else must equal the file name (case-insensitively).
@@ -156,6 +162,7 @@ impl Default for SandboxConfigFile {
             allow_shell: true,
             shell_timeout_secs: default_shell_timeout_secs(),
             permission_mode: None,
+            os_isolation: None,
             extra_sensitive_names: Vec::new(),
         }
     }
@@ -200,6 +207,7 @@ fn is_default_sandbox(cfg: &SandboxConfigFile) -> bool {
         && cfg.allow_shell
         && cfg.shell_timeout_secs == default_shell_timeout_secs()
         && cfg.permission_mode.is_none()
+        && cfg.os_isolation.is_none()
         && cfg.extra_sensitive_names.is_empty()
 }
 
@@ -761,6 +769,7 @@ mod tests {
         assert!(config.sandbox.allow_shell);
         assert_eq!(config.sandbox.shell_timeout_secs, 30);
         assert_eq!(config.sandbox.permission_mode, None);
+        assert_eq!(config.sandbox.os_isolation, None);
         assert!(config.sandbox.extra_sensitive_names.is_empty());
         assert!(is_default_sandbox(&config.sandbox));
     }
@@ -773,6 +782,7 @@ mod tests {
                     "workspace_root": "/tmp/project",
                     "permission_mode": "workspace-write",
                     "shell_timeout_secs": 120,
+                    "os_isolation": "require",
                     "extra_sensitive_names": ["secrets.json", ".token"]
                 }
             }"#,
@@ -784,6 +794,7 @@ mod tests {
             Some("workspace-write")
         );
         assert_eq!(config.sandbox.shell_timeout_secs, 120);
+        assert_eq!(config.sandbox.os_isolation.as_deref(), Some("require"));
         assert_eq!(config.sandbox.extra_sensitive_names.len(), 2);
         assert!(!is_default_sandbox(&config.sandbox));
     }

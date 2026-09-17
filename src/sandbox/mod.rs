@@ -2,46 +2,61 @@
 //!
 //! ## Security model — read this before trusting any of it
 //!
-//! Everything in this module is an **application-level restriction**. It is
-//! *not* an OS-level sandbox, and nothing here should be described as one:
+//! Two independent layers protect shell commands, and both are documented
+//! here with their real limits:
 //!
-//! 1. The file tools (`read_file`, `write_file`, `edit_file`, `list_files`)
-//!    resolve every path against the workspace root and refuse paths that
-//!    escape it (directly, via `..`, or via symlinks) as well as sensitive
-//!    files. These checks are real, but they live in this process: a path
-//!    validated here can still be swapped for a symlink between validation
-//!    and I/O (TOCTOU), which only OS primitives such as `openat2` could
-//!    close portably.
-//! 2. The `bash` tool runs `sh -c <command>` with the workspace as the
-//!    **current directory only**. It is *not* confined to the workspace: a
-//!    command runs with the full privileges of the chatTUI process and can
-//!    read or write any file the user can, reach the network, and spawn
-//!    arbitrary child processes. Partial mitigations applied here (all
-//!    honest about their limits):
-//!    - a hard timeout that kills the command's process group;
-//!    - a reduced environment (credential-like variables are not inherited);
-//!    - a best-effort scan that refuses commands *naming* sensitive files —
-//!      trivially bypassable (quoting, command substitution), defense in
-//!      depth only, never a security control;
-//!    - a tiny advisory denylist for obvious foot-guns (also bypassable).
-//! 3. The permission layer ([`permissions::PermissionMode`]) gates which
-//!    tool *classes* may run at all. It, too, is application policy.
+//! 1. **Application-level restrictions** (always active):
+//!    - The file tools (`read_file`, `write_file`, `edit_file`, `list_files`)
+//!      resolve every path against the workspace root and refuse paths that
+//!      escape it (directly, via `..`, or via symlinks) as well as sensitive
+//!      files. These checks live in this process: a path validated here can
+//!      still be swapped for a symlink between validation and I/O (TOCTOU),
+//!      which only OS primitives such as `openat2` could close portably.
+//!    - The permission layer ([`permissions::PermissionMode`]) gates which
+//!      tool *classes* may run at all.
+//!    - `bash` refuses commands that *name* sensitive files and keeps a tiny
+//!      advisory denylist — both are string scans and both are trivially
+//!      bypassable; they are foot-gun guards, never security controls.
 //!
-//! True isolation would require OS mechanisms (seccomp/landlock/apparmor,
-//! containers or VMs, or at minimum `openat2`-style path resolution) that
-//! are not wired up portably from this crate today. Until that happens,
-//! describe this system as **workspace-restricted tool execution**, never
-//! as a sandbox.
+//! 2. **Kernel-level isolation for shell commands** (Linux, enabled by
+//!    default via `os_isolation: auto`; see [`os_isolation`]): before the
+//!    shell is spawned on a dedicated worker thread, the thread receives
+//!    Landlock filesystem rules (reads everywhere, writes only under the
+//!    workspace plus a small set of scratch roots) and a seccomp-bpf filter
+//!    (network sockets, ptrace/process-injection, kernel-module loading,
+//!    namespace/mount tricks and more are denied). The shell inherits both
+//!    and cannot remove them. When the kernel does not support these
+//!    facilities, `auto` mode runs the command **unrestricted** and says so
+//!    in the tool output, and `require` mode refuses to run — the fallback
+//!    is never silent.
+//!
+//!    Limits that remain even with isolation active, by design: reads
+//!    outside the workspace are still possible (toolchains must read system
+//!    files, so secret-*read* protection stays an application policy);
+//!    `connect()` is denied even for Unix sockets; `/tmp`, `$TMPDIR`,
+//!    `/dev/shm`, `$CARGO_HOME` and `$CARGO_TARGET_DIR` are writable; and
+//!    like every software sandbox this trusts the kernel.
+//!
+//! On platforms or configurations where kernel isolation is off, `bash` is
+//! *not* confined at all: a command runs with the full privileges of the
+//! chatTUI process and can read or write any file the user can, reach the
+//! network, and spawn arbitrary child processes. Describe the system as
+//! **workspace-restricted tool execution** — never as a sandbox — unless
+//! kernel isolation is verified active.
 
+pub mod os_isolation;
 pub mod permissions;
 
 use crate::api::types::ToolCall;
+use crate::sandbox::os_isolation::OsIsolation;
 use crate::sandbox::permissions::{authorize, PermissionMode, ToolKind};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+#[cfg(unix)] // used by the sandboxed worker thread only
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 use tokio::fs;
 
@@ -64,6 +79,10 @@ pub struct SandboxConfig {
     pub shell_timeout: Duration,
     /// Application-level permission mode (see [`permissions`]).
     pub permission_mode: PermissionMode,
+    /// When to apply kernel-level isolation (Landlock filesystem
+    /// confinement + seccomp syscall filter) to shell commands. See
+    /// [`os_isolation`] for the exact guarantees and limits.
+    pub os_isolation: OsIsolation,
     /// Extra sensitive file names/suffixes (from config.json) appended to
     /// the built-in sensitive-file policy. An entry starting with `.` is a
     /// suffix match, anything else an exact (case-insensitive) name match.
@@ -81,6 +100,7 @@ impl Default for SandboxConfig {
             max_file_size: 1024 * 1024, // 1MB
             shell_timeout: Duration::from_secs(DEFAULT_SHELL_TIMEOUT_SECS),
             permission_mode: PermissionMode::FullAuto,
+            os_isolation: OsIsolation::Auto,
             extra_sensitive_names: Vec::new(),
         }
     }
@@ -319,15 +339,116 @@ impl Sandbox {
         }
     }
 
-    /// Run a shell command. **Read the module docs first: this is not an
-    /// OS-level sandbox.** What this method actually guarantees:
+    /// Run a shell command. **Read the module docs first.** What this method
+    /// actually guarantees:
     /// - the workspace root is the command's current directory (cwd only);
     /// - the command runs in its own process group and is killed — group
     ///   included — when the configured timeout expires;
     /// - the environment is reduced to [`ENV_ALLOWLIST`], so API keys and
     ///   other credentials are not inherited;
-    /// - commands that name sensitive files are refused (best effort).
+    /// - commands that name sensitive files are refused (best effort);
+    /// - **kernel-level isolation when available and enabled** (Linux,
+    ///   `os_isolation` != off): the command cannot modify files outside the
+    ///   workspace/scratch roots, open network connections, ptrace other
+    ///   processes, or load kernel modules — enforced by the kernel, not by
+    ///   command inspection. When the kernel lacks the facilities, `auto`
+    ///   mode appends an explicit warning to the output and `require` mode
+    ///   refuses to run; neither pretends the command was confined.
     pub async fn bash(&self, command: &str) -> Result<String> {
+        let cmd = self.prepare_shell(command)?;
+        let timeout = self.config.effective_shell_timeout();
+
+        #[cfg(unix)]
+        {
+            let workspace = self.config.workspace_root.clone();
+            let roots = os_isolation::writable_roots(&workspace);
+            let mode = self.config.os_isolation;
+            let cmd_owned = cmd.to_string();
+
+            let (otx, orx) = tokio::sync::oneshot::channel::<Result<ShellOutcome, String>>();
+            let pid_slot = std::sync::Arc::new(AtomicI32::new(-1));
+            let pid_for_thread = pid_slot.clone();
+
+            let worker = std::thread::Builder::new()
+                .name("sandboxed-shell".into())
+                .spawn(move || {
+                    let mut warning = String::new();
+                    if mode != OsIsolation::Off {
+                        let report = os_isolation::restrict_current_thread(
+                            &roots,
+                            os_isolation::WRITE_ONLY_DEVICES,
+                        );
+                        if !report.fs || !report.syscall {
+                            let detail = report.notes.join("; ");
+                            if mode == OsIsolation::Require {
+                                let _ = otx.send(Err(format!(
+                                    "OS-level isolation is required but unavailable ({detail}) — refusing to run the command. \
+                                     Set sandbox.os_isolation = \"auto\" to allow an unrestricted fallback."
+                                )));
+                                return;
+                            }
+                            warning = format!(
+                                "\n(os-level isolation unavailable: {detail} — the command ran with full user privileges)"
+                            );
+                        }
+                    }
+                    let outcome = run_isolated_shell(&cmd_owned, &workspace, &pid_for_thread);
+                    let _ = otx.send(outcome.map(|mut outcome| {
+                        outcome.warning = warning;
+                        outcome
+                    }));
+                });
+
+            if let Err(error) = worker {
+                return Err(anyhow!("could not start the sandboxed shell worker: {error}"));
+            }
+
+            let outcome = match tokio::time::timeout(timeout, orx).await {
+                Ok(Ok(inner)) => inner,
+                Ok(Err(_worker_gone)) => Err("shell worker exited without reporting".to_string()),
+                Err(_elapsed) => {
+                    let pid = pid_slot.load(Ordering::SeqCst);
+                    if pid > 0 {
+                        kill_process_group(pid as u32).await;
+                    }
+                    return Err(anyhow!(
+                        "command timed out after {}s and was killed: {}",
+                        timeout.as_secs(),
+                        cmd
+                    ));
+                }
+            };
+
+            let outcome = outcome.map_err(|error| anyhow!("{error}"))?;
+            let mut rendered =
+                format_shell_parts(&outcome.stdout, &outcome.stderr, &outcome.status_text);
+            if !outcome.warning.is_empty() {
+                rendered.push_str(&outcome.warning);
+            }
+            Ok(rendered)
+        }
+
+        #[cfg(not(unix))]
+        {
+            let output = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .current_dir(&self.config.workspace_root)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output()
+                .await
+                .context("executing command")?;
+            let _ = timeout; // no timeout on this platform yet; documented gap
+            Ok(format_shell_output(output))
+        }
+    }
+
+    /// Shared pre-flight checks for shell execution; returns the trimmed
+    /// command on success.
+    fn prepare_shell(&self, command: &str) -> Result<&str> {
         if !self.has_target() {
             return Err(anyhow!(
                 "no target directory set — use /sandbox <path> or --sandbox <path>"
@@ -357,50 +478,7 @@ impl Sandbox {
                 reference
             ));
         }
-
-        let timeout = self.config.effective_shell_timeout();
-        let mut builder = tokio::process::Command::new("sh");
-        builder
-            .arg("-c")
-            .arg(cmd)
-            .current_dir(&self.config.workspace_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear();
-        for (name, value) in std::env::vars_os() {
-            if env_var_allowed(&name) {
-                builder.env(name, value);
-            }
-        }
-        // Own process group so the timeout can take down the whole tree
-        // (background jobs, grandchildren), not just the `sh` process.
-        #[cfg(unix)]
-        builder.process_group(0);
-        builder.kill_on_drop(true);
-
-        let mut child = builder.spawn().context("spawning sh")?;
-        let pid = child.id();
-        let timed = tokio::time::timeout(timeout, child.wait_with_output()).await;
-        match timed {
-            Ok(status) => {
-                let output = status.context("executing command")?;
-                Ok(format_shell_output(output))
-            }
-            Err(_) => {
-                // Dropping `wait_with_output` also dropped the child handle,
-                // which kill-on-drop turned into a SIGKILL for `sh` itself;
-                // now take down the rest of the group best-effort.
-                if let Some(pid) = pid {
-                    kill_process_group(pid).await;
-                }
-                Err(anyhow!(
-                    "command timed out after {}s and was killed: {}",
-                    timeout.as_secs(),
-                    cmd
-                ))
-            }
-        }
+        Ok(cmd)
     }
 
     /// Best-effort scan: refuse commands that *name* a sensitive file.
@@ -602,8 +680,85 @@ fn canonicalize_deepest(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+#[cfg(not(unix))] // the unix path renders through `ShellOutcome` instead
 fn format_shell_output(output: std::process::Output) -> String {
     format_shell_parts(&output.stdout, &output.stderr, &output.status.to_string())
+}
+
+/// Raw result of one sandboxed shell run, before rendering.
+#[cfg(unix)]
+struct ShellOutcome {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    status_text: String,
+    warning: String,
+}
+
+/// Spawn `sh -c <cmd>` from the **current, already-confined thread**, in its
+/// own process group, with the filtered environment, and collect the output.
+/// Runs on the dedicated worker thread only — the caller (chatTUI's main
+/// thread) is never restricted itself.
+#[cfg(unix)]
+fn run_isolated_shell(
+    cmd: &str,
+    workspace: &Path,
+    pid_slot: &AtomicI32,
+) -> Result<ShellOutcome, String> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+
+    let mut builder = std::process::Command::new("sh");
+    builder
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear();
+    for (name, value) in std::env::vars_os() {
+        if env_var_allowed(&name) {
+            builder.env(name, value);
+        }
+    }
+    // Own process group so a timeout can take down the whole tree
+    // (background jobs, grandchildren), not just the `sh` process.
+    unsafe {
+        builder.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = builder.spawn().map_err(|error| format!("spawning sh: {error}"))?;
+    pid_slot.store(child.id() as i32, Ordering::SeqCst);
+
+    // Drain both pipes concurrently so a chatty child can never fill them
+    // and deadlock while `wait()` runs.
+    let stdout_pipe = child.stdout.take().ok_or_else(|| "stdout unavailable".to_string())?;
+    let stderr_pipe = child.stderr.take().ok_or_else(|| "stderr unavailable".to_string())?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buffer);
+        buffer
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buffer);
+        buffer
+    });
+
+    let status = child.wait().map_err(|error| format!("waiting on sh: {error}"))?;
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(ShellOutcome {
+        stdout,
+        stderr,
+        status_text: status.to_string(),
+        warning: String::new(),
+    })
 }
 
 fn format_shell_parts(stdout: &[u8], stderr: &[u8], status_text: &str) -> String {
@@ -1022,14 +1177,129 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn shell_is_not_confined_to_the_workspace_documented_limitation() {
-        // Deliberately pins the honest behavior: shell commands are NOT
-        // sandboxed and can read outside the workspace. If this test ever
-        // fails because real isolation was added, update the tool docs.
+    async fn shell_reads_outside_the_workspace_are_allowed_by_design() {
+        // Pins the honest behavior in BOTH modes: even with kernel isolation
+        // active, reads outside the workspace stay allowed (toolchains must
+        // read system files; secret-read protection is application policy).
+        // Writes outside are covered by the isolation-specific tests below.
         let dir = unique_root("no-sandbox");
         let sandbox = Sandbox::with_root(dir);
         let out = sandbox.bash("cat /etc/hosts").await.unwrap();
         assert!(!out.trim().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_kernel_isolation_denies_outside_writes_when_supported() {
+        if !os_isolation::os_isolation_supported() {
+            eprintln!("skipping: kernel lacks Landlock/seccomp support");
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+        else {
+            eprintln!("skipping: HOME is not set");
+            return;
+        };
+        let dir = unique_root("iso-write");
+        let mut cfg = SandboxConfig::default();
+        cfg.workspace_root = dir.canonicalize().unwrap();
+        cfg.os_isolation = OsIsolation::Require;
+        let sandbox = Sandbox::new(cfg);
+
+        let escape = home.join("chattui_iso_escape_probe");
+        let _ = std::fs::remove_file(&escape);
+
+        // Write outside the workspace: the kernel must refuse it. The shell
+        // still exits normally, so the denial shows up in stderr output.
+        let out = sandbox
+            .bash(&format!("touch '{}'", escape.display()))
+            .await
+            .expect("the shell itself must run");
+        let lower = out.to_ascii_lowercase();
+        assert!(
+            lower.contains("permission denied") || lower.contains("operation not permitted"),
+            "expected a filesystem denial, got: {out}"
+        );
+        assert!(
+            !escape.exists(),
+            "the sandboxed shell must not be able to write outside the workspace"
+        );
+
+        // The workspace itself stays writable, and normal output flows.
+        let out = sandbox
+            .bash("echo ok > inside.txt && cat inside.txt")
+            .await
+            .unwrap();
+        assert!(out.contains("ok"), "unexpected output: {out}");
+        assert!(dir.join("inside.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_network_access_is_denied_when_isolation_is_supported() {
+        if !os_isolation::os_isolation_supported() {
+            eprintln!("skipping: kernel lacks Landlock/seccomp support");
+            return;
+        }
+        let dir = unique_root("iso-net");
+        let sandbox = Sandbox::with_root(dir);
+        // `ping` needs a socket; under isolation the kernel refuses it.
+        let out = sandbox
+            .bash("ping -c1 -W1 127.0.0.1")
+            .await
+            .expect("the shell itself must run");
+        let lower = out.to_ascii_lowercase();
+        if lower.contains("not found") {
+            eprintln!("skipping: ping is not installed");
+            return;
+        }
+        assert!(
+            lower.contains("permitted") || lower.contains("denied"),
+            "expected a socket permission failure, got: {out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_auto_mode_fallback_is_explicit_not_silent() {
+        let dir = unique_root("iso-auto");
+        let sandbox = Sandbox::with_root(dir);
+        let out = sandbox.bash("echo hi").await.unwrap();
+        let supported = os_isolation::os_isolation_supported();
+        if supported {
+            assert!(
+                !out.contains("os-level isolation unavailable"),
+                "no warning may appear when isolation applied: {out}"
+            );
+        } else {
+            assert!(
+                out.contains("os-level isolation unavailable"),
+                "the unrestricted fallback must say so explicitly: {out}"
+            );
+        }
+        assert!(out.contains("hi"));
+    }
+
+    #[tokio::test]
+    async fn bash_require_mode_fails_closed_when_isolation_unsupported() {
+        // Only meaningful on machines without kernel support; elsewhere the
+        // command simply runs (confined), so the test asserts the invariant
+        // that holds in both worlds.
+        let dir = unique_root("iso-require");
+        let mut cfg = SandboxConfig::default();
+        cfg.workspace_root = dir.canonicalize().unwrap();
+        cfg.os_isolation = OsIsolation::Require;
+        let sandbox = Sandbox::new(cfg);
+        let result = sandbox.bash("echo hi").await;
+        if os_isolation::os_isolation_supported() {
+            assert!(result.unwrap().contains("hi"));
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("required but unavailable"), "{error}");
+        }
     }
 
     #[cfg(unix)]

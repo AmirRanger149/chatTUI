@@ -25,6 +25,7 @@ pub use overlay::Overlay;
 
 use crate::api::types::{StreamEvent, ToolCall};
 use crate::config::Config;
+use crate::sandbox::os_isolation::OsIsolation;
 use crate::sandbox::permissions::PermissionMode;
 use crate::sandbox::{Sandbox, SandboxConfig};
 use crate::session::manager::SessionManager;
@@ -116,6 +117,20 @@ impl App {
                 None,
             ),
         };
+        // Kernel isolation for shell commands: auto (default) / require /
+        // off. An unknown value falls back to auto and reports the typo.
+        let (os_isolation, isolation_error) = match config.sandbox.os_isolation.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => match OsIsolation::parse(raw) {
+                Some(mode) => (mode, None),
+                None => (
+                    OsIsolation::Auto,
+                    Some(format!(
+                        "unknown sandbox.os_isolation '{raw}' — valid values: auto, require, off"
+                    )),
+                ),
+            },
+            _ => (OsIsolation::Auto, None),
+        };
         let sandbox_config = SandboxConfig {
             enabled: config.sandbox.enabled,
             workspace_root: PathBuf::new(),
@@ -124,6 +139,7 @@ impl App {
             max_file_size: 1024 * 1024,
             shell_timeout: Duration::from_secs(config.sandbox.shell_timeout_secs.max(1)),
             permission_mode,
+            os_isolation,
             extra_sensitive_names: config.sandbox.extra_sensitive_names.clone(),
         };
         let mut sandbox = Sandbox::new(sandbox_config);
@@ -166,6 +182,9 @@ impl App {
             app.push_error(format!("sandbox target from config is invalid: {error}"));
         }
         if let Some(error) = mode_error {
+            app.push_error(format!("sandbox {error}"));
+        }
+        if let Some(error) = isolation_error {
             app.push_error(format!("sandbox {error}"));
         }
         // For providers whose default model is availability-based (custom
