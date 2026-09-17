@@ -398,6 +398,39 @@ before any output has been written — a stream that breaks mid-answer is
 reported as-is instead of being spliced onto a second model. Authentication
 failures are reported immediately, since a different model cannot fix those.
 
+## Agent Tools: Security Model
+
+Agent mode (`/sandbox <dir>` or `--sandbox <dir>`) gives the model file tools
+and a shell. What is actually enforced — and what is not:
+
+- **File tools (`read_file`, `write_file`, `edit_file`, `list_files`) are
+  workspace-restricted.** Paths must resolve inside the target directory,
+  including through symlinks; `..` traversal and absolute escapes are
+  refused. Sensitive files are refused for reading and writing: dotenv files
+  (`.env`, `*.env`), key material (`*.pem`, `*.key`, `*.p12`, `*.pfx`,
+  `*.jks`, SSH private keys), `.git/config`, and every write under `.git/`.
+  Add names via `sandbox.extra_sensitive_names` in `config.json`.
+- **The `bash` tool is NOT a sandbox.** Commands run via `sh -c` with the
+  workspace as the current directory only. They run with your full user
+  privileges and can read or write files outside the workspace, reach the
+  network, and spawn processes. Treat model-generated shell commands with
+  the same caution you would treat any script from an LLM.
+- **Shell hardening that is applied:** a hard timeout (default 30s,
+  `sandbox.shell_timeout_secs`; the command's process group is killed when
+  it expires) and a reduced environment — credential-like variables such as
+  API keys are not passed to shell commands.
+- **Permissions:** `sandbox.permission_mode` selects `read-only`,
+  `workspace-write`, `ask-before-write`, `ask-before-shell` or `full-auto`.
+  When unset, the legacy `auto_approve` / `allow_shell` flags decide.
+  `ask-*` modes currently deny the gated action (interactive approval is
+  not implemented yet) instead of allowing it silently.
+- **Agent loop:** tool-call rounds are capped (`MAX_AGENT_ITERATIONS = 10`),
+  and `Esc` aborts the in-flight model request.
+
+True isolation (seccomp/landlock, containers, VMs) is not implemented; until
+it is, this system is accurately described as *workspace-restricted tool
+execution*, not a sandbox.
+
 ## Saved Data
 
 Conversation history is stored in the platform data directory, normally:

@@ -211,8 +211,11 @@ impl App {
         let status = if self.sandbox.config.enabled { "enabled" } else { "disabled" };
         let agent = if self.agent_mode { "on" } else { "off" };
         self.push_notice(format!(
-            "sandbox: {status} | agent: {agent} | root: {root} | shell: {} | auto-approve: {}",
-            self.sandbox.config.allow_shell, self.sandbox.config.auto_approve
+            "sandbox: {status} | agent: {agent} | root: {root} | mode: {} | shell: {} | shell-timeout: {}s | auto-approve: {}",
+            self.sandbox.config.permission_mode.as_str(),
+            self.sandbox.config.allow_shell,
+            self.sandbox.config.effective_shell_timeout().as_secs(),
+            self.sandbox.config.auto_approve
         ));
         if !self.sandbox.has_target() {
             self.push_notice(

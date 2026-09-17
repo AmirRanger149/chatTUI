@@ -72,17 +72,17 @@ impl App {
             let has_system = messages.iter().any(|m| m.role == Role::System);
             if !has_system {
                 let workspace = self.sandbox.config.workspace_root.display().to_string();
+                let timeout_secs = self.sandbox.config.effective_shell_timeout().as_secs();
+                let mode = self.sandbox.config.permission_mode.as_str();
+                // The schema must describe what the program enforces — no
+                // claims of sandboxing: file tools are workspace-restricted,
+                // shell is not isolated (cwd only, full user privileges).
                 let system_content = format!(
-                    "You are chatTUI agent with sandbox access. Target directory (dst): {workspace}\n\
-                    All file and shell tools operate only inside this target directory.\n\
-                    You can read, write, edit, list files and run shell commands via tools.\n\
-                    - read_file(path): read file content (relative to the target)\n\
-                    - write_file(path, content): create/overwrite file in the target\n\
-                    - edit_file(path, old_string, new_string): surgical edit (old_string must be unique)\n\
-                    - list_files(path): list directory\n\
-                    - bash(command): run shell command (cwd is the target directory)\n\
-                    Always use tools to help the user with file operations. Be concise, explain what you do.\n\
-                    Never write files outside the target directory.",
+                    "You are chatTUI agent. Target directory (workspace): {workspace}\n\
+                    File tools (read_file, write_file, edit_file, list_files) operate only inside this workspace; paths that escape it (including via symlinks) and sensitive files (.env*, key material, .git/config) are refused.\n\
+                    bash runs `sh -c` with the workspace as the current directory, but it is NOT an OS sandbox: commands run with full user privileges and may access files outside the workspace and the network. Commands are killed after a {timeout_secs}s timeout.\n\
+                    Permission mode: {mode}. Tools outside the mode return permission-denied errors.\n\
+                    Use tools to help the user with file operations. Be concise, explain what you do. Never write files outside the target directory.",
                 );
                 messages.insert(0, Message::new(Role::System, system_content));
             }
@@ -105,7 +105,7 @@ impl App {
             Vec::new()
         };
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             if let Err(error) = client
                 .stream_chat(&messages, &model, temperature, tool_defs, tx.clone())
                 .await
@@ -113,6 +113,7 @@ impl App {
                 let _ = tx.send(StreamEvent::Error(error.to_string())).await;
             }
         });
+        self.stream_task = Some(task);
         self.tokens = Some(rx);
         self.streaming = true;
         self.stream_started = Some(Instant::now());
@@ -152,7 +153,7 @@ impl App {
         }
 
         // Stream finished - check for agent loop
-        if has_tool_calls && !self.pending_tool_calls.is_empty() {
+        if self.streaming && has_tool_calls && !self.pending_tool_calls.is_empty() {
             // Save assistant message with tool calls
             let response_text = std::mem::take(&mut self.response);
             let pending = std::mem::take(&mut self.pending_tool_calls);
@@ -173,10 +174,16 @@ impl App {
             }
             self.sessions.add_assistant_with_tools(response_text, tool_records);
 
-            // Execute tools
+            // Execute tools (permission-gated inside the sandbox). Each
+            // error — including timeouts, path escapes and permission
+            // denials — is returned to the model as a structured tool error
+            // result instead of aborting the loop.
             let sandbox = self.sandbox.clone();
             let mut tool_results = Vec::new();
             for tc in &pending {
+                if !self.streaming {
+                    break; // cancelled while earlier tools were running
+                }
                 match sandbox.execute_tool(tc).await {
                     Ok(output) => {
                         tool_results.push((tc.id.clone(), output, false));
@@ -223,12 +230,43 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, Cell};
+    use crate::api::types::ToolCall;
+    use crate::app::{App, Cell, MAX_AGENT_ITERATIONS};
     use crate::config::Config;
+    use crate::sandbox::permissions::PermissionMode;
     use crate::session::manager::SessionManager;
 
     fn test_app() -> App {
         App::new(Config::default(), SessionManager::for_tests())
+    }
+
+    /// An app with agent tools enabled against an empty temp workspace and
+    /// no API key: a tool round that tries to continue the agent loop fails
+    /// its restart immediately instead of touching the network.
+    fn agent_app(name: &str) -> App {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        let mut app = App::new(config, SessionManager::for_tests());
+        let dir = std::env::temp_dir().join(format!("chatTUI_loop_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.sandbox.set_target(dir.to_str().unwrap()).unwrap();
+        app.agent_mode = true;
+        app
+    }
+
+    fn tool_call_event(id: &str, name: &str, arguments: &str) -> StreamEvent {
+        StreamEvent::ToolCall(ToolCall::new(id, name, arguments))
+    }
+
+    /// Feed one completed stream containing `events` into the app.
+    fn feed(app: &mut App, events: Vec<StreamEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        for event in events {
+            tx.try_send(event).unwrap();
+        }
+        drop(tx);
+        app.streaming = true;
+        app.tokens = Some(rx);
     }
 
     #[test]
@@ -255,5 +293,129 @@ mod tests {
         assert_eq!(app.cells.len(), 2);
         assert!(matches!(app.cells[0], Cell::Notice(_)));
         assert_eq!(app.cells[1], Cell::Assistant("hel".into()));
+    }
+
+    #[tokio::test]
+    async fn tool_rounds_execute_and_stop_predictably_when_restart_fails() {
+        let mut app = agent_app("restart-fail");
+        feed(&mut app, vec![tool_call_event("c1", "list_files", "{}")]);
+        app.receive_token().await;
+
+        // The tool actually ran.
+        assert!(app.cells.iter().any(|c| matches!(
+            c,
+            Cell::ToolResult { is_error: false, .. }
+        )));
+        // The loop tried to continue, the restart failed (no API key), and
+        // the agent stopped with a reported error instead of looping.
+        assert!(!app.streaming);
+        assert_eq!(app.agent_iterations, 0);
+        assert!(matches!(app.cells.last(), Some(Cell::Error(_))));
+    }
+
+    #[tokio::test]
+    async fn agent_loop_stops_at_max_iterations() {
+        let mut app = agent_app("max-iterations");
+        app.agent_iterations = MAX_AGENT_ITERATIONS;
+        feed(&mut app, vec![tool_call_event("c1", "list_files", "{}")]);
+        app.receive_token().await;
+
+        // The final round's tool still ran and its result was recorded…
+        assert!(app
+            .cells
+            .iter()
+            .any(|c| matches!(c, Cell::ToolResult { .. })));
+        // …but no further LLM request was started and the agent stopped.
+        assert!(!app.streaming);
+        assert_eq!(app.agent_iterations, 0);
+        assert!(app.cells.iter().any(|c| matches!(
+            c,
+            Cell::Notice(text) if text.contains("agent stopped")
+        )));
+    }
+
+    #[tokio::test]
+    async fn repeated_tool_rounds_cannot_exceed_max_iterations() {
+        // Restart streams succeed (the legacy `api_key` field satisfies
+        // start_stream; the endpoint is a closed local port that fails
+        // fast), so the agent loop really runs round after round — exactly
+        // the setup that would spin forever if the cap were bypassable.
+        let config: Config = serde_json::from_str(
+            r#"{"provider":"openai","base_url":"http://127.0.0.1:9/v1","api_key":"test-key"}"#,
+        )
+        .unwrap();
+        let mut app = App::new(config, SessionManager::for_tests());
+        let dir =
+            std::env::temp_dir().join(format!("chatTUI_loop_many_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.sandbox.set_target(dir.to_str().unwrap()).unwrap();
+        app.agent_mode = true;
+
+        let mut rounds = 0;
+        loop {
+            // The counter may reach but never exceed the maximum.
+            assert!(
+                app.agent_iterations <= MAX_AGENT_ITERATIONS,
+                "iteration counter exceeded its maximum"
+            );
+            feed(
+                &mut app,
+                vec![tool_call_event(&format!("c{rounds}"), "list_files", "{}")],
+            );
+            app.receive_token().await;
+            rounds += 1;
+            assert!(rounds < 100, "agent loop failed to terminate");
+            if !app.streaming {
+                break;
+            }
+        }
+
+        assert_eq!(rounds, MAX_AGENT_ITERATIONS + 1);
+        assert!(app.cells.iter().any(|c| matches!(
+            c,
+            Cell::Notice(text) if text.contains("agent stopped")
+        )));
+        assert_eq!(app.agent_iterations, 0);
+    }
+
+    #[tokio::test]
+    async fn tool_errors_cannot_bypass_the_iteration_limit() {
+        // Every round fails (permission denied); the counter must still
+        // advance and the loop must still terminate.
+        let mut app = agent_app("errors-bounded");
+        app.sandbox.config.permission_mode = PermissionMode::ReadOnly;
+        let rounds = 3;
+        for round in 0..rounds {
+            assert!(app.agent_iterations < MAX_AGENT_ITERATIONS);
+            feed(
+                &mut app,
+                vec![tool_call_event(&format!("c{round}"), "write_file", r#"{"path":"x","content":"y"}"#)],
+            );
+            app.receive_token().await;
+            assert!(!app.streaming);
+            assert!(app.cells.iter().any(|c| matches!(
+                c,
+                Cell::ToolResult { is_error: true, content, .. }
+                    if content.contains("permission denied")
+            )));
+        }
+        assert!(!app.streaming);
+    }
+
+    #[tokio::test]
+    async fn permission_denials_reach_the_model_as_tool_errors() {
+        let mut app = agent_app("permission");
+        app.sandbox.config.permission_mode = PermissionMode::ReadOnly;
+        feed(
+            &mut app,
+            vec![tool_call_event("c1", "bash", r#"{"command":"echo hi"}"#)],
+        );
+        app.receive_token().await;
+        assert!(app.cells.iter().any(|c| matches!(
+            c,
+            Cell::ToolResult { is_error: true, content, .. }
+                if content.contains("permission denied")
+        )));
     }
 }

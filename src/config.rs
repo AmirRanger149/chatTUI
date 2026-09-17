@@ -121,10 +121,30 @@ pub struct SandboxConfigFile {
     pub auto_approve: bool,
     #[serde(default = "default_true")]
     pub allow_shell: bool,
+    /// Hard timeout in seconds for agent shell commands. The command's
+    /// process group is killed when it expires; clamped to at least 1s so
+    /// the agent can never be blocked indefinitely.
+    #[serde(default = "default_shell_timeout_secs")]
+    pub shell_timeout_secs: u64,
+    /// Explicit permission mode: "read-only", "workspace-write",
+    /// "ask-before-write", "ask-before-shell" or "full-auto". When unset,
+    /// the mode is derived from the legacy `auto_approve` / `allow_shell`
+    /// flags exactly as in earlier versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    /// Extra sensitive file names appended to the built-in policy. An entry
+    /// starting with "." matches any file name ending with it; anything
+    /// else must equal the file name (case-insensitively).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_sensitive_names: Vec<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_shell_timeout_secs() -> u64 {
+    30
 }
 
 impl Default for SandboxConfigFile {
@@ -134,6 +154,9 @@ impl Default for SandboxConfigFile {
             workspace_root: String::new(),
             auto_approve: true,
             allow_shell: true,
+            shell_timeout_secs: default_shell_timeout_secs(),
+            permission_mode: None,
+            extra_sensitive_names: Vec::new(),
         }
     }
 }
@@ -171,7 +194,13 @@ pub struct Config {
 }
 
 fn is_default_sandbox(cfg: &SandboxConfigFile) -> bool {
-    cfg.enabled && cfg.workspace_root.is_empty() && cfg.auto_approve && cfg.allow_shell
+    cfg.enabled
+        && cfg.workspace_root.is_empty()
+        && cfg.auto_approve
+        && cfg.allow_shell
+        && cfg.shell_timeout_secs == default_shell_timeout_secs()
+        && cfg.permission_mode.is_none()
+        && cfg.extra_sensitive_names.is_empty()
 }
 
 impl Default for Config {
@@ -720,5 +749,49 @@ mod tests {
             config.api_key_for_provider("apinex").as_deref(),
             Some("new-key")
         );
+    }
+
+    #[test]
+    fn sandbox_config_defaults_are_backward_compatible() {
+        // A config without any sandbox keys keeps the historical behavior:
+        // enabled, auto-approved, shell allowed, 30s timeout.
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.sandbox.enabled);
+        assert!(config.sandbox.auto_approve);
+        assert!(config.sandbox.allow_shell);
+        assert_eq!(config.sandbox.shell_timeout_secs, 30);
+        assert_eq!(config.sandbox.permission_mode, None);
+        assert!(config.sandbox.extra_sensitive_names.is_empty());
+        assert!(is_default_sandbox(&config.sandbox));
+    }
+
+    #[test]
+    fn sandbox_config_reads_the_security_fields() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "sandbox": {
+                    "workspace_root": "/tmp/project",
+                    "permission_mode": "workspace-write",
+                    "shell_timeout_secs": 120,
+                    "extra_sensitive_names": ["secrets.json", ".token"]
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.sandbox.workspace_root, "/tmp/project");
+        assert_eq!(
+            config.sandbox.permission_mode.as_deref(),
+            Some("workspace-write")
+        );
+        assert_eq!(config.sandbox.shell_timeout_secs, 120);
+        assert_eq!(config.sandbox.extra_sensitive_names.len(), 2);
+        assert!(!is_default_sandbox(&config.sandbox));
+    }
+
+    #[test]
+    fn sandbox_timeout_round_trips_zero_but_enforcement_clamps_it() {
+        let config: Config =
+            serde_json::from_str(r#"{"sandbox": {"shell_timeout_secs": 0}}"#).unwrap();
+        assert_eq!(config.sandbox.shell_timeout_secs, 0);
     }
 }
