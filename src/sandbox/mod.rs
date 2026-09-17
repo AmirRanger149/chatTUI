@@ -351,9 +351,13 @@ impl Sandbox {
     ///   `os_isolation` != off): the command cannot modify files outside the
     ///   workspace/scratch roots, open network connections, ptrace other
     ///   processes, or load kernel modules — enforced by the kernel, not by
-    ///   command inspection. When the kernel lacks the facilities, `auto`
-    ///   mode appends an explicit warning to the output and `require` mode
-    ///   refuses to run; neither pretends the command was confined.
+    ///   command inspection. The restrictions are installed in the forked
+    ///   child just before exec (see [`os_isolation::confine_in_child`]),
+    ///   so the shell never runs unconfined. When the kernel lacks the
+    ///   facilities, `auto` mode runs the command **unrestricted** with an
+    ///   explicit warning in the output and `require` mode refuses to run;
+    ///   neither pretends the command was confined, and neither can panic
+    ///   the worker.
     pub async fn bash(&self, command: &str) -> Result<String> {
         let cmd = self.prepare_shell(command)?;
         let timeout = self.config.effective_shell_timeout();
@@ -372,31 +376,14 @@ impl Sandbox {
             let worker = std::thread::Builder::new()
                 .name("sandboxed-shell".into())
                 .spawn(move || {
-                    let mut warning = String::new();
-                    if mode != OsIsolation::Off {
-                        let report = os_isolation::restrict_current_thread(
-                            &roots,
-                            os_isolation::WRITE_ONLY_DEVICES,
-                        );
-                        if !report.fs || !report.syscall {
-                            let detail = report.notes.join("; ");
-                            if mode == OsIsolation::Require {
-                                let _ = otx.send(Err(format!(
-                                    "OS-level isolation is required but unavailable ({detail}) — refusing to run the command. \
-                                     Set sandbox.os_isolation = \"auto\" to allow an unrestricted fallback."
-                                )));
-                                return;
-                            }
-                            warning = format!(
-                                "\n(os-level isolation unavailable: {detail} — the command ran with full user privileges)"
-                            );
-                        }
-                    }
-                    let outcome = run_isolated_shell(&cmd_owned, &workspace, &pid_for_thread);
-                    let _ = otx.send(outcome.map(|mut outcome| {
-                        outcome.warning = warning;
-                        outcome
-                    }));
+                    let outcome = run_shell_process(
+                        &cmd_owned,
+                        &workspace,
+                        &pid_for_thread,
+                        mode,
+                        &roots,
+                    );
+                    let _ = otx.send(outcome);
                 });
 
             if let Err(error) = worker {
@@ -420,12 +407,7 @@ impl Sandbox {
             };
 
             let outcome = outcome.map_err(|error| anyhow!("{error}"))?;
-            let mut rendered =
-                format_shell_parts(&outcome.stdout, &outcome.stderr, &outcome.status_text);
-            if !outcome.warning.is_empty() {
-                rendered.push_str(&outcome.warning);
-            }
-            Ok(rendered)
+            Ok(format_shell_parts(&outcome.stdout, &outcome.stderr, &outcome.status_text))
         }
 
         #[cfg(not(unix))]
@@ -691,18 +673,23 @@ struct ShellOutcome {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     status_text: String,
-    warning: String,
 }
 
-/// Spawn `sh -c <cmd>` from the **current, already-confined thread**, in its
-/// own process group, with the filtered environment, and collect the output.
-/// Runs on the dedicated worker thread only — the caller (chatTUI's main
-/// thread) is never restricted itself.
+/// Spawn `sh -c <cmd>` on the current (unrestricted) worker thread, in its
+/// own process group, with the filtered environment, and collect the
+/// output. Kernel isolation is installed **inside the forked child, just
+/// before execve**, via a `pre_exec` hook — never on this thread — so the
+/// process-spawn machinery runs normally and the shell still never executes
+/// a single instruction unconfined. `require`-mode failures surface as
+/// clean errors here (std plumbs `pre_exec` errors through its spawn-error
+/// channel); auto-mode failures are announced by the child on stderr.
 #[cfg(unix)]
-fn run_isolated_shell(
+fn run_shell_process(
     cmd: &str,
     workspace: &Path,
     pid_slot: &AtomicI32,
+    isolation: OsIsolation,
+    writable_roots: &[PathBuf],
 ) -> Result<ShellOutcome, String> {
     use std::io::Read;
     use std::os::unix::process::CommandExt;
@@ -731,8 +718,35 @@ fn run_isolated_shell(
             Ok(())
         });
     }
+    if isolation != OsIsolation::Off {
+        let roots = writable_roots.to_vec();
+        let strict = isolation == OsIsolation::Require;
+        unsafe {
+            builder.pre_exec(move || {
+                os_isolation::confine_in_child(&roots, os_isolation::WRITE_ONLY_DEVICES, strict)
+            });
+        }
+    }
 
-    let mut child = builder.spawn().map_err(|error| format!("spawning sh: {error}"))?;
+    let mut child = match builder.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if isolation == OsIsolation::Require
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+                )
+            {
+                return Err(
+                    "OS-level isolation is required but unavailable on this system - refusing \
+                     to run the command. Set sandbox.os_isolation = \"auto\" in config.json to \
+                     allow an explicit unrestricted fallback."
+                        .to_string(),
+                );
+            }
+            return Err(format!("spawning sh: {error}"));
+        }
+    };
     pid_slot.store(child.id() as i32, Ordering::SeqCst);
 
     // Drain both pipes concurrently so a chatty child can never fill them
@@ -753,12 +767,7 @@ fn run_isolated_shell(
     let status = child.wait().map_err(|error| format!("waiting on sh: {error}"))?;
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
-    Ok(ShellOutcome {
-        stdout,
-        stderr,
-        status_text: status.to_string(),
-        warning: String::new(),
-    })
+    Ok(ShellOutcome { stdout, stderr, status_text: status.to_string() })
 }
 
 fn format_shell_parts(stdout: &[u8], stderr: &[u8], status_text: &str) -> String {

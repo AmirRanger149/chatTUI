@@ -1,9 +1,10 @@
 //! Kernel-enforced process isolation for agent shell commands (Linux only;
 //! every other platform is a no-op that reports itself as unsupported).
 //!
-//! Two independent, unprivileged kernel facilities are applied to a dedicated
-//! worker thread *before* the shell is spawned. The shell and every process
-//! it creates inherit both, and an unprivileged process cannot remove them:
+//! Two independent, unprivileged kernel facilities are installed **inside
+//! the forked child, just before execve** (via `Command::pre_exec`, see
+//! [`confine_in_child`]). The shell and every process it creates inherit
+//! both, and an unprivileged process cannot remove them:
 //!
 //! - **Filesystem (Landlock LSM, kernel >= 5.13):** read/execute stay
 //!   allowed everywhere — shells, compilers and linkers must read system
@@ -27,6 +28,13 @@
 //! policy); `connect()` is denied even for Unix sockets, so tools that talk
 //! to local daemons fail; and like every in-process sandbox this trusts the
 //! kernel itself.
+//!
+//! Why pre-exec and not "restrict the worker thread before spawning": the
+//! process-spawn machinery (stdio pipes, fork, the child's error channel)
+//! must itself run unrestricted — under the filter it fails hard. Installing
+//! the restrictions between fork and exec keeps the spawn path normal while
+//! the shell still never runs unconfined, and unavailable-kernel situations
+//! become clean, reportable errors instead of panics.
 //!
 //! Raw syscalls are used through the existing `libc` dependency instead of
 //! higher-level crates, so enabling this feature adds nothing new to the
@@ -141,6 +149,96 @@ pub(crate) fn restrict_current_thread(
         notes: vec!["OS-level isolation is only implemented on Linux".into()],
     }
 }
+
+/// Confinement hook for `Command::pre_exec`: runs **inside the forked
+/// child, just before execve**. The installation point matters: the
+/// process-spawn machinery itself (stdio pipe setup, fork, the child's
+/// error-reporting channel) must stay unrestricted — running it under the
+/// seccomp filter makes the spawn fail hard — so the restrictions are
+/// installed as late as possible, after stdio setup and before the shell's
+/// execve. The shell therefore never executes a single instruction
+/// unconfined, and everything the child inherited (process group, filtered
+/// environment) is already in place.
+///
+/// - `strict` (require mode): a failure aborts the spawn with a clean
+///   `io::Error` the parent reports (never a panic).
+/// - best effort (auto mode): on failure a fixed warning is written to the
+///   already-redirected stderr so the parent's tool output stays honest,
+///   and the command runs anyway.
+#[cfg(target_os = "linux")]
+pub(crate) fn confine_in_child(
+    writable_roots: &[PathBuf],
+    write_only_paths: &[&'static str],
+    strict: bool,
+) -> std::io::Result<()> {
+    let applied = set_no_new_privs().is_ok()
+        && seccomp::apply().is_ok()
+        && landlock::restrict(writable_roots, write_only_paths).is_ok();
+    if applied {
+        return Ok(());
+    }
+    if strict {
+        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+    }
+    write_stderr(b"(os-level isolation unavailable - the command ran unrestricted)\n");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn confine_in_child(
+    _writable_roots: &[PathBuf],
+    _write_only_paths: &[&'static str],
+    strict: bool,
+) -> std::io::Result<()> {
+    if strict {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "os-level isolation is only implemented on Linux",
+        ));
+    }
+    write_stderr(b"(os-level isolation unavailable - the command ran unrestricted)\n");
+    Ok(())
+}
+
+/// Best-effort write to stderr without touching std (pre-exec context).
+#[cfg(target_os = "linux")]
+fn write_stderr(message: &[u8]) {
+    let mut written = 0usize;
+    while written < message.len() {
+        let n = unsafe {
+            libc::write(
+                2,
+                message[written..].as_ptr().cast::<libc::c_void>(),
+                message.len() - written,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        written += n as usize;
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn write_stderr(message: &[u8]) {
+    let mut written = 0usize;
+    while written < message.len() {
+        let n = unsafe {
+            libc::write(
+                2,
+                message[written..].as_ptr().cast::<libc::c_void>(),
+                message.len() - written,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        written += n as usize;
+    }
+}
+
+#[cfg(all(not(unix), not(target_os = "linux")))]
+fn write_stderr(_message: &[u8]) {}
 
 /// Directories the sandboxed shell may *modify*, on top of the workspace.
 /// `/tmp` and `/dev/shm` are granted because ordinary builds need scratch
