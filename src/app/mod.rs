@@ -25,12 +25,15 @@ pub use overlay::Overlay;
 
 use crate::api::types::{StreamEvent, ToolCall};
 use crate::config::Config;
+use crate::sandbox::os_isolation::OsIsolation;
+use crate::sandbox::permissions::PermissionMode;
 use crate::sandbox::{Sandbox, SandboxConfig};
 use crate::session::manager::SessionManager;
 use anyhow::Result;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Receiver;
+use tokio::task::JoinHandle;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PLACEHOLDER: &str = "Ask chatTUI to do anything";
@@ -60,6 +63,10 @@ pub struct App {
     pub streaming: bool,
     pub stream_started: Option<Instant>,
     pub tokens: Option<Receiver<StreamEvent>>,
+    /// Handle for the in-flight LLM request task so `interrupt()` can abort
+    /// it (dropping the request future closes the HTTP stream) instead of
+    /// leaving it running after the user cancelled.
+    stream_task: Option<JoinHandle<()>>,
     pub models: ModelCatalog,
     models_rx: Option<Receiver<Result<Vec<String>>>>,
     /// Whether the in-flight model-list fetch is a background
@@ -88,12 +95,52 @@ pub struct App {
 impl App {
     pub fn new(config: Config, sessions: SessionManager) -> Self {
         // Build sandbox from config — never default to process cwd.
+        // An explicit `permission_mode` wins; when it is unset the legacy
+        // auto_approve/allow_shell flags decide, as they always did. An
+        // unknown mode fails closed to read-only until the config is fixed.
+        let (permission_mode, mode_error) = match config.sandbox.permission_mode.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => match PermissionMode::parse(raw) {
+                Some(mode) => (mode, None),
+                None => (
+                    PermissionMode::ReadOnly,
+                    Some(format!(
+                        "unknown sandbox.permission_mode '{raw}' — valid modes: read-only, \
+                         workspace-write, ask-before-write, ask-before-shell, full-auto"
+                    )),
+                ),
+            },
+            _ => (
+                PermissionMode::from_legacy_flags(
+                    config.sandbox.auto_approve,
+                    config.sandbox.allow_shell,
+                ),
+                None,
+            ),
+        };
+        // Kernel isolation for shell commands: auto (default) / require /
+        // off. An unknown value falls back to auto and reports the typo.
+        let (os_isolation, isolation_error) = match config.sandbox.os_isolation.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => match OsIsolation::parse(raw) {
+                Some(mode) => (mode, None),
+                None => (
+                    OsIsolation::Auto,
+                    Some(format!(
+                        "unknown sandbox.os_isolation '{raw}' — valid values: auto, require, off"
+                    )),
+                ),
+            },
+            _ => (OsIsolation::Auto, None),
+        };
         let sandbox_config = SandboxConfig {
             enabled: config.sandbox.enabled,
             workspace_root: PathBuf::new(),
             auto_approve: config.sandbox.auto_approve,
             allow_shell: config.sandbox.allow_shell,
             max_file_size: 1024 * 1024,
+            shell_timeout: Duration::from_secs(config.sandbox.shell_timeout_secs.max(1)),
+            permission_mode,
+            os_isolation,
+            extra_sensitive_names: config.sandbox.extra_sensitive_names.clone(),
         };
         let mut sandbox = Sandbox::new(sandbox_config);
         let mut target_error = None;
@@ -111,6 +158,7 @@ impl App {
             streaming: false,
             stream_started: None,
             tokens: None,
+            stream_task: None,
             models: ModelCatalog::default(),
             models_rx: None,
             models_fetch_auto: false,
@@ -132,6 +180,12 @@ impl App {
         app.rebuild_cells();
         if let Some(error) = target_error {
             app.push_error(format!("sandbox target from config is invalid: {error}"));
+        }
+        if let Some(error) = mode_error {
+            app.push_error(format!("sandbox {error}"));
+        }
+        if let Some(error) = isolation_error {
+            app.push_error(format!("sandbox {error}"));
         }
         // For providers whose default model is availability-based (custom
         // providers without an explicit `model`),
@@ -198,6 +252,13 @@ impl App {
     }
 
     pub fn interrupt(&mut self) {
+        // Abort the in-flight LLM request: dropping its future closes the
+        // HTTP stream. Tool execution runs inline on this loop and is
+        // bounded by the shell timeout, so no separate tool process can
+        // outlive the interrupt.
+        if let Some(task) = self.stream_task.take() {
+            task.abort();
+        }
         self.tokens = None;
         self.streaming = false;
         self.stream_started = None;
