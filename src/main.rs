@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use app::App;
 use config::Config;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -69,7 +69,9 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
             loop {
                 match event::read()? {
                     Event::Key(key) => {
-                        if !handle_key(app, key) {
+                        // Windows sends a Press *and* a Release event per keystroke; only the
+                        // press may reach handle_key() or every key would act twice.
+                        if should_handle(&key) && !handle_key(app, key) {
                             return Ok(());
                         }
                     }
@@ -85,6 +87,26 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
             return Ok(());
         }
     }
+}
+
+/// Whether a key event may be forwarded to [`handle_key`].
+///
+/// crossterm's Windows console backend maps the console `key_down` flag straight onto
+/// [`KeyEventKind`], so one physical keystroke arrives as **two** `Event::Key`s: a `Press` and a
+/// `Release` (crossterm `src/event/sys/windows/parse.rs`). Handling both doubles every action on
+/// Windows — typing `/` inserts `//`, backspace deletes two characters, arrows move twice,
+/// ctrl+c quits on the first press. Unix backends only ever emit `Press` unless the kitty keyboard
+/// protocol is turned on (`PushKeyboardEnhancementFlags` + `REPORT_EVENT_TYPES`), which this app
+/// never does, so filtering here is a no-op on Linux/macOS.
+///
+/// `Repeat` is allowed through as well: no crossterm backend produces it today (Windows reports a
+/// held key as a stream of `Press`es, plain Unix reports nothing), but it keeps auto-repeat working
+/// if keyboard enhancement flags are ever enabled. `Release` is dropped outright — it carries no
+/// character/code information that a press did not already deliver.
+///
+/// Do not "simplify" this check away: it looks redundant to anyone testing only on Linux.
+fn should_handle(key: &KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
 /// Returns `false` when the app should exit.
@@ -245,4 +267,55 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     execute!(terminal.backend_mut(), LeaveAlternateScreen, event::DisableBracketedPaste)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, kind: KeyEventKind) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind)
+    }
+
+    #[test]
+    fn press_is_forwarded_and_release_is_dropped() {
+        for code in [
+            KeyCode::Char('/'),
+            KeyCode::Backspace,
+            KeyCode::Left,
+            KeyCode::Enter,
+            KeyCode::Char('c'),
+        ] {
+            assert!(should_handle(&key(code, KeyEventKind::Press)), "{code:?} press");
+            assert!(
+                !should_handle(&key(code, KeyEventKind::Release)),
+                "{code:?} release must never reach handle_key"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_press_release_pair_yields_a_single_forwarded_event() {
+        // What the Windows console backend delivers for one physical "/" keystroke.
+        let keystroke = [
+            key(KeyCode::Char('/'), KeyEventKind::Press),
+            key(KeyCode::Char('/'), KeyEventKind::Release),
+        ];
+        let forwarded: Vec<KeyEvent> = keystroke.into_iter().filter(should_handle).collect();
+        assert_eq!(forwarded.len(), 1, "a keystroke must be handled exactly once");
+        assert_eq!(forwarded[0].kind, KeyEventKind::Press);
+    }
+
+    #[test]
+    fn unix_press_only_stream_is_untouched_by_the_filter() {
+        // Unix backends emit Press for every keystroke, so nothing is dropped there.
+        let typed = ['h', 'i'].map(|ch| key(KeyCode::Char(ch), KeyEventKind::Press));
+        assert!(typed.iter().all(should_handle));
+    }
+
+    #[test]
+    fn repeat_is_allowed_so_held_keys_still_auto_repeat() {
+        assert!(should_handle(&key(KeyCode::Char('a'), KeyEventKind::Repeat)));
+        assert!(should_handle(&key(KeyCode::Down, KeyEventKind::Repeat)));
+    }
 }
