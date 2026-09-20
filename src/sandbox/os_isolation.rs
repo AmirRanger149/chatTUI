@@ -12,22 +12,47 @@
 //!   workspace root, `/tmp` (plus `$TMPDIR`), `/dev/shm`, `$CARGO_HOME` and
 //!   `$CARGO_TARGET_DIR` when set, and write-only character devices
 //!   (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`).
-//! - **Syscall filter (seccomp-bpf):** creating non-Unix sockets and the
-//!   whole connect/listen/send/receive family is denied; likewise ptrace and
-//!   cross-process memory injection (`process_vm_*`), kernel-module loading,
-//!   `kexec`, `bpf`, `perf_event_open`, keyring syscalls, namespace creation
-//!   (`clone` with namespace flags, `unshare`, `setns`, mount-family
-//!   syscalls, `chroot`), `pidfd_getfd`, io_uring, `swapon`/`reboot`.
+//! - **Syscall filter (seccomp-bpf):** denied with `EPERM`:
+//!   creating any socket outside `AF_UNIX`/`AF_NETLINK` plus the whole
+//!   connect/listen/send/receive family (`connect`, `bind`, `listen`,
+//!   `accept`, `accept4`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`,
+//!   `recvmmsg`, `sendmmsg`, `shutdown`); ptrace and cross-process memory
+//!   injection (`ptrace`, `process_vm_readv`, `process_vm_writev`);
+//!   kernel-module loading (`init_module`, `finit_module`,
+//!   `delete_module`); `kexec_load` and `kexec_file_load`; `bpf`;
+//!   `perf_event_open`; keyring syscalls (`add_key`, `request_key`,
+//!   `keyctl`); **namespace creation** — `unshare`, `setns`, and
+//!   `clone`/`clone3` with any namespace flag set; the **mount-family**
+//!   syscalls (`mount`, `umount2`, `pivot_root`, `open_tree`, `move_mount`,
+//!   `fsopen`, `fsconfig`, `fsmount`, `fspick`, `mount_setattr`); `chroot`;
+//!   `pidfd_getfd`; io_uring (`io_uring_setup`, `io_uring_enter`,
+//!   `io_uring_register`); `swapon`/`swapoff`/`reboot`; `userfaultfd`.
+//!   Finally, `kill(-1, sig)` — "signal every process this uid may signal"
+//!   — is denied so a stray broad `kill -9 -1` cannot reach processes
+//!   outside the sandbox (the chatTUI session included); targeted signals
+//!   (`kill <pid>`, `kill -<pgid>`, shell job control) stay allowed.
 //!   `clone3` returns `ENOSYS` so libc falls back to plain `clone`, whose
-//!   flags *are* inspectable.
+//!   flags *are* inspectable: classic BPF cannot dereference `clone3`'s
+//!   pointer argument, so the ENOSYS fallback is the only way the
+//!   namespace-flag check can cover it.
+//!
+//! Every number above is checked against the per-architecture syscall
+//! tables in the `SysNums`/`UNIFIED_DENY` constants; the
+//! `isolation_denies_namespace_and_mount_syscalls_when_supported` and
+//! sibling regression tests pin the real enforced behavior through the
+//! actual `bash` tool path, so a drifted table (wrong number for the
+//! running architecture silently no-ops a rule) fails CI instead of
+//! passing silently.
 //!
 //! Enforcement happens inside the kernel against the actual syscalls — it
 //! does not depend on inspecting the command string. The remaining limits
 //! are documented, not hidden: reading files outside the workspace stays
 //! possible by design (secret-read protection remains an application-level
 //! policy); `connect()` is denied even for Unix sockets, so tools that talk
-//! to local daemons fail; and like every in-process sandbox this trusts the
-//! kernel itself.
+//! to local daemons fail; targeted signals and tools like `pkill` can still
+//! reach same-uid processes (an inherent limit of unprivileged,
+//! same-uid sandboxing — only the all-process `kill(-1)` is denied); and
+//! like every in-process sandbox this trusts the kernel itself.
 //!
 //! Why pre-exec and not "restrict the worker thread before spawning": the
 //! process-spawn machinery (stdio pipes, fork, the child's error channel)
@@ -160,27 +185,45 @@ pub(crate) fn restrict_current_thread(
 /// unconfined, and everything the child inherited (process group, filtered
 /// environment) is already in place.
 ///
-/// - `strict` (require mode): a failure aborts the spawn with a clean
-///   `io::Error` the parent reports (never a panic).
-/// - best effort (auto mode): on failure a fixed warning is written to the
-///   already-redirected stderr so the parent's tool output stays honest,
-///   and the command runs anyway.
+/// The two facilities are **independent**: seccomp (the syscall filter) is
+/// attempted even when Landlock is unavailable and vice versa, so a kernel
+/// that is missing one of them still gets the other. Historically a single
+/// `&&` chain here meant that a kernel with, say, Landlock disabled at boot
+/// silently lost the seccomp filter too — the child ran with *no*
+/// enforcement beyond `NO_NEW_PRIVS` while the output only hinted at it.
+/// In `strict` (require) mode ANY missing facility aborts the spawn with a
+/// clean `io::Error` the parent reports (never a panic) — fail closed. In
+/// best-effort (auto) mode whatever applied stays applied and a fixed,
+/// precise warning is written to the already-redirected stderr so the
+/// parent's tool output stays honest.
 #[cfg(target_os = "linux")]
 pub(crate) fn confine_in_child(
     writable_roots: &[PathBuf],
     write_only_paths: &[&'static str],
     strict: bool,
 ) -> std::io::Result<()> {
-    let applied = set_no_new_privs().is_ok()
-        && seccomp::apply().is_ok()
-        && landlock::restrict(writable_roots, write_only_paths).is_ok();
-    if applied {
+    // NO_NEW_PRIVS is the prerequisite for both facilities (and stops
+    // privilege gain through setuid binaries). Without it neither can be
+    // installed, so the split below still degrades to the combined warning.
+    let nnp_ok = set_no_new_privs().is_ok();
+    // One failure must not strip the other layer — apply each on its own.
+    let syscall_ok = nnp_ok && seccomp::apply().is_ok();
+    let fs_ok = nnp_ok && landlock::restrict(writable_roots, write_only_paths).is_ok();
+
+    if syscall_ok && fs_ok {
         return Ok(());
     }
     if strict {
         return Err(std::io::Error::from_raw_os_error(libc::EPERM));
     }
-    write_stderr(b"(os-level isolation unavailable - the command ran unrestricted)\n");
+    if !syscall_ok && !fs_ok {
+        // Legacy combined line (greppable; asserted by tests).
+        write_stderr(b"(os-level isolation unavailable - the command ran unrestricted)\n");
+    } else if !syscall_ok {
+        write_stderr(b"(os-level syscall isolation unavailable - network and process restrictions were not applied)\n");
+    } else {
+        write_stderr(b"(os-level filesystem isolation unavailable - write restrictions were not applied)\n");
+    }
     Ok(())
 }
 
@@ -521,13 +564,23 @@ mod seccomp {
         ptrace: i64,
         mount: i64,
         umount2: i64,
+        /// mount-family: move the root (needs CAP_SYS_ADMIN in the owning
+        /// user namespace; denied so no namespace can be re-rooted).
+        pivot_root: i64,
         chroot: i64,
         swapon: i64,
         swapoff: i64,
         reboot: i64,
         init_module: i64,
+        /// fd-based module loading — same threat as `init_module`, and the
+        /// variant modern modprobe actually uses.
+        finit_module: i64,
         delete_module: i64,
         kexec_load: i64,
+        /// fd-based kexec — same threat as `kexec_load`.
+        kexec_file_load: i64,
+        /// `kill(-1, sig)` targeting check; see `build_filter`.
+        kill: i64,
         add_key: i64,
         request_key: i64,
         keyctl: i64,
@@ -558,13 +611,17 @@ mod seccomp {
         ptrace: 101,
         mount: 165,
         umount2: 166,
+        pivot_root: 155,
         chroot: 161,
         swapon: 167,
         swapoff: 168,
         reboot: 169,
         init_module: 175,
+        finit_module: 313,
         delete_module: 176,
         kexec_load: 246,
+        kexec_file_load: 320,
+        kill: 62,
         add_key: 248,
         request_key: 249,
         keyctl: 250,
@@ -583,6 +640,13 @@ mod seccomp {
     #[cfg(target_arch = "aarch64")]
     const AUDIT_ARCH: u32 = 0xC000_00B7; // arm64, little-endian, 64-bit
     #[cfg(target_arch = "aarch64")]
+    // arm64 has no private table: it uses include/uapi/asm-generic/unistd.h
+    // verbatim. Every number below must be taken from THAT file — mixing in
+    // numbers from other architectures silently no-ops a rule (a wrong
+    // number usually names a different, harmless syscall). Regression:
+    // `unshare` used to be 266 here (= `kcmp` on arm64) and `bpf` 386
+    // (unassigned on arm64), leaving the whole namespace-creation deny and
+    // `bpf` dead on arm64 builds.
     const NR: SysNums = SysNums {
         socket: 198,
         connect: 203,
@@ -598,23 +662,27 @@ mod seccomp {
         ptrace: 117,
         mount: 40,
         umount2: 39,
+        pivot_root: 41,
         chroot: 51,
         swapon: 224,
         swapoff: 225,
         reboot: 142,
         init_module: 105,
+        finit_module: 273,
         delete_module: 106,
         kexec_load: 104,
+        kexec_file_load: 294,
+        kill: 129,
         add_key: 217,
         request_key: 218,
         keyctl: 219,
-        unshare: 266,
+        unshare: 97,
         accept4: 242,
         perf_event_open: 241,
         recvmmsg: 243,
         process_vm_readv: 270,
         process_vm_writev: 271,
-        bpf: 386,
+        bpf: 280,
         userfaultfd: 282,
         sendmmsg: 269,
         setns: 268,
@@ -624,6 +692,8 @@ mod seccomp {
     const UNIFIED_DENY: &[i64] = &[
         425, // io_uring_setup
         426, // io_uring_enter
+        427, // io_uring_register (kernel/blob manipulation needs setup+enter,
+             // but deny the whole family so no gap is left open by accident)
         428, // open_tree
         429, // move_mount
         430, // fsopen
@@ -703,13 +773,16 @@ mod seccomp {
             NR.ptrace,
             NR.mount,
             NR.umount2,
+            NR.pivot_root,
             NR.chroot,
             NR.swapon,
             NR.swapoff,
             NR.reboot,
             NR.init_module,
+            NR.finit_module,
             NR.delete_module,
             NR.kexec_load,
+            NR.kexec_file_load,
             NR.add_key,
             NR.request_key,
             NR.keyctl,
@@ -739,6 +812,25 @@ mod seccomp {
         // clone3 -> ENOSYS so libc falls back to clone() whose flags we see
         f.push(jeq(CLONE3 as u32, 0, 1));
         f.push(ret_errno(ENOSYS));
+
+        // kill with the "every process" target -> EPERM: pid == -1 is the
+        // one *broad* kill target — everything this uid may signal at once,
+        // the chatTUI session included — so a stray `kill -9 -1` must not
+        // deliver. Targeted kills — `kill <pid>`, `kill -<pgid>`, job
+        // control — stay allowed (they can still reach same-uid processes;
+        // that residual is inherent and documented in the module docs).
+        // The deny keys on the low 32 bits of args[0] alone, because the
+        // -1 reaches the kernel in two different encodings: sign-extended
+        // 0xFFFFFFFFFFFFFFFF (raw syscalls) and zero-extended
+        // 0x00000000FFFFFFFF (glibc's kill() widens its int pid without
+        // sign extension — verified against the real kernel). No legitimate
+        // target can have an all-ones low word: pids are < 2^31 and
+        // `-pgid` targets never produce it (such a call would be ESRCH
+        // anyway), so this cannot misfire.
+        f.push(jeq(NR.kill as u32, 0, 3)); // not kill: skip to the socket check
+        f.push(ld_abs(16)); // args[0] low 32 bits = the pid target
+        f.push(jeq(u32::MAX, 0, 1)); // low word != all-ones: not -1, allow
+        f.push(ret_errno(EPERM));
 
         // socket(): allow only AF_UNIX / AF_NETLINK
         //   JEQ socket: hit -> fall through; miss -> jump 5 to RET_ALLOW
@@ -786,6 +878,7 @@ mod seccomp {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::sandbox::Sandbox;
     use std::path::PathBuf;
 
     fn unique_root(name: &str) -> PathBuf {
@@ -891,5 +984,198 @@ mod tests {
         assert_eq!(OsIsolation::parse("yolo"), None);
         assert_eq!(OsIsolation::parse(""), None);
         assert_eq!(OsIsolation::default(), OsIsolation::Auto);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression tests for the seccomp namespace/mount/kill denials.
+    //
+    // These run raw syscalls through the REAL `Sandbox::bash` ->
+    // `run_shell_process` -> `confine_in_child` path — the same route a
+    // live agent session takes — because the class of bug being guarded
+    // against (a syscall number wrong for the running architecture, a rule
+    // missing from the program, an earlier ALLOW shadowing a DENY) only
+    // shows up in the *enforced* filter, not in the source that claims to
+    // build it. Each probe compiles a tiny C helper through the sandboxed
+    // shell itself and reports `rc=`/`errno=` so the test can assert EPERM
+    // exactly.
+    // -----------------------------------------------------------------------
+
+    /// C probe making the raw syscalls under test. Namespace flags are
+    /// stable UAPI bits (linux/sched.h); signal 0 is a permission probe
+    /// that kills nothing even if it were allowed.
+    const PROBE_SOURCE: &str = r#"#define _GNU_SOURCE
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+/* Stable namespace-creation bits from linux/sched.h. */
+#define CLONE_NEWNS   0x00020000UL
+#define CLONE_NEWNET  0x40000000UL
+#define CLONE_NEWUSER 0x10000000UL
+
+static void report(const char *stage, long rc) {
+    printf("%s rc=%ld errno=%d\n", stage, rc, rc == -1 ? errno : 0);
+    fflush(stdout);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    if (!strcmp(argv[1], "unshare_newuser")) {
+        report("unshare_newuser", syscall(SYS_unshare, CLONE_NEWUSER));
+    } else if (!strcmp(argv[1], "unshare_newnet")) {
+        report("unshare_newnet", syscall(SYS_unshare, CLONE_NEWNET));
+    } else if (!strcmp(argv[1], "unshare_newns")) {
+        report("unshare_newns", syscall(SYS_unshare, CLONE_NEWNS));
+    } else if (!strcmp(argv[1], "clone_newuser")) {
+        long pid = syscall(SYS_clone, CLONE_NEWUSER | (unsigned long)SIGCHLD,
+                           0, 0, 0, 0);
+        if (pid == 0) _exit(0); /* only reachable if the clone succeeded */
+        if (pid > 0) { waitpid((pid_t)pid, 0, 0); report("clone_newuser", 0); }
+        else report("clone_newuser", -1);
+    } else if (!strcmp(argv[1], "mount")) {
+        mkdir("mnt", 0755);
+        /* Plain mount: unprivileged it is EPERM anyway; the interesting
+           assertion is that it stays EPERM under the filter too. */
+        report("mount_direct", mount("tmpfs", "mnt", "tmpfs", 0, 0));
+        /* The real-world chain: a user namespace grants CAP_SYS_ADMIN over
+           a mount namespace, which is how an unprivileged `mount` can
+           succeed at all. Denying the unshare must close it. */
+        long rc = syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNS);
+        report("unshare_user_mount_ns", rc);
+        if (rc == 0) report("mount_in_ns", mount("tmpfs", "mnt", "tmpfs", 0, 0));
+    } else if (!strcmp(argv[1], "kill_all")) {
+        /* kill(-1, 0): probes permission for "every process we may signal"
+           (the session-ending footgun) without delivering anything. */
+        report("kill_minus1", kill(-1, 0));
+    } else {
+        return 2;
+    }
+    return 0;
+}
+"#;
+
+    /// Compile `PROBE_SOURCE` through the sandboxed shell and run it in
+    /// `mode` — exercising the real confinement path end to end. Returns
+    /// `None` (after skipping cleanly) on kernels without isolation
+    /// support, mirroring the Auto-mode fallback pattern of the bash tests
+    /// in `crate::sandbox`.
+    async fn run_sandboxed_probe(dir_name: &str, mode: &str) -> Option<String> {
+        if !os_isolation_supported() {
+            eprintln!("skipping: kernel lacks Landlock/seccomp support");
+            return None;
+        }
+        let ws = unique_root(dir_name);
+        std::fs::write(ws.join("probe.c"), PROBE_SOURCE).unwrap();
+        let sandbox = Sandbox::with_root(ws.clone());
+        let command = format!("cc -O1 -o probe probe.c && ./probe {mode}");
+        let out = match sandbox.bash(&command).await {
+            Ok(out) => out,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&ws);
+                panic!("sandboxed probe `{mode}` failed to run: {error}");
+            }
+        };
+        let _ = std::fs::remove_dir_all(&ws);
+        // The probe prints `rc=`/`errno=` lines on success; a missing line
+        // means the compile or exec failed (e.g. no C compiler on the
+        // machine) — skip rather than fail, like the `ping`-based test.
+        if !out.contains("rc=") {
+            eprintln!("skipping: probe did not run: {out}");
+            return None;
+        }
+        // Isolation was supported, so no fallback warning may appear.
+        assert!(
+            !out.contains("os-level isolation unavailable"),
+            "isolation reported supported but the child fell back: {out}"
+        );
+        Some(out)
+    }
+
+    #[tokio::test]
+    async fn bash_unshare_clone_newuser_is_denied_when_isolation_is_supported() {
+        let Some(out) = run_sandboxed_probe("iso-unshare-user", "unshare_newuser").await
+        else {
+            return;
+        };
+        assert!(
+            out.contains("unshare_newuser rc=-1 errno=1"),
+            "unshare(CLONE_NEWUSER) must fail with EPERM, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_unshare_clone_newnet_is_denied_when_isolation_is_supported() {
+        let Some(out) = run_sandboxed_probe("iso-unshare-net", "unshare_newnet").await
+        else {
+            return;
+        };
+        assert!(
+            out.contains("unshare_newnet rc=-1 errno=1"),
+            "unshare(CLONE_NEWNET) must fail with EPERM, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_unshare_clone_newns_is_denied_when_isolation_is_supported() {
+        let Some(out) = run_sandboxed_probe("iso-unshare-ns", "unshare_newns").await
+        else {
+            return;
+        };
+        assert!(
+            out.contains("unshare_newns rc=-1 errno=1"),
+            "unshare(CLONE_NEWNS) must fail with EPERM, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_clone_with_namespace_flag_is_denied_when_isolation_is_supported() {
+        // Guards the flags-argument inspection: `clone` itself must not be
+        // blanket-allowed, and `clone3` must keep falling back to it.
+        let Some(out) = run_sandboxed_probe("iso-clone-user", "clone_newuser").await
+        else {
+            return;
+        };
+        assert!(
+            out.contains("clone_newuser rc=-1 errno=1"),
+            "clone(CLONE_NEWUSER) must fail with EPERM, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_mount_and_namespace_chain_is_denied_when_isolation_is_supported() {
+        let Some(out) = run_sandboxed_probe("iso-mount", "mount").await else {
+            return;
+        };
+        assert!(
+            out.contains("mount_direct rc=-1 errno=1"),
+            "mount() must fail with EPERM, got: {out}"
+        );
+        assert!(
+            out.contains("unshare_user_mount_ns rc=-1 errno=1"),
+            "the unshare(CLONE_NEWUSER|CLONE_NEWNS) mount chain must be \
+             denied, got: {out}"
+        );
+        assert!(
+            !out.contains("mount_in_ns"),
+            "no mount may succeed inside a namespace, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_broad_kill_minus1_is_denied_when_isolation_is_supported() {
+        let Some(out) = run_sandboxed_probe("iso-kill-all", "kill_all").await else {
+            return;
+        };
+        assert!(
+            out.contains("kill_minus1 rc=-1 errno=1"),
+            "kill(-1, ...) must fail with EPERM so a broad signal cannot \
+             end the session, got: {out}"
+        );
     }
 }

@@ -24,18 +24,24 @@
 //!    Landlock filesystem rules (reads everywhere, writes only under the
 //!    workspace plus a small set of scratch roots) and a seccomp-bpf filter
 //!    (network sockets, ptrace/process-injection, kernel-module loading,
-//!    namespace/mount tricks and more are denied). The shell inherits both
-//!    and cannot remove them. When the kernel does not support these
-//!    facilities, `auto` mode runs the command **unrestricted** and says so
-//!    in the tool output, and `require` mode refuses to run — the fallback
-//!    is never silent.
+//!    namespace/mount tricks, io_uring, the all-process `kill(-1)`, and
+//!    more are denied). The two facilities are applied **independently**
+//!    (one being unavailable on a kernel does not silently remove the
+//!    other), the shell inherits whatever applied, and it cannot remove
+//!    it. When a facility is unavailable, `auto` mode says exactly which
+//!    one in the tool output and `require` mode refuses to run — the
+//!    fallback is never silent.
 //!
 //!    Limits that remain even with isolation active, by design: reads
 //!    outside the workspace are still possible (toolchains must read system
 //!    files, so secret-*read* protection stays an application policy);
 //!    `connect()` is denied even for Unix sockets; `/tmp`, `$TMPDIR`,
-//!    `/dev/shm`, `$CARGO_HOME` and `$CARGO_TARGET_DIR` are writable; and
-//!    like every software sandbox this trusts the kernel.
+//!    `/dev/shm`, `$CARGO_HOME` and `$CARGO_TARGET_DIR` are writable;
+//!    *targeted* signals (`kill <pid>`, `pkill`, `pidfd_send_signal`) can
+//!    still reach same-uid processes including this session — an inherent
+//!    limit of unprivileged same-uid sandboxing (only the all-process
+//!    `kill(-1)` is denied, see below); and like every software sandbox
+//!    this trusts the kernel.
 //!
 //! On platforms or configurations where kernel isolation is off, `bash` is
 //! *not* confined at all: a command runs with the full privileges of the
@@ -350,14 +356,16 @@ impl Sandbox {
     /// - **kernel-level isolation when available and enabled** (Linux,
     ///   `os_isolation` != off): the command cannot modify files outside the
     ///   workspace/scratch roots, open network connections, ptrace other
-    ///   processes, or load kernel modules — enforced by the kernel, not by
-    ///   command inspection. The restrictions are installed in the forked
-    ///   child just before exec (see [`os_isolation::confine_in_child`]),
-    ///   so the shell never runs unconfined. When the kernel lacks the
-    ///   facilities, `auto` mode runs the command **unrestricted** with an
-    ///   explicit warning in the output and `require` mode refuses to run;
-    ///   neither pretends the command was confined, and neither can panic
-    ///   the worker.
+    ///   processes, load kernel modules, create namespaces or mounts, or
+    ///   signal every process on the machine (`kill(-1)`) — enforced by the
+    ///   kernel, not by command inspection. The restrictions are installed
+    ///   in the forked child just before exec (see
+    ///   [`os_isolation::confine_in_child`]), so the shell never runs
+    ///   unconfined, and each facility is enforced independently of the
+    ///   other. When the kernel lacks a facility, `auto` mode runs the
+    ///   command with exactly the warning that names what is missing in the
+    ///   output and `require` mode refuses to run; neither pretends the
+    ///   command was confined, and neither can panic the worker.
     pub async fn bash(&self, command: &str) -> Result<String> {
         let cmd = self.prepare_shell(command)?;
         let timeout = self.config.effective_shell_timeout();
@@ -710,6 +718,29 @@ fn run_shell_process(
     }
     // Own process group so a timeout can take down the whole tree
     // (background jobs, grandchildren), not just the `sh` process.
+    //
+    // DECISION FLAG — `kill -9 -1` from a tool command ends the whole
+    // chatTUI session. Chosen approach: seccomp-deny `kill(-1, sig)` inside
+    // the sandboxed child (see `seccomp::build_filter` in os_isolation) —
+    // the one *broad* kill target, everything-at-once — plus this
+    // documented note. Reasoning:
+    // - The alternative wrapper/supervisor-as-group-leader idea does NOT
+    //   actually help: `kill(-1)` on Linux signals every process the sender
+    //   may signal except the sender itself, regardless of process-group
+    //   membership, so a supervisor as pgid leader would still die — and so
+    //   would chatTUI (same uid, same session). Re-shaping the group only
+    //   moves the blast radius.
+    // - Documentation alone was rejected because the footgun stays one
+    //   accidental command away from ending the session; denying `kill(-1)`
+    //   is one small BPF rule, cannot break the timeout kill (that runs
+    //   from the unsandboxed parent via `kill_process_group`), and leaves
+    //   targeted signals (`kill <pid>`, `kill -<pgid>`, `kill %job`) fully
+    //   working for normal build/test flows.
+    // - Residual, documented limits: targeted `kill <pid>`, `pkill` and
+    //   `pidfd_send_signal` can still reach same-uid processes, chatTUI
+    //   included — that is inherent to unprivileged same-uid sandboxing
+    //   (the agent can always read /proc and find the pid) and is called
+    //   out in the module security-model docs.
     unsafe {
         builder.pre_exec(|| {
             if libc::setpgid(0, 0) != 0 {
