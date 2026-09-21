@@ -8,6 +8,11 @@ pub struct ToolCallRecord {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Gemini's opaque `thoughtSignature` for this call — must be echoed
+    /// back verbatim on replay. Absent for other providers and for
+    /// sessions recorded before signatures were preserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,5 +201,43 @@ impl SessionManager {
         };
         manager.new_session();
         manager
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_record_round_trips_the_signature() {
+        let record = ToolCallRecord {
+            id: "c1".into(),
+            name: "list_files".into(),
+            arguments: "{}".into(),
+            signature: Some("sig-bytes".into()),
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        let back: ToolCallRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.signature.as_deref(), Some("sig-bytes"));
+    }
+
+    #[test]
+    fn legacy_tool_call_records_have_no_signature() {
+        // Sessions written before signatures existed must load unchanged.
+        let back: ToolCallRecord =
+            serde_json::from_str(r#"{"id":"c1","name":"x","arguments":"{}"}"#).unwrap();
+        assert_eq!(back.signature, None);
+    }
+
+    #[test]
+    fn signature_free_records_serialize_without_the_field() {
+        let record = ToolCallRecord {
+            id: "c1".into(),
+            name: "list_files".into(),
+            arguments: "{}".into(),
+            signature: None,
+        };
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("signature"));
     }
 }

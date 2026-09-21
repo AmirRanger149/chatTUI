@@ -61,7 +61,17 @@ impl App {
                             repaired_args += 1;
                             "{}".to_string()
                         };
-                        crate::api::types::ToolCall::new(tc.id.clone(), tc.name.clone(), arguments)
+                        let mut call = crate::api::types::ToolCall::new(
+                            tc.id.clone(),
+                            tc.name.clone(),
+                            arguments,
+                        );
+                        // Provider reasoning signatures (Gemini) must survive
+                        // replay verbatim, or the turn is rejected with 400.
+                        if let Some(signature) = tc.signature.clone() {
+                            call = call.with_signature(signature);
+                        }
+                        call
                     })
                     .collect();
                 msg = msg.with_tool_calls(tool_calls);
@@ -254,6 +264,7 @@ impl App {
                     } else {
                         tc.arguments.clone()
                     },
+                    signature: tc.signature.clone(),
                 })
                 .collect();
 
@@ -581,6 +592,7 @@ mod tests {
                 id: "c1".into(),
                 name: "edit_file".into(),
                 arguments: r#"{"new_string": "#.into(),
+                signature: None,
             }],
         );
 

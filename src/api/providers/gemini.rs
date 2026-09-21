@@ -131,13 +131,7 @@ impl GeminiBackend {
                             parts.push(json!({ "text": message.content }));
                         }
                         for tc in tool_calls {
-                            let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
-                            parts.push(json!({
-                                "functionCall": {
-                                    "name": tc.name,
-                                    "args": args
-                                }
-                            }));
+                            parts.push(function_call_part(tc));
                         }
                         contents.push(json!({
                             "role": "model",
@@ -217,7 +211,8 @@ impl GeminiBackend {
         }
         let mut stream = response.bytes_stream();
         let mut reader = SseReader::new();
-        let mut emitted = String::new();
+        // Cumulative text of the CURRENT answer segment (see text_delta).
+        let mut segment_text = String::new();
         let mut any_text = false;
         let mut finish_reason = String::new();
         let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
@@ -318,14 +313,28 @@ impl GeminiBackend {
                                     "{}".to_string()
                                 };
                                 let id = format!("{}:{}", name, pending_tool_calls.len());
-                                let tc = ToolCall::new(id, name, args_str);
+                                let mut tc = ToolCall::new(id, name, args_str);
+                                // The part's opaque reasoning signature is the
+                                // only carrier of the model's thinking state;
+                                // keep it so replay can echo it back verbatim
+                                // (Gemini rejects turns that omit it: HTTP 400
+                                // "missing a thought_signature").
+                                if let Some(signature) = part["thoughtSignature"].as_str() {
+                                    tc = tc.with_signature(signature.to_string());
+                                }
                                 pending_tool_calls.push(tc);
                             }
                         }
                     }
                 }
 
-                // Text handling - cumulative
+                // Text handling. Gemini normally streams cumulative text:
+                // each frame repeats the whole answer so far, and only the
+                // new suffix is emitted. With interleaved thinking, though,
+                // the accumulation resets after a thinking segment — the
+                // next answer piece arrives as a fresh part that does not
+                // extend the previous frame. Dropping those frames is what
+                // cut answers short after a few words.
                 let mut full = String::new();
                 if let Some(parts) = value["candidates"][0]["content"]["parts"].as_array() {
                     for part in parts {
@@ -340,25 +349,12 @@ impl GeminiBackend {
                         }
                     }
                 }
-                if let Some(delta) = full.strip_prefix(emitted.as_str()) {
-                    if !delta.is_empty() {
-                        tx.send(StreamEvent::Delta(delta.to_string()))
-                            .await
-                            .map_err(|_| Failure::Fatal("stream receiver closed".into()))?;
-                        emitted.push_str(delta);
-                        any_text = true;
-                    }
-                } else if !full.is_empty() && full != emitted {
-                    // Handle non-cumulative case
-                    if full.len() > emitted.len() {
-                        if let Some(delta) = full.strip_prefix(&emitted) {
-                            tx.send(StreamEvent::Delta(delta.to_string()))
-                                .await
-                                .map_err(|_| Failure::Fatal("stream receiver closed".into()))?;
-                            emitted = full;
-                            any_text = true;
-                        }
-                    }
+                if let Some(delta) = text_delta(&segment_text, &full) {
+                    tx.send(StreamEvent::Delta(delta))
+                        .await
+                        .map_err(|_| Failure::Fatal("stream receiver closed".into()))?;
+                    segment_text = full;
+                    any_text = true;
                 }
             }
         }
@@ -392,5 +388,95 @@ impl ChatBackend for GeminiBackend {
         tx: Sender<StreamEvent>,
     ) -> Pin<Box<dyn Future<Output = Result<(), Failure>> + Send + '_>> {
         Box::pin(self.stream_inner(request.clone(), tx))
+    }
+}
+
+/// Advance the streaming-text state with one frame's visible text and
+/// return the delta to emit, if any.
+///
+/// Within an answer segment Gemini streams cumulative text, so a frame that
+/// extends `segment_text` yields only the new suffix. With interleaved
+/// thinking the accumulation resets after a thinking segment: a frame that
+/// does NOT extend the current segment is the start of a new one and must
+/// be emitted whole — silently dropping it truncates the answer.
+fn text_delta(segment_text: &str, full: &str) -> Option<String> {
+    if full.is_empty() {
+        return None;
+    }
+    let delta = match full.strip_prefix(segment_text) {
+        Some(rest) => rest.to_string(),
+        None => full.to_string(),
+    };
+    if delta.is_empty() {
+        None
+    } else {
+        Some(delta)
+    }
+}
+
+/// Build one replayed `model`-turn part for a tool call. The model's opaque
+/// reasoning signature travels with the call and is echoed back verbatim —
+/// Gemini's thinking models reject the whole turn with 400 INVALID_ARGUMENT
+/// when it is missing.
+fn function_call_part(tc: &ToolCall) -> Value {
+    let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+    let mut part = json!({
+        "functionCall": {
+            "name": tc.name,
+            "args": args
+        }
+    });
+    if let Some(signature) = &tc.signature {
+        part["thoughtSignature"] = json!(signature);
+    }
+    part
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn function_call_part_echoes_the_thought_signature() {
+        let signed =
+            ToolCall::new("list_files:0", "list_files", "{}").with_signature("sig-bytes");
+        let part = function_call_part(&signed);
+        assert_eq!(part["thoughtSignature"], json!("sig-bytes"));
+        assert_eq!(part["functionCall"]["name"], json!("list_files"));
+
+        // Calls without a signature (other providers, legacy sessions) stay
+        // exactly as they always were.
+        let unsigned = ToolCall::new("list_files:1", "list_files", "{}");
+        let part = function_call_part(&unsigned);
+        assert!(part.get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn function_call_part_falls_back_to_empty_args_on_bad_json() {
+        let tc = ToolCall::new("x:0", "read_file", r#"{"path": "#).with_signature("s");
+        let part = function_call_part(&tc);
+        assert_eq!(part["functionCall"]["args"], json!({}));
+        assert_eq!(part["thoughtSignature"], json!("s"));
+    }
+
+    #[test]
+    fn text_delta_streams_cumulative_suffixes() {
+        assert_eq!(text_delta("", "Hello").as_deref(), Some("Hello"));
+        assert_eq!(text_delta("Hello", "Hello world").as_deref(), Some(" world"));
+        // Duplicate frame — nothing new.
+        assert_eq!(text_delta("Hello world", "Hello world"), None);
+        // Thought-only frame — no visible text at all.
+        assert_eq!(text_delta("Hello", ""), None);
+    }
+
+    #[test]
+    fn text_delta_treats_a_reset_as_a_new_segment() {
+        // Interleaved thinking: the cumulative text restarts after a
+        // thinking block. The fresh piece must be emitted whole, not
+        // dropped — dropping it is what cut answers short.
+        assert_eq!(
+            text_delta("Sure", "Here is the rest").as_deref(),
+            Some("Here is the rest")
+        );
     }
 }

@@ -6,6 +6,13 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String, // JSON string
+    /// The provider's opaque reasoning signature for this call, when it
+    /// gives one (Gemini's `thoughtSignature` on the functionCall part).
+    /// It is the only carrier of the model's private reasoning state and
+    /// must be echoed back verbatim when replaying the call, or Gemini's
+    /// thinking models reject the turn with 400. Other providers leave it
+    /// `None`.
+    pub signature: Option<String>,
 }
 
 impl ToolCall {
@@ -14,7 +21,15 @@ impl ToolCall {
             id: id.into(),
             name: name.into(),
             arguments: arguments.into(),
+            signature: None,
         }
+    }
+
+    /// Attach the provider's opaque reasoning signature. Treated as a black
+    /// box: never parsed, never modified, only round-tripped.
+    pub fn with_signature(mut self, signature: impl Into<String>) -> Self {
+        self.signature = Some(signature.into());
+        self
     }
 }
 
