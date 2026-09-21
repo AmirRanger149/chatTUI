@@ -30,6 +30,7 @@ use crate::sandbox::permissions::PermissionMode;
 use crate::sandbox::{Sandbox, SandboxConfig};
 use crate::session::manager::SessionManager;
 use anyhow::Result;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Receiver;
@@ -53,6 +54,23 @@ pub enum Cell {
     Notice(String),
     ToolCall { name: String, args: String, id: String },
     ToolResult { id: String, content: String, is_error: bool },
+}
+
+/// What the status row shows while the API client waits out a retry backoff.
+/// Set by `StreamEvent::Retry`, cleared as soon as tokens flow again, the
+/// stream ends, or the user interrupts.
+#[derive(Debug, Clone)]
+pub struct RetryView {
+    /// When the backoff started — the countdown is derived from this, so the
+    /// animation needs no extra timer.
+    pub started: Instant,
+    /// How long the backoff lasts in total.
+    pub wait: Duration,
+    /// Which retry this is (1-based) and the maximum.
+    pub attempt: u8,
+    pub max: u8,
+    /// Why the previous attempt failed, shown dimmed after the countdown.
+    pub reason: String,
 }
 
 pub struct App {
@@ -90,6 +108,13 @@ pub struct App {
     pub pending_tool_calls: Vec<ToolCall>,
     pub agent_iterations: usize,
     pub agent_mode: bool,
+    /// Ids of tool calls whose arguments arrived unparseable (a stream cut
+    /// mid-arguments). They get an explicit truncation error instead of a
+    /// misleading "missing field", and are persisted with clean JSON.
+    pub truncated_tool_calls: HashSet<String>,
+    /// Live retry state for the animated status row; `None` outside a
+    /// same-model retry backoff.
+    pub retry_state: Option<RetryView>,
 }
 
 impl App {
@@ -176,6 +201,8 @@ impl App {
             pending_tool_calls: Vec::new(),
             agent_iterations: 0,
             agent_mode: true, // Agent mode enabled by default when sandbox enabled
+            truncated_tool_calls: HashSet::new(),
+            retry_state: None,
         };
         app.rebuild_cells();
         if let Some(error) = target_error {
@@ -264,6 +291,8 @@ impl App {
         self.stream_started = None;
         self.pending_tool_calls.clear();
         self.agent_iterations = 0;
+        self.truncated_tool_calls.clear();
+        self.retry_state = None;
         self.finish_partial();
     }
 

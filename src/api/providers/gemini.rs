@@ -17,8 +17,8 @@
 //!   full `models/{name}` path).
 //! - Tool calling uses `functionDeclarations` and `functionCall`/`functionResponse`.
 
-use super::ChatBackend;
-use crate::api::error::{classify_failure, error_detail};
+use super::{ChatBackend, HttpTimeouts};
+use crate::api::error::{classify_failure, error_detail, MAX_CONSECUTIVE_SSE_PARSE_FAILURES};
 use crate::api::sse::SseReader;
 use crate::api::types::{CompletionRequest, Failure, Role, StreamEvent, ToolCall};
 use crate::tools;
@@ -35,17 +35,22 @@ pub struct GeminiBackend {
     http: Client,
     api_key: String,
     base_url: String,
+    /// How long the stream may stay quiet between chunks before the
+    /// connection counts as dead. There is deliberately no whole-request
+    /// timeout: it would cut long generations off mid-answer.
+    idle_timeout: Duration,
 }
 
 impl GeminiBackend {
-    pub fn new(api_key: String, base_url: String) -> Self {
+    pub fn new(api_key: String, base_url: String, timeouts: HttpTimeouts) -> Self {
         Self {
             http: Client::builder()
-                .timeout(Duration::from_secs(120))
+                .connect_timeout(timeouts.connect)
                 .build()
                 .expect("HTTP client"),
             api_key,
             base_url: base_url.trim_end_matches('/').into(),
+            idle_timeout: timeouts.idle,
         }
     }
 
@@ -61,13 +66,21 @@ impl GeminiBackend {
 
     async fn list_models_inner(&self) -> Result<Vec<String>> {
         let url = format!("{}/models", self.base_url);
-        let response = self
-            .http
-            .get(url)
-            .header("x-goog-api-key", &self.api_key)
-            .send()
-            .await
-            .context("sending GET /models request")?;
+        let response = tokio::time::timeout(
+            self.idle_timeout,
+            self.http
+                .get(url)
+                .header("x-goog-api-key", &self.api_key)
+                .send(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "model list request timed out after {}s",
+                self.idle_timeout.as_secs()
+            )
+        })?
+        .context("sending GET /models request")?;
         let status = response.status();
         if !status.is_success() {
             return Err(anyhow!(
@@ -196,7 +209,7 @@ impl GeminiBackend {
             .json(&body)
             .send()
             .await
-            .map_err(|error| Failure::Retryable(format!("request failed: {error}")))?;
+            .map_err(|error| Failure::Transient(format!("request failed: {error}")))?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -208,24 +221,76 @@ impl GeminiBackend {
         let mut any_text = false;
         let mut finish_reason = String::new();
         let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
+        let mut bad_lines = 0usize;
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| {
-                if any_text || !pending_tool_calls.is_empty() {
-                    Failure::Fatal(format!("stream interrupted after output started: {error}"))
-                } else {
-                    Failure::Retryable(format!("stream interrupted before any output: {error}"))
+        let mut stream_ended = false;
+        loop {
+            // Idle-timeout guard: a stream may run as long as it keeps
+            // producing chunks, but a connection that stays quiet past
+            // `idle_timeout` is dead and must not hang the UI forever.
+            // When the stream closes cleanly, whatever trailing frame the
+            // reader still holds (a provider may end without a final
+            // newline) is processed too — losing it can truncate tool-call
+            // arguments.
+            let payloads = if stream_ended {
+                break;
+            } else {
+                match tokio::time::timeout(self.idle_timeout, stream.next()).await {
+                    Ok(Some(Ok(chunk))) => reader.feed(&chunk),
+                    Ok(Some(Err(error))) => {
+                        return Err(if any_text || !pending_tool_calls.is_empty() {
+                            Failure::Fatal(format!(
+                                "stream interrupted after output started: {error}"
+                            ))
+                        } else {
+                            Failure::Transient(format!(
+                                "stream interrupted before any output: {error}"
+                            ))
+                        });
+                    }
+                    Ok(None) => {
+                        stream_ended = true;
+                        reader.flush()
+                    }
+                    Err(_elapsed) => {
+                        let secs = self.idle_timeout.as_secs();
+                        return Err(if any_text || !pending_tool_calls.is_empty() {
+                            Failure::Fatal(format!(
+                                "the connection went quiet for {secs}s after output started"
+                            ))
+                        } else {
+                            Failure::Transient(format!(
+                                "the connection went quiet for {secs}s before any output"
+                            ))
+                        });
+                    }
                 }
-            })?;
-            for data in reader.feed(&chunk) {
+            };
+            for data in payloads {
                 if data == "[DONE]" {
                     for tc in pending_tool_calls.drain(..) {
                         let _ = tx.send(StreamEvent::ToolCall(tc)).await;
                     }
                     return Ok(());
                 }
-                let value: Value = serde_json::from_str(&data)
-                    .map_err(|error| Failure::Fatal(format!("parsing streaming response failed: {error}")))?;
+                let value: Value = match serde_json::from_str(&data) {
+                    Ok(value) => {
+                        bad_lines = 0;
+                        value
+                    }
+                    Err(_) => {
+                        // Gateways occasionally emit junk or keep-alive
+                        // lines; a single one must not kill the stream. Only
+                        // a run of consecutive garbage is treated as broken.
+                        bad_lines += 1;
+                        if bad_lines >= MAX_CONSECUTIVE_SSE_PARSE_FAILURES {
+                            return Err(Failure::Fatal(format!(
+                                "the stream sent {bad_lines} unparseable lines in a row (last: {data})"
+                            )));
+                        }
+                        continue;
+                    }
+                };
                 if let Some(reason) = value["promptFeedback"]["blockReason"].as_str() {
                     return Err(Failure::Fatal(format!(
                         "Gemini blocked the prompt: {reason}"

@@ -37,16 +37,30 @@ pub enum StreamEvent {
     ToolCall(ToolCall),
     /// Progress information, shown as a quiet transcript row.
     Notice(String),
+    /// A same-model retry starts after a backoff. The UI shows an animated
+    /// countdown while the client waits out `wait_ms`; the next `Delta`,
+    /// `ToolCall` or `Error` clears it.
+    Retry {
+        attempt: u8,
+        max: u8,
+        wait_ms: u64,
+        reason: String,
+    },
     /// The request failed for good.
     Error(String),
 }
 
-/// Why a chat attempt failed, and whether a different model could fix it.
+/// Why a chat attempt failed, and what the orchestrator may do about it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
-    /// Another model may succeed: bad requests for this model, missing or
-    /// decommissioned models, "high demand"/overload, throttling, upstream
-    /// outages.
+    /// The same model may answer fine if asked again: network failures,
+    /// connect problems, idle timeouts, HTTP 408/429/5xx. The orchestrator
+    /// retries the *same* model with backoff before considering other
+    /// models.
+    Transient(String),
+    /// This specific model is the problem: bad requests against it, missing
+    /// or decommissioned models, "high demand"/overload. Another model may
+    /// succeed.
     Retryable(String),
     /// Switching models will not help: rejected credentials, protocol
     /// errors, a stream that broke after output started.
@@ -56,6 +70,11 @@ pub enum Failure {
 /// How many models a single message may try before giving up: the requested
 /// model plus up to three fallbacks.
 pub const MAX_MODELS_PER_SEND: usize = 4;
+
+/// How many times a single message may retry the *same* model on
+/// [`Failure::Transient`] errors (network, timeouts, throttling) before the
+/// orchestrator falls back to other models.
+pub const MAX_RETRIES_PER_MODEL: usize = 3;
 
 /// A message's speaker. Each backend maps these onto its own wire roles
 /// (OpenAI `system/assistant/user`, Anthropic's top-level `system` + content

@@ -213,6 +213,18 @@ marked `· custom`) or directly with `/provider openai|anthropic|gemini|<custom-
 | `temperature` | Sampling temperature for responses | `0.7` |
 | `model` | Optional model name override for the active provider | Provider default |
 | `base_url` | Optional endpoint override for the active provider | Provider default |
+| `connect_timeout_secs` | Max seconds to wait while establishing an API connection | `15` |
+| `idle_timeout_secs` | Max seconds a stream may stay quiet between chunks before the connection counts as dead — this is *not* a cap on total generation time | `90` |
+
+> **Retries & timeouts.** Transient failures (network errors, timeouts,
+> HTTP 408/429/5xx) retry the *same* model up to three times with
+> exponential backoff — announced in the transcript and shown as an animated
+> `Retrying in …s` countdown above the composer — before falling back to
+> another model as described below. Model-specific failures (missing or
+> overloaded models) skip straight to the model fallback. Streams themselves
+> are only bounded by the idle timeout, so long generations are never cut
+> off as long as tokens keep arriving, and a lone malformed SSE line from a
+> gateway no longer kills the stream.
 
 > **Deprecated fields still work.** Older configs that use `dahl_api_key`,
 > `apinex_api_key`, or the legacy single `api_key` field keep working: those
@@ -456,6 +468,13 @@ Conversation history is stored in the platform data directory, normally:
 
 The history file contains your saved messages. Back it up if you need to keep
 your conversations, and protect it if they contain private information.
+Saves are atomic (temp file + rename), so a crash cannot leave a truncated
+history behind; if the file is ever unreadable at startup, chatTUI moves it
+aside as `sessions.json.corrupt-<timestamp>` and starts fresh instead of
+refusing to launch. Corrupted tool calls from an interrupted or truncated
+stream are repaired automatically on replay (truncated arguments become
+`{}`, missing tool results are backfilled), and each repair is announced in
+the transcript.
 
 ## Troubleshooting
 

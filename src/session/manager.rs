@@ -48,7 +48,26 @@ impl SessionManager {
             path,
         };
         if manager.path.exists() {
-            manager.store = serde_json::from_slice(&fs::read(&manager.path)?)?;
+            // A corrupt history must never brick startup: quarantine the
+            // file and start fresh instead of failing.
+            let bytes = fs::read(&manager.path)?;
+            match serde_json::from_slice(&bytes) {
+                Ok(store) => manager.store = store,
+                Err(error) => {
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let quarantine = manager
+                        .path
+                        .with_file_name(format!("sessions.json.corrupt-{stamp}"));
+                    let _ = fs::rename(&manager.path, &quarantine);
+                    eprintln!(
+                        "chatTUI: sessions.json was unreadable ({error}); moved to {} and starting fresh",
+                        quarantine.display()
+                    );
+                }
+            }
         }
         if manager.store.sessions.is_empty() {
             manager.new_session();
@@ -62,7 +81,12 @@ impl SessionManager {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&self.path, serde_json::to_vec_pretty(&self.store)?)?;
+        // Atomic save: write a temp file, then rename over the real one. A
+        // crash mid-write can then at worst lose the save itself, never
+        // leave a truncated sessions.json behind.
+        let tmp = self.path.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_vec_pretty(&self.store)?)?;
+        fs::rename(&tmp, &self.path)?;
         Ok(())
     }
 

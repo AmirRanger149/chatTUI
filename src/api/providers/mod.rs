@@ -19,7 +19,33 @@ use crate::api::types::{CompletionRequest, Failure, StreamEvent};
 use anyhow::Result;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use tokio::sync::mpsc::Sender;
+
+/// HTTP timeouts shared by every backend.
+///
+/// Deliberately no blanket whole-request timeout: it would include reading
+/// the streamed body and cut long generations off mid-answer. Streams are
+/// instead guarded by an *idle* timeout on each chunk (see the backends'
+/// read loops), so a response that keeps producing tokens may run as long
+/// as it needs while a dead connection is still detected.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpTimeouts {
+    /// How long establishing the connection may take before giving up.
+    pub connect: Duration,
+    /// How long the stream may stay quiet between chunks before the
+    /// connection is treated as dead.
+    pub idle: Duration,
+}
+
+impl Default for HttpTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(15),
+            idle: Duration::from_secs(90),
+        }
+    }
+}
 
 /// The wire protocol a provider speaks. OpenAI and every OpenAI-compatible
 /// gateway (the custom providers in `config.json`: Dahl, APInex, Ollama,
@@ -33,14 +59,20 @@ pub enum ProviderKind {
 }
 
 impl ProviderKind {
-    /// Build the backend for this protocol, bound to a key and endpoint.
-    pub fn build(self, api_key: String, base_url: String) -> Box<dyn ChatBackend> {
+    /// Build the backend for this protocol, bound to a key, endpoint and
+    /// timeout policy.
+    pub fn build(
+        self,
+        api_key: String,
+        base_url: String,
+        timeouts: HttpTimeouts,
+    ) -> Box<dyn ChatBackend> {
         match self {
             Self::OpenAICompatible => {
-                Box::new(OpenAICompatibleBackend::new(api_key, base_url))
+                Box::new(OpenAICompatibleBackend::new(api_key, base_url, timeouts))
             }
-            Self::Anthropic => Box::new(AnthropicBackend::new(api_key, base_url)),
-            Self::Gemini => Box::new(GeminiBackend::new(api_key, base_url)),
+            Self::Anthropic => Box::new(AnthropicBackend::new(api_key, base_url, timeouts)),
+            Self::Gemini => Box::new(GeminiBackend::new(api_key, base_url, timeouts)),
         }
     }
 }
@@ -49,13 +81,15 @@ impl ProviderKind {
 ///
 /// # Fallback contract
 ///
-/// The orchestrator in [`crate::api::client`] retries a failed attempt with a
-/// different model only when [`stream_completion`] returns
-/// [`Failure::Retryable`]. A backend must therefore return [`Failure::Fatal`]
-/// whenever it has already emitted some text. Splicing a second model into a
-/// half-written answer gives you one Frankenstein reply. (This is how the old
-/// single-backend code behaved; it is written down here so new backends keep
-/// doing it.)
+/// The orchestrator in [`crate::api::client`] reacts to failures in three
+/// ways: [`Failure::Transient`] retries the *same* model with backoff
+/// (network, timeouts, throttling), [`Failure::Retryable`] switches to
+/// another model, and [`Failure::Fatal`] ends the request. A backend must
+/// therefore return [`Failure::Fatal`] whenever it has already emitted some
+/// text — neither a retry nor a second model may be spliced into a
+/// half-written answer, or you get one Frankenstein reply. (This is how the
+/// old single-backend code behaved; it is written down here so new backends
+/// keep doing it.)
 ///
 /// [`stream_completion`]: ChatBackend::stream_completion
 pub trait ChatBackend: Send + Sync {

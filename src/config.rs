@@ -1,7 +1,8 @@
 use crate::api::client::ApiClient;
-use crate::api::providers::ProviderKind;
+use crate::api::providers::{HttpTimeouts, ProviderKind};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use std::{env, fs, path::PathBuf};
 
 /// A chat provider: an id/name, the wire protocol it speaks, its endpoint,
@@ -196,6 +197,22 @@ pub struct Config {
     pub temperature: f32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
+    /// How long establishing an API connection may take, in seconds, before
+    /// the attempt is abandoned (clamped to at least 1s at use).
+    #[serde(
+        default = "default_connect_timeout_secs",
+        skip_serializing_if = "is_default_connect_timeout_secs"
+    )]
+    pub connect_timeout_secs: u64,
+    /// How long an API stream may stay quiet between chunks, in seconds,
+    /// before the connection is treated as dead (clamped to at least 1s at
+    /// use). This is *not* a cap on the total generation time — a stream
+    /// that keeps producing tokens may run as long as it needs.
+    #[serde(
+        default = "default_idle_timeout_secs",
+        skip_serializing_if = "is_default_idle_timeout_secs"
+    )]
+    pub idle_timeout_secs: u64,
     #[serde(default, skip_serializing_if = "is_default_sandbox")]
     pub sandbox: SandboxConfigFile,
 }
@@ -209,6 +226,22 @@ fn is_default_sandbox(cfg: &SandboxConfigFile) -> bool {
         && cfg.permission_mode.is_none()
         && cfg.os_isolation.is_none()
         && cfg.extra_sensitive_names.is_empty()
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    15
+}
+
+fn is_default_connect_timeout_secs(value: &u64) -> bool {
+    *value == default_connect_timeout_secs()
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    90
+}
+
+fn is_default_idle_timeout_secs(value: &u64) -> bool {
+    *value == default_idle_timeout_secs()
 }
 
 impl Default for Config {
@@ -225,6 +258,8 @@ impl Default for Config {
             model: String::new(),
             temperature: 0.7,
             provider: String::new(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            idle_timeout_secs: default_idle_timeout_secs(),
             sandbox: SandboxConfigFile::default(),
         };
         // Pick up every provider's key from its environment variable.
@@ -390,9 +425,15 @@ impl Config {
             .find_provider(&self.provider)
             .map(|p| p.kind)
             .unwrap_or(ProviderKind::OpenAICompatible);
+        // Clamp away zero so a misconfiguration can never mean "no timeout".
+        let timeouts = HttpTimeouts {
+            connect: Duration::from_secs(self.connect_timeout_secs.max(1)),
+            idle: Duration::from_secs(self.idle_timeout_secs.max(1)),
+        };
         ApiClient::new(kind.build(
             self.api_key.clone().unwrap_or_default(),
             self.base_url.clone(),
+            timeouts,
         ))
     }
 

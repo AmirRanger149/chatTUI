@@ -34,6 +34,20 @@ impl SseReader {
         }
         out
     }
+
+    /// Drain a trailing frame that ended without a final newline. Providers
+    /// that close the connection mid-frame must not silently lose the last
+    /// event — that is exactly how tool-call arguments get truncated.
+    pub(crate) fn flush(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.buffer.is_empty() {
+            let line = std::mem::take(&mut self.buffer);
+            if let Some(data) = sse_data(&line) {
+                out.push(data.to_string());
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -68,5 +82,21 @@ mod tests {
                 "done".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn flush_recovers_a_trailing_frame_without_newline() {
+        let mut reader = SseReader::new();
+        assert!(reader.feed(b"data: {\"tail\":1}").is_empty());
+        assert_eq!(reader.flush(), vec!["{\"tail\":1}".to_string()]);
+        // Nothing is left behind, and flushing again is harmless.
+        assert!(reader.flush().is_empty());
+    }
+
+    #[test]
+    fn flush_ignores_non_data_trailing_lines() {
+        let mut reader = SseReader::new();
+        reader.feed(b"event: ping");
+        assert!(reader.flush().is_empty());
     }
 }

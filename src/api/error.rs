@@ -4,13 +4,29 @@
 use crate::api::types::Failure;
 use serde_json::Value;
 
-/// Decide whether a failed chat response could succeed with a different
-/// model. `status` is the HTTP status, or `0` when the API failed inside a
-/// 200-OK stream and only the error text is known.
+/// How many consecutive unparseable SSE `data:` lines a backend tolerates
+/// before declaring the stream broken. Gateways occasionally emit junk or
+/// keep-alive lines; a single bad line must not kill an otherwise healthy
+/// stream.
+pub(crate) const MAX_CONSECUTIVE_SSE_PARSE_FAILURES: usize = 5;
+
+/// Decide how the orchestrator should react to a failed chat attempt.
+///
+/// - [`Failure::Transient`] — the same model may answer fine if asked again:
+///   network trouble, HTTP 408/429/5xx. The orchestrator retries the same
+///   model with backoff before falling back to other models.
+/// - [`Failure::Retryable`] — this specific model is the problem (missing,
+///   decommissioned, overloaded); a different model may succeed.
+/// - [`Failure::Fatal`] — no retry and no other model can help (rejected
+///   credentials, protocol errors).
+///
+/// `status` is the HTTP status, or `0` when the API failed inside a 200-OK
+/// stream and only the error text is known.
 pub(crate) fn classify_failure(status: u16, body: &str) -> Failure {
     let lower = body.to_ascii_lowercase();
 
-    // Wrong credentials are fatal no matter which model is asked.
+    // Wrong credentials are fatal no matter which model is asked — and
+    // retrying the same one is pointless.
     const AUTH: &[&str] = &[
         "invalid api key",
         "invalid_api_key",
@@ -27,17 +43,23 @@ pub(crate) fn classify_failure(status: u16, body: &str) -> Failure {
         return Failure::Fatal(compact_failure("the API rejected the credentials", status, body));
     }
 
+    // Server-side and transport trouble on a real HTTP status: timeouts,
+    // throttling, and upstream outages. The same model may answer fine a few
+    // seconds later, so these get same-model retries with backoff first.
+    if status == 408 || status == 429 || (500..=599).contains(&status) {
+        return Failure::Transient(compact_failure("the API hit a transient error", status, body));
+    }
+
     // These statuses are the API saying "not this model / not right now":
-    // bad requests against the model, missing models, throttling and
-    // upstream outages. A different model may well work.
-    if matches!(status, 400 | 404 | 408 | 409 | 413 | 422 | 425 | 429)
-        || (500..=599).contains(&status)
-    {
+    // bad requests against the model, missing models, payload problems. A
+    // different model may well work.
+    if matches!(status, 400 | 404 | 409 | 413 | 422 | 425) {
         return Failure::Retryable(compact_failure("the model rejected the request", status, body));
     }
 
-    // Any other status can still mean "model busy / gone" if the body says so,
-    // like the usual "currently experiencing high demand" line.
+    // Any other status can still mean "model busy / gone" if the body says
+    // so, like the usual "currently experiencing high demand" line. Also the
+    // only signal available for status-less, mid-stream API errors.
     const MODEL_TROUBLE: &[&str] = &[
         "high demand",
         "overload",
@@ -64,9 +86,7 @@ pub(crate) fn classify_failure(status: u16, body: &str) -> Failure {
     }
 
     // Project/key valid but this model is not enabled (common on 403).
-    if status == 403
-        && (lower.contains("model") || lower.contains("does not have access"))
-    {
+    if status == 403 && (lower.contains("model") || lower.contains("does not have access")) {
         return Failure::Retryable(compact_failure("the model rejected the request", status, body));
     }
 
@@ -116,20 +136,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classifies_retryable_and_fatal_failures() {
+    fn classifies_transient_retryable_and_fatal_failures() {
+        // Server-side trouble and throttling → retry the same model first.
+        assert!(matches!(
+            classify_failure(503, "The model is currently experiencing high demand"),
+            Failure::Transient(_)
+        ));
+        assert!(matches!(classify_failure(429, "slow down"), Failure::Transient(_)));
+        assert!(matches!(classify_failure(500, "oops"), Failure::Transient(_)));
+        assert!(matches!(classify_failure(408, "gateway timeout"), Failure::Transient(_)));
+
         // Bad request for the model → try another one.
         assert!(matches!(
             classify_failure(400, "{\"error\":{\"message\":\"Model not found\"}}"),
             Failure::Retryable(_)
         ));
-        // The classic "high demand" overload line.
-        assert!(matches!(
-            classify_failure(503, "The model is currently experiencing high demand"),
-            Failure::Retryable(_)
-        ));
-        assert!(matches!(classify_failure(429, "slow down"), Failure::Retryable(_)));
-        assert!(matches!(classify_failure(500, "oops"), Failure::Retryable(_)));
-        // Credentials never get better by switching models.
+
+        // Credentials never get better by retrying or switching models.
         assert!(matches!(
             classify_failure(401, "{\"error\":{\"message\":\"Invalid API key\"}}"),
             Failure::Fatal(_)
@@ -146,7 +169,9 @@ mod tests {
             ),
             Failure::Retryable(_)
         ));
-        // Mid-stream failure texts follow the same rules.
+
+        // Mid-stream failure texts (status 0) follow the phrase rules: the
+        // classic "high demand" line is model trouble, unknown text is fatal.
         assert!(matches!(
             classify_failure(0, "Model is currently getting high demand, try later"),
             Failure::Retryable(_)
@@ -158,7 +183,7 @@ mod tests {
     fn error_detail_prefers_the_api_message() {
         assert_eq!(error_detail("{\"error\":{\"message\":\"boom\"}}"), "boom");
         assert_eq!(error_detail("{\"detail\":\"detailed\"}"), "detailed");
-        assert_eq!(error_detail("  plain text  "), "plain text");
+        assert_eq!(error_detail(" plain text "), "plain text");
         assert_eq!(error_detail(""), "");
         assert!(error_detail(&"x".repeat(500)).chars().count() <= 201);
     }

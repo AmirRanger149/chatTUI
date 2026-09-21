@@ -507,8 +507,17 @@ impl Sandbox {
         let kind = ToolKind::from_tool_name(&tool_call.name)
             .ok_or_else(|| anyhow!("unknown tool: {}", tool_call.name))?;
         self.authorize(kind)?;
-        let args: Value = serde_json::from_str(&tool_call.arguments)
-            .unwrap_or(Value::Object(Default::default()));
+        // Never silently fall back to empty arguments: unparseable JSON
+        // almost always means the call was truncated mid-stream, and the
+        // model deserves an error that says so (and how to recover).
+        let args: Value = match serde_json::from_str(&tool_call.arguments) {
+            Ok(value) => value,
+            Err(_) => {
+                return Err(anyhow!(
+                    "tool call arguments are not valid JSON — they most likely arrived truncated when the stream was cut mid-call; retry with smaller edits"
+                ));
+            }
+        };
         match tool_call.name.as_str() {
             "read_file" => {
                 let path = args["path"].as_str().ok_or_else(|| anyhow!("missing path"))?;
@@ -1426,6 +1435,16 @@ mod tests {
         assert_eq!(sandbox.execute_tool(&read).await.unwrap(), "hello");
         let list = ToolCall::new("3", "list_files", "{}");
         assert!(sandbox.execute_tool(&list).await.unwrap().contains("a.txt"));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_reports_truncated_arguments_explicitly() {
+        let dir = unique_root("trunc-args");
+        let sandbox = Sandbox::with_root(dir);
+        // Unterminated JSON — what a stream cut mid-arguments leaves behind.
+        let call = ToolCall::new("1", "read_file", r#"{"path": "#);
+        let err = sandbox.execute_tool(&call).await.unwrap_err();
+        assert!(err.to_string().contains("truncated"), "unexpected: {err}");
     }
 
     #[test]

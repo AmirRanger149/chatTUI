@@ -1,7 +1,8 @@
 //! The `• Working (12s • esc to interrupt)` row drawn above the composer
-//! while a response is streaming.
+//! while a response is streaming — plus the shimmering `Retrying` countdown
+//! shown while the client waits out a same-model retry backoff.
 
-use crate::app::App;
+use crate::app::{App, RetryView};
 use crate::ui::theme::{self, SPINNER};
 use crate::ui::thinking;
 use ratatui::prelude::*;
@@ -9,6 +10,10 @@ use ratatui::widgets::Paragraph;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if let Some(retry) = &app.retry_state {
+        render_retry(frame, area, app, retry);
         return;
     }
     if app.is_thinking() {
@@ -69,5 +74,38 @@ fn render_thinking(frame: &mut Frame, area: Rect, app: &App) {
             ));
         }
     }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The `↻ Retrying in 1.8s (attempt 2/3 · reason • esc to interrupt)` row.
+/// Same shimmer treatment as the thinking indicator; the countdown is
+/// derived from the retry state on every redraw, so the ~20fps render loop
+/// animates it for free. When the retry succeeds the state is cleared and
+/// this row simply disappears.
+fn render_retry(frame: &mut Frame, area: Rect, app: &App, retry: &RetryView) {
+    let tick = app.elapsed_ms();
+    let remaining = retry.wait.saturating_sub(retry.started.elapsed());
+    let mut spans = vec![Span::styled(
+        format!("{} ", thinking::glyph(tick)),
+        Style::new().fg(Color::Yellow).bold(),
+    )];
+    spans.extend(thinking::shimmer("Retrying", tick / 90, Style::new().italic()));
+    spans.push(Span::styled(
+        format!(" in {:.1}s ", remaining.as_secs_f64()),
+        Style::new().bold(),
+    ));
+    spans.push(Span::styled(
+        format!("(attempt {}/{} · ", retry.attempt, retry.max),
+        theme::dim(),
+    ));
+    let used = theme::spans_width(&spans);
+    let tail = " • esc to interrupt)";
+    let room = (area.width as usize).saturating_sub(used + theme::cell_width(tail) + 2);
+    if room > 8 {
+        spans.push(Span::styled(theme::clamp_text(&retry.reason, room), theme::dim()));
+    }
+    spans.push(Span::styled(" • ", theme::dim()));
+    spans.push(Span::raw("esc"));
+    spans.push(Span::styled(" to interrupt)", theme::dim()));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

@@ -3,11 +3,12 @@
 //! Now with agent loop for tool calling.
 
 use crate::api::types::{Message, Role, StreamEvent, ToolDefinition};
-use crate::app::{App, Cell, MAX_AGENT_ITERATIONS};
+use crate::app::{App, Cell, RetryView, MAX_AGENT_ITERATIONS};
 use crate::session::manager::ToolCallRecord;
 use crate::tools;
 use anyhow::Result;
-use std::time::Instant;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
 impl App {
@@ -35,30 +36,82 @@ impl App {
             ));
         }
         let (tx, rx) = mpsc::channel(64);
-        let mut messages: Vec<Message> = self
-            .sessions
-            .current()
-            .messages
+        let mut messages: Vec<Message> = Vec::with_capacity(self.sessions.current().messages.len());
+        let mut repaired_args = 0usize;
+        for m in &self.sessions.current().messages {
+            let role = Role::from(m.role.as_str());
+            let mut msg = Message::new(
+                role,
+                crate::ui::thinking::strip(&m.content),
+            );
+            if let Some(id) = &m.tool_call_id {
+                msg = msg.with_tool_call_id(id.clone());
+            }
+            if let Some(tcs) = &m.tool_calls {
+                // History integrity: tool-call arguments must be valid JSON
+                // before they are replayed. A truncated call (a stream cut
+                // mid-arguments) would otherwise poison this request and
+                // every later one in the session.
+                let tool_calls: Vec<crate::api::types::ToolCall> = tcs
+                    .iter()
+                    .map(|tc| {
+                        let arguments = if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_ok() {
+                            tc.arguments.clone()
+                        } else {
+                            repaired_args += 1;
+                            "{}".to_string()
+                        };
+                        crate::api::types::ToolCall::new(tc.id.clone(), tc.name.clone(), arguments)
+                    })
+                    .collect();
+                msg = msg.with_tool_calls(tool_calls);
+            }
+            messages.push(msg);
+        }
+
+        // History integrity: every assistant tool call needs a paired tool
+        // result, or OpenAI-compatible APIs reject the whole conversation.
+        // Backfill anything an interrupted round left unanswered.
+        let answered: HashSet<String> = messages
             .iter()
-            .map(|m| {
-                let role = Role::from(m.role.as_str());
-                let mut msg = Message::new(
-                    role,
-                    crate::ui::thinking::strip(&m.content),
-                );
-                if let Some(id) = &m.tool_call_id {
-                    msg = msg.with_tool_call_id(id.clone());
-                }
-                if let Some(tcs) = &m.tool_calls {
-                    let tool_calls: Vec<crate::api::types::ToolCall> = tcs
-                        .iter()
-                        .map(|tc| crate::api::types::ToolCall::new(tc.id.clone(), tc.name.clone(), tc.arguments.clone()))
-                        .collect();
-                    msg = msg.with_tool_calls(tool_calls);
-                }
-                msg
-            })
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.clone())
             .collect();
+        let mut backfilled = 0usize;
+        let mut paired: Vec<Message> = Vec::with_capacity(messages.len());
+        for message in messages {
+            let missing: Vec<String> = if message.role == Role::Assistant {
+                message
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .map(|tc| tc.id.clone())
+                            .filter(|id| !answered.contains(id))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            paired.push(message);
+            for id in missing {
+                paired.push(Message::tool_result(id, "interrupted before this tool could run"));
+                backfilled += 1;
+            }
+        }
+        let mut messages = paired;
+        if repaired_args > 0 {
+            self.push_notice(format!(
+                "repaired {repaired_args} truncated tool call(s) in history before replay"
+            ));
+        }
+        if backfilled > 0 {
+            self.push_notice(format!(
+                "backfilled {backfilled} missing tool result(s) from an interrupted round"
+            ));
+        }
 
         // Inject system prompt for agent mode if enabled
         let want_tools = self.agent_mode && self.config.sandbox.enabled && self.sandbox.config.enabled;
@@ -127,15 +180,44 @@ impl App {
         let mut has_tool_calls = false;
         loop {
             match rx.try_recv() {
-                Ok(StreamEvent::Delta(token)) => self.response.push_str(&token),
+                Ok(StreamEvent::Delta(token)) => {
+                    // Tokens are flowing again: the retry countdown is over.
+                    self.retry_state = None;
+                    self.response.push_str(&token);
+                }
                 Ok(StreamEvent::ToolCall(tc)) => {
+                    self.retry_state = None;
+                    // Detect truncated tool calls at ingestion: arguments
+                    // that do not parse were cut mid-stream. Record the id
+                    // so execution returns an explicit error and the stored
+                    // record keeps replayable JSON.
+                    if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_err() {
+                        self.truncated_tool_calls.insert(tc.id.clone());
+                    }
                     self.pending_tool_calls.push(tc);
                     has_tool_calls = true;
                 }
                 Ok(StreamEvent::Notice(message)) => {
                     self.push_notice(message);
                 }
+                Ok(StreamEvent::Retry {
+                    attempt,
+                    max,
+                    wait_ms,
+                    reason,
+                }) => {
+                    // Drive the animated status row: the countdown is
+                    // computed from `started` on every redraw.
+                    self.retry_state = Some(RetryView {
+                        started: Instant::now(),
+                        wait: Duration::from_millis(wait_ms),
+                        attempt,
+                        max,
+                        reason,
+                    });
+                }
                 Ok(StreamEvent::Error(error)) => {
+                    self.retry_state = None;
                     self.finish_partial();
                     self.streaming = false;
                     self.stream_started = None;
@@ -152,6 +234,9 @@ impl App {
             }
         }
 
+        // The stream ended cleanly; drop any leftover retry indicator.
+        self.retry_state = None;
+
         // Stream finished - check for agent loop
         if self.streaming && has_tool_calls && !self.pending_tool_calls.is_empty() {
             // Save assistant message with tool calls
@@ -162,7 +247,13 @@ impl App {
                 .map(|tc| ToolCallRecord {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
-                    arguments: tc.arguments.clone(),
+                    // Truncated arguments are stored as "{}" so the saved
+                    // history never carries unparseable JSON.
+                    arguments: if self.truncated_tool_calls.contains(&tc.id) {
+                        "{}".to_string()
+                    } else {
+                        tc.arguments.clone()
+                    },
                 })
                 .collect();
 
@@ -184,7 +275,14 @@ impl App {
                 if !self.streaming {
                     break; // cancelled while earlier tools were running
                 }
-                match sandbox.execute_tool(tc).await {
+                let outcome = if self.truncated_tool_calls.contains(&tc.id) {
+                    Err(anyhow::anyhow!(
+                        "tool call arguments arrived truncated (the stream was cut mid-call) — retry with smaller edits"
+                    ))
+                } else {
+                    sandbox.execute_tool(tc).await
+                };
+                match outcome {
                     Ok(output) => {
                         tool_results.push((tc.id.clone(), output, false));
                     }
@@ -198,6 +296,30 @@ impl App {
             for (id, content, is_error) in &tool_results {
                 self.push_tool_result(id.clone(), content.clone(), *is_error);
                 self.sessions.add_tool_result(id.clone(), content.clone());
+            }
+
+            // The truncation verdicts for this round have been consumed.
+            for tc in &pending {
+                self.truncated_tool_calls.remove(&tc.id);
+            }
+
+            // Interrupted while tools were running: backfill an
+            // "interrupted" result for every call that never ran so the
+            // assistant/tool pairing in the history stays valid, then stop —
+            // an interrupted round must never restart the agent loop.
+            if !self.streaming {
+                let executed: HashSet<&str> =
+                    tool_results.iter().map(|(id, _, _)| id.as_str()).collect();
+                for tc in &pending {
+                    if !executed.contains(tc.id.as_str()) {
+                        let content =
+                            "interrupted by the user before this tool could run".to_string();
+                        self.push_tool_result(tc.id.clone(), content.clone(), true);
+                        self.sessions.add_tool_result(tc.id.clone(), content);
+                    }
+                }
+                self.agent_iterations = 0;
+                return;
             }
 
             // Continue agent loop if iterations left
@@ -417,5 +539,61 @@ mod tests {
             Cell::ToolResult { is_error: true, content, .. }
                 if content.contains("permission denied")
         )));
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_arguments_become_an_explicit_tool_error() {
+        let mut app = agent_app("truncated");
+        // Unterminated JSON — a tool call whose stream was cut mid-arguments.
+        feed(
+            &mut app,
+            vec![StreamEvent::ToolCall(ToolCall::new(
+                "c1",
+                "edit_file",
+                r#"{"new_string": "#,
+            ))],
+        );
+        app.receive_token().await;
+
+        // The model sees an error that names the real problem…
+        assert!(app.cells.iter().any(|c| matches!(
+            c,
+            Cell::ToolResult { is_error: true, content, .. } if content.contains("truncated")
+        )));
+        // …and the stored record carries clean JSON, never the broken text.
+        assert!(app.sessions.current().messages.iter().any(|m| m
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| calls.iter().any(|tc| tc.arguments == "{}"))));
+    }
+
+    #[tokio::test]
+    async fn replay_repairs_truncated_arguments_and_missing_tool_results() {
+        let mut config = Config::default();
+        config.api_key = Some("test-key".into());
+        config.base_url = "http://127.0.0.1:9/v1".into();
+        let mut app = App::new(config, SessionManager::for_tests());
+
+        // Doubly broken history: unterminated arguments AND no tool result.
+        app.sessions.add_assistant_with_tools(
+            "",
+            vec![ToolCallRecord {
+                id: "c1".into(),
+                name: "edit_file".into(),
+                arguments: r#"{"new_string": "#.into(),
+            }],
+        );
+
+        app.start_stream().expect("stream starts");
+
+        assert!(app.cells.iter().any(|c| matches!(
+            c,
+            Cell::Notice(text) if text.contains("repaired 1 truncated tool call")
+        )));
+        assert!(app.cells.iter().any(|c| matches!(
+            c,
+            Cell::Notice(text) if text.contains("backfilled 1 missing tool result")
+        )));
+        app.interrupt();
     }
 }
