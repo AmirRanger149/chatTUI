@@ -73,6 +73,16 @@ pub const MIN_SHELL_TIMEOUT_SECS: u64 = 1;
 /// Tool output larger than this is truncated before it reaches the model.
 const MAX_TOOL_OUTPUT_BYTES: usize = 20_000;
 
+/// Default line window for ranged reads. Reading files window by window
+/// keeps a 10,000-line file from flooding the conversation context — the
+/// model pages through it instead of swallowing it whole.
+pub const DEFAULT_READ_LIMIT: usize = 250;
+/// Hard cap on a single read window.
+pub const MAX_READ_LIMIT: usize = 1_000;
+/// Display cap for one source line; minified files must not blow the
+/// output budget on a single line.
+const MAX_LINE_DISPLAY_CHARS: usize = 1_000;
+
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
     pub enabled: bool,
@@ -252,7 +262,11 @@ impl Sandbox {
         Ok(())
     }
 
-    pub async fn read_file(&self, path: &str) -> Result<String> {
+    /// Read a window of a file: up to `limit` lines starting at the
+    /// 1-based `offset`. The output is numbered lines with a header that
+    /// says which range of the file was served, so large files are read in
+    /// chunks instead of flooding the conversation context.
+    pub async fn read_file(&self, path: &str, offset: usize, limit: usize) -> Result<String> {
         self.authorize(ToolKind::Read)?;
         let full = self.resolve_path(path)?;
         self.check_access(&full, Access::Read)?;
@@ -268,7 +282,39 @@ impl Sandbox {
             ));
         }
         let content = fs::read_to_string(&full).await.context("reading file")?;
-        Ok(content)
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+
+        if total == 0 {
+            return Ok(format!("{path}: empty file"));
+        }
+        let offset = offset.max(1);
+        if offset > total {
+            return Ok(format!(
+                "{path}: the file has {total} line(s); offset {offset} is past the end"
+            ));
+        }
+        let limit = limit.clamp(1, MAX_READ_LIMIT);
+        let start = offset - 1;
+        let end = (start + limit).min(total);
+
+        let mut out = format!("{path}: lines {}-{} of {total}\n", offset, end);
+        for (index, line) in lines[start..end].iter().enumerate() {
+            let display: String = if line.chars().count() > MAX_LINE_DISPLAY_CHARS {
+                line.chars().take(MAX_LINE_DISPLAY_CHARS).collect::<String>() + " …"
+            } else {
+                (*line).to_string()
+            };
+            out.push_str(&format!("{:>6}│{}\n", start + index + 1, display));
+        }
+        if end < total {
+            out.push_str(&format!(
+                "… {} more line(s) — call read_file again with offset {}\n",
+                total - end,
+                end + 1
+            ));
+        }
+        Ok(out)
     }
 
     pub async fn write_file(&self, path: &str, content: &str) -> Result<String> {
@@ -286,8 +332,19 @@ impl Sandbox {
                 return Err(anyhow!("path escapes workspace: {}", path));
             }
         }
+        // Line stats for the report: how many lines the file had before
+        // (if it existed) and how many it has now.
+        let old_lines = fs::read_to_string(&full)
+            .await
+            .map(|old| old.lines().count())
+            .unwrap_or(0);
+        let new_lines = content.lines().count();
         fs::write(&full, content).await.context("writing file")?;
-        Ok(format!("wrote {} bytes to {}", content.len(), path))
+        if old_lines > 0 {
+            Ok(format!("wrote {path} (+{new_lines} -{old_lines})"))
+        } else {
+            Ok(format!("wrote {path} (+{new_lines})"))
+        }
     }
 
     pub async fn edit_file(&self, path: &str, old_string: &str, new_string: &str) -> Result<String> {
@@ -307,13 +364,10 @@ impl Sandbox {
             ));
         }
         let new_content = current.replacen(old_string, new_string, 1);
+        let removed = old_string.lines().count();
+        let added = new_string.lines().count();
         fs::write(&full, &new_content).await.context("writing edited file")?;
-        Ok(format!(
-            "edited {} ({} -> {} chars)",
-            path,
-            old_string.len(),
-            new_string.len()
-        ))
+        Ok(format!("edited {path} (+{added} -{removed})"))
     }
 
     pub async fn list_files(&self, path: &str) -> Result<String> {
@@ -521,7 +575,12 @@ impl Sandbox {
         match tool_call.name.as_str() {
             "read_file" => {
                 let path = args["path"].as_str().ok_or_else(|| anyhow!("missing path"))?;
-                self.read_file(path).await
+                let offset = args["offset"].as_u64().map(|v| v as usize).unwrap_or(1);
+                let limit = args["limit"]
+                    .as_u64()
+                    .map(|v| v as usize)
+                    .unwrap_or(DEFAULT_READ_LIMIT);
+                self.read_file(path, offset, limit).await
             }
             "write_file" => {
                 let path = args["path"].as_str().ok_or_else(|| anyhow!("missing path"))?;
@@ -1445,6 +1504,59 @@ mod tests {
         let call = ToolCall::new("1", "read_file", r#"{"path": "#);
         let err = sandbox.execute_tool(&call).await.unwrap_err();
         assert!(err.to_string().contains("truncated"), "unexpected: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_file_serves_numbered_windows() {
+        let dir = unique_root("read-window");
+        let body: String = (1..=600).map(|i| format!("line {i}\n")).collect();
+        fs::write(dir.join("big.txt"), body).await.unwrap();
+        let sandbox = Sandbox::with_root(dir);
+
+        // First window: 250 numbered lines plus a pointer onward.
+        let out = sandbox.read_file("big.txt", 1, 250).await.unwrap();
+        assert!(out.contains("lines 1-250 of 600"), "header: {out}");
+        assert!(out.contains("1│line 1"));
+        assert!(out.contains("250│line 250"));
+        assert!(!out.contains("line 251"));
+        assert!(out.contains("offset 251"), "footer must point onward: {out}");
+
+        // A later window; the tail carries no onward pointer.
+        let out = sandbox.read_file("big.txt", 551, 250).await.unwrap();
+        assert!(out.contains("lines 551-600 of 600"), "header: {out}");
+        assert!(!out.contains("more line"));
+
+        // Past the end: informative, not a crash.
+        let out = sandbox.read_file("big.txt", 700, 250).await.unwrap();
+        assert!(out.contains("past the end"), "{out}");
+
+        // Empty file: plain and simple.
+        let out = sandbox.read_file("empty-missing", 1, 250).await;
+        assert!(out.is_err(), "a missing file is still an error");
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_report_line_stats() {
+        let dir = unique_root("stats");
+        let sandbox = Sandbox::with_root(dir);
+
+        // New file: additions only.
+        let out = sandbox.write_file("a.txt", "one\ntwo\n").await.unwrap();
+        assert_eq!(out, "wrote a.txt (+2)");
+
+        // Overwrite: additions and removals.
+        let out = sandbox
+            .write_file("a.txt", "one\ntwo\nthree\nfour\nfive\n")
+            .await
+            .unwrap();
+        assert_eq!(out, "wrote a.txt (+5 -2)");
+
+        // Edit: one line replaced by two.
+        let out = sandbox
+            .edit_file("a.txt", "three", "three-a\nthree-b")
+            .await
+            .unwrap();
+        assert_eq!(out, "edited a.txt (+2 -1)");
     }
 
     #[test]

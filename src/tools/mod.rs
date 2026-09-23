@@ -34,13 +34,21 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::new(
             "read_file",
-            "Read the contents of a file within the agent workspace. The path must resolve inside the workspace root (including through symlinks). Sensitive files are refused: dotenv files (.env, *.env), key material (*.pem, *.key, *.p12, *.pfx, *.jks, SSH private keys) and .git/config. Files above the size limit are refused. Returns file content or a structured error.",
+            "Read a WINDOW of a file within the agent workspace: up to 'limit' numbered lines (default 250, max 1000) starting at the 1-based line 'offset' (default 1). The output header says which range of the file was served, and a footer points to the next offset when more lines exist. Read large files in successive windows (e.g. offset 1, then 251, then 501…) until you have the region you need — never try to pull a huge file in one call. The line numbers in the output are display-only; use the raw text (without numbers) for edit_file old_string. The path must resolve inside the workspace root (including through symlinks). Sensitive files are refused: dotenv files (.env, *.env), key material (*.pem, *.key, *.p12, *.pfx, *.jks, SSH private keys) and .git/config. Files above the size limit are refused.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Relative path from workspace root, e.g. 'src/main.rs' or 'README.md'"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "1-based first line to read (default 1)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max lines to read in this window (default 250, max 1000)"
                     }
                 },
                 "required": ["path"]
@@ -48,7 +56,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "write_file",
-            "Create or overwrite a file inside the agent workspace. The path must resolve inside the workspace root (including through symlinks); writing into .git/ or to sensitive files (.env*, key material) is refused. Parent directories are created automatically. Requires a permission mode that allows writes ('workspace-write' or 'full-auto'); otherwise a permission-denied error is returned.",
+            "Create or overwrite a file inside the agent workspace. Prefer edit_file for targeted changes; write_file replaces the ENTIRE file, so for big files keep it to when a full rewrite is really what you want. The path must resolve inside the workspace root (including through symlinks); writing into .git/ or to sensitive files (.env*, key material) is refused. Parent directories are created automatically. The result reports the change as +added -removed lines. Requires a permission mode that allows writes ('workspace-write' or 'full-auto'); otherwise a permission-denied error is returned.",
             json!({
                 "type": "object",
                 "properties": {
@@ -66,7 +74,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::new(
             "edit_file",
-            "Edit a file inside the agent workspace by replacing exact old_string with new_string. old_string must match exactly (including whitespace) and appear exactly once. The same workspace-path and sensitive-file restrictions as write_file apply, and write permission is required ('workspace-write' or 'full-auto').",
+            "Edit a file inside the agent workspace by replacing exact old_string with new_string. old_string must match exactly (including whitespace) and appear exactly once. Keep edits small and targeted — one focused change per call. The result reports the change as +added -removed lines. The same workspace-path and sensitive-file restrictions as write_file apply, and write permission is required ('workspace-write' or 'full-auto').",
             json!({
                 "type": "object",
                 "properties": {

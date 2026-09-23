@@ -124,6 +124,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_tool_detail();
+            return true;
+        }
+        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.toggle_history();
             return true;
         }
@@ -182,18 +186,29 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
             return true;
         }
-        Some(app::Overlay::Providers { .. }) => {
-            match key.code {
-                KeyCode::Up => app.move_provider_selection(-1),
-                KeyCode::Down => app.move_provider_selection(1),
-                KeyCode::PageUp => app.move_provider_selection(-(app::OVERLAY_ROWS as i32)),
-                KeyCode::PageDown => app.move_provider_selection(app::OVERLAY_ROWS as i32),
-                KeyCode::Enter => app.apply_selected_provider(),
-                _ => {}
+            Some(app::Overlay::Providers { .. }) => {
+                match key.code {
+                    KeyCode::Up => app.move_provider_selection(-1),
+                    KeyCode::Down => app.move_provider_selection(1),
+                    KeyCode::PageUp => app.move_provider_selection(-(app::OVERLAY_ROWS as i32)),
+                    KeyCode::PageDown => app.move_provider_selection(app::OVERLAY_ROWS as i32),
+                    KeyCode::Enter => app.apply_selected_provider(),
+                    _ => {}
+                }
+                return true;
             }
-            return true;
-        }
-        None => {}
+            Some(app::Overlay::ToolDetail { .. }) => {
+                match key.code {
+                    KeyCode::Up => app.move_tool_detail_selection(-1),
+                    KeyCode::Down => app.move_tool_detail_selection(1),
+                    KeyCode::PageUp => app.move_tool_detail_selection(-(app::OVERLAY_ROWS as i32)),
+                    KeyCode::PageDown => app.move_tool_detail_selection(app::OVERLAY_ROWS as i32),
+                    KeyCode::Enter => app.overlay = None,
+                    _ => {}
+                }
+                return true;
+            }
+            None => {}
     }
 
     // Transcript scrolling (only when no overlay is open): pgup moves the

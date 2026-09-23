@@ -12,6 +12,15 @@ pub enum Overlay {
     Code { selected: usize },
     Models { selected: usize },
     Providers { selected: usize },
+    ToolDetail { selected: usize },
+}
+
+/// One inspectable tool activity for the `ctrl+t` overlay: what a write,
+/// edit, list or bash call actually did. Reads are deliberately absent —
+/// their windowed content is for the model, not the user's screen.
+pub struct ToolDetailItem {
+    pub title: String,
+    pub lines: Vec<String>,
 }
 
 impl App {
@@ -122,6 +131,134 @@ impl App {
         }
     }
 
+    // -- tool detail ----------------------------------------------------------
+
+    /// Every inspectable tool activity in the conversation, in order:
+    /// writes show their added lines, edits their removed + added lines,
+    /// bash its full command and output. Re-derived from the transcript
+    /// cells on demand (like `code_blocks`), so nothing extra is stored.
+    pub fn tool_details(&self) -> Vec<ToolDetailItem> {
+        let mut items = Vec::new();
+        for cell in &self.cells {
+            let Cell::ToolCall { name, args, id } = cell else {
+                continue;
+            };
+            let args_v = serde_json::from_str::<serde_json::Value>(args).ok();
+            let result = self.cells.iter().rev().find_map(|c| match c {
+                Cell::ToolResult {
+                    id: rid, content, ..
+                } if rid == id => Some(content.clone()),
+                _ => None,
+            });
+            match name.as_str() {
+                "write_file" => {
+                    let path = args_v
+                        .as_ref()
+                        .and_then(|v| v["path"].as_str())
+                        .unwrap_or("?");
+                    let content = args_v
+                        .as_ref()
+                        .and_then(|v| v["content"].as_str())
+                        .unwrap_or("");
+                    let mut lines: Vec<String> =
+                        content.lines().map(|l| format!("+ {l}")).collect();
+                    if lines.is_empty() {
+                        lines.push("(empty file)".to_string());
+                    }
+                    items.push(ToolDetailItem {
+                        title: format!("Write {path}"),
+                        lines,
+                    });
+                }
+                "edit_file" => {
+                    let path = args_v
+                        .as_ref()
+                        .and_then(|v| v["path"].as_str())
+                        .unwrap_or("?");
+                    let old = args_v
+                        .as_ref()
+                        .and_then(|v| v["old_string"].as_str())
+                        .unwrap_or("");
+                    let new = args_v
+                        .as_ref()
+                        .and_then(|v| v["new_string"].as_str())
+                        .unwrap_or("");
+                    let mut lines: Vec<String> =
+                        old.lines().map(|l| format!("- {l}")).collect();
+                    lines.extend(new.lines().map(|l| format!("+ {l}")));
+                    items.push(ToolDetailItem {
+                        title: format!("Edit {path}"),
+                        lines,
+                    });
+                }
+                "list_files" => {
+                    let path = args_v
+                        .as_ref()
+                        .and_then(|v| v["path"].as_str())
+                        .unwrap_or(".");
+                    let lines = match result {
+                        Some(content) => content.lines().map(str::to_string).collect(),
+                        None => vec!["(no result yet)".to_string()],
+                    };
+                    items.push(ToolDetailItem {
+                        title: format!("List {path}"),
+                        lines,
+                    });
+                }
+                "bash" => {
+                    let cmd = args_v
+                        .as_ref()
+                        .and_then(|v| v["command"].as_str())
+                        .unwrap_or("?");
+                    let mut lines = vec![format!("$ {cmd}"), String::new()];
+                    match result {
+                        Some(content) => {
+                            lines.extend(content.lines().map(str::to_string));
+                        }
+                        None => lines.push("(still running…)".to_string()),
+                    }
+                    items.push(ToolDetailItem {
+                        title: format!("$ {}", crate::ui::theme::clamp_text(cmd, 80)),
+                        lines,
+                    });
+                }
+                _ => {}
+            }
+        }
+        items
+    }
+
+    /// `ctrl+t`: open the tool-detail overlay on the most recent activity,
+    /// or close it when it is already open — the same toggle feel as
+    /// `ctrl+r` for reasoning.
+    pub fn toggle_tool_detail(&mut self) {
+        if self
+            .overlay
+            .is_some_and(|o| matches!(o, Overlay::ToolDetail { .. }))
+        {
+            self.overlay = None;
+            return;
+        }
+        let count = self.tool_details().len();
+        if count == 0 {
+            self.push_notice("no tool activity to inspect yet".into());
+            return;
+        }
+        self.overlay = Some(Overlay::ToolDetail {
+            selected: count - 1,
+        });
+    }
+
+    pub fn move_tool_detail_selection(&mut self, delta: i32) {
+        let len = self.tool_details().len();
+        if len == 0 {
+            return;
+        }
+        if let Some(Overlay::ToolDetail { selected }) = &mut self.overlay {
+            *selected = (*selected as i32 + delta).rem_euclid(len as i32) as usize;
+        }
+    }
+
     /// `Enter` in the code overlay: copy the selected block to the clipboard.
     pub fn copy_selected_code(&mut self) {
         let Some(Overlay::Code { selected }) = self.overlay else {
@@ -170,6 +307,76 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Config::default(), SessionManager::for_tests())
+    }
+
+    #[test]
+    fn tool_details_collect_write_edit_bash_but_not_reads() {
+        let mut app = test_app();
+        app.cells.push(Cell::ToolCall {
+            name: "read_file".into(),
+            args: r#"{"path":"a.txt"}"#.into(),
+            id: "r1".into(),
+        });
+        app.cells.push(Cell::ToolResult {
+            id: "r1".into(),
+            content: "     1│hello".into(),
+            is_error: false,
+        });
+        app.cells.push(Cell::ToolCall {
+            name: "edit_file".into(),
+            args: r#"{"path":"b.txt","old_string":"x","new_string":"y1\ny2"}"#.into(),
+            id: "e1".into(),
+        });
+        app.cells.push(Cell::ToolResult {
+            id: "e1".into(),
+            content: "edited b.txt (+2 -1)".into(),
+            is_error: false,
+        });
+        app.cells.push(Cell::ToolCall {
+            name: "bash".into(),
+            args: r#"{"command":"ls -la"}"#.into(),
+            id: "b1".into(),
+        });
+        app.cells.push(Cell::ToolResult {
+            id: "b1".into(),
+            content: "total 8".into(),
+            is_error: false,
+        });
+
+        let items = app.tool_details();
+        assert_eq!(items.len(), 2, "reads stay out of the inspector");
+        assert_eq!(items[0].title, "Edit b.txt");
+        assert!(items[0].lines.contains(&"- x".to_string()));
+        assert!(items[0].lines.contains(&"+ y1".to_string()));
+        assert!(items[0].lines.contains(&"+ y2".to_string()));
+        assert!(items[1].title.starts_with("$ ls -la"));
+        assert!(items[1].lines.iter().any(|l| l == "total 8"));
+    }
+
+    #[test]
+    fn toggle_tool_detail_opens_latest_and_closes() {
+        let mut app = test_app();
+        app.toggle_tool_detail();
+        assert!(app.overlay.is_none(), "nothing to inspect yet");
+        assert!(matches!(app.cells.last(), Some(Cell::Notice(_))));
+
+        app.cells.push(Cell::ToolCall {
+            name: "bash".into(),
+            args: r#"{"command":"pwd"}"#.into(),
+            id: "b1".into(),
+        });
+        app.cells.push(Cell::ToolResult {
+            id: "b1".into(),
+            content: "/tmp".into(),
+            is_error: false,
+        });
+        app.toggle_tool_detail();
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::ToolDetail { selected: 0 })
+        ));
+        app.toggle_tool_detail();
+        assert!(app.overlay.is_none());
     }
 
     #[test]

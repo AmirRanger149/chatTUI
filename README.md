@@ -261,7 +261,8 @@ The composer is always focused — just start typing and press `Enter` to send.
 | `Enter` | Send the message |
 | `Shift+Enter` | Newline in the composer |
 | `Esc` | Close a popup, then interrupt a running stream, then clear the composer |
-| `Ctrl+T` | Conversation history |
+| `Ctrl+H` | Conversation history |
+| `Ctrl+T` | Inspect tool activity — write/edit diffs, bash command + output |
 | `Ctrl+G` | Browse and copy code blocks |
 | `Ctrl+R` | Show / hide model reasoning |
 | `PgUp` / `PgDn` | Scroll the transcript |
@@ -441,6 +442,10 @@ and a shell. What is actually enforced — and what is not:
   When unset, the legacy `auto_approve` / `allow_shell` flags decide.
   `ask-*` modes currently deny the gated action (interactive approval is
   not implemented yet) instead of allowing it silently.
+- **Context-aware file tools:** `read_file` serves numbered windows of at
+  most 1,000 lines (250 by default), so large files are paged through
+  instead of flooding the conversation; `write_file` / `edit_file` report
+  their change as `+added -removed` line counts.
 - **Agent loop:** the agent keeps working for as long as it makes
   progress — there is no fixed step cap. It is stopped by specific guards
   instead: the same failing tool call 3 rounds in a row (stagnation), 4

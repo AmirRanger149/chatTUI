@@ -145,6 +145,7 @@ impl App {
                     File tools (read_file, write_file, edit_file, list_files) operate only inside this workspace; paths that escape it (including via symlinks) and sensitive files (.env*, key material, .git/config) are refused.\n\
                     bash runs `sh -c` with the workspace as the current directory. When OS-level isolation is active (Linux kernel 5.13+), the kernel blocks writes outside the workspace and its scratch roots (/tmp, CARGO_HOME, CARGO_TARGET_DIR), denies all network connections, and denies ptrace/kernel-module/namespace operations; on systems without it, commands run with full user privileges and the tool output says so. Secret files remain readable by shell commands by design (the name-based refusal is best-effort).\n\
                     Commands are killed after a {timeout_secs}s timeout. Permission mode: {mode}. Tools outside the mode return permission-denied errors.\n\
+                    File handling policy: read_file returns a window of numbered lines (250 by default) — read large files in successive windows (offset 1, then 251, …) instead of pulling them whole; prefer small targeted edit_file calls over rewriting entire files.\n\
                     Use tools to help the user with file operations. Be concise, explain what you do. Never write files outside the target directory.",
                 );
                 messages.insert(0, Message::new(Role::System, system_content));

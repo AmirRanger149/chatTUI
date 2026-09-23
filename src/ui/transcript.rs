@@ -15,9 +15,31 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     lines.extend(theme::with_border(header_lines(app, width.saturating_sub(4))));
     lines.push(Line::from(""));
 
+    // Pair tool results with the call that produced them so results can be
+    // rendered compactly (a successful read needs no row at all).
+    let mut call_names: Vec<(String, String)> = Vec::new();
     for cell in &app.cells {
-        lines.extend(cell_lines(cell, width, app));
-        lines.push(Line::from(""));
+        if let Cell::ToolCall { name, id, .. } = cell {
+            call_names.push((id.clone(), name.clone()));
+        }
+        let before = lines.len();
+        match cell {
+            Cell::ToolCall { name, args, id } => {
+                lines.extend(tool_call_lines(name, args, id, width));
+            }
+            Cell::ToolResult { id, content, is_error } => {
+                let call_name = call_names
+                    .iter()
+                    .rev()
+                    .find(|(cid, _)| cid == id)
+                    .map(|(_, name)| name.as_str());
+                lines.extend(tool_result_lines(id, content, *is_error, width, call_name));
+            }
+            _ => lines.extend(cell_lines(cell, width, app)),
+        }
+        if lines.len() > before {
+            lines.push(Line::from(""));
+        }
     }
     if !app.response.is_empty() {
         lines.extend(assistant_lines(&app.response, width, app));
@@ -137,69 +159,126 @@ fn assistant_lines(text: &str, width: usize, app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+/// One compact activity row per tool call. The full arguments stay in the
+/// model's history, but the transcript shows only what the user needs:
+/// `Read src/main.rs · lines 1-250`, `Edit src/app.js · +2 -1`, …
 fn tool_call_lines(name: &str, args: &str, id: &str, width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    // Header: 🔧 tool_call
-    let header_style = Style::new().fg(Color::Yellow).bold();
-    lines.push(Line::from(vec![
-        Span::styled("🔧 ", header_style),
-        Span::styled(format!("{} ", name), header_style),
-        Span::styled(format!("[{}]", &id[..id.len().min(12)]), theme::dim()),
-    ]));
-    
-    // Args - try to pretty print JSON
-    let pretty_args = if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
-        serde_json::to_string_pretty(&v).unwrap_or_else(|_| args.to_string())
-    } else {
-        args.to_string()
+    let args_v = serde_json::from_str::<serde_json::Value>(args).ok();
+    let path = args_v
+        .as_ref()
+        .and_then(|v| v["path"].as_str())
+        .unwrap_or("?")
+        .to_string();
+    let summary = match name {
+        "read_file" => {
+            let offset = args_v
+                .as_ref()
+                .and_then(|v| v["offset"].as_u64())
+                .unwrap_or(1)
+                .max(1);
+            let limit = args_v
+                .as_ref()
+                .and_then(|v| v["limit"].as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(crate::sandbox::DEFAULT_READ_LIMIT)
+                .clamp(1, crate::sandbox::MAX_READ_LIMIT);
+            format!("Read {path} · lines {offset}-{}", offset + limit as u64 - 1)
+        }
+        "write_file" => {
+            let count = args_v
+                .as_ref()
+                .and_then(|v| v["content"].as_str())
+                .map(|c| c.lines().count())
+                .unwrap_or(0);
+            format!("Write {path} · {count} lines")
+        }
+        "edit_file" => {
+            let added = args_v
+                .as_ref()
+                .and_then(|v| v["new_string"].as_str())
+                .map(|s| s.lines().count())
+                .unwrap_or(0);
+            let removed = args_v
+                .as_ref()
+                .and_then(|v| v["old_string"].as_str())
+                .map(|s| s.lines().count())
+                .unwrap_or(0);
+            format!("Edit {path} · +{added} -{removed}")
+        }
+        "list_files" => format!("List {}", if path == "?" { ".".into() } else { path }),
+        "bash" => {
+            let cmd = args_v
+                .as_ref()
+                .and_then(|v| v["command"].as_str())
+                .unwrap_or("?");
+            format!("$ {}", theme::clamp_text(&cmd.replace('\n', " "), 120))
+        }
+        _ => name.to_string(),
     };
-    
-    for line in pretty_args.lines().take(10) {
-        lines.extend(theme::wrap_styled(
-            vec![Span::styled(theme::clamp_text(line, 500), Style::new().fg(Color::DarkGray))],
-            width,
-            Span::raw("  "),
-            Span::raw("  "),
-        ));
-    }
-    if pretty_args.lines().count() > 10 {
-        lines.push(Line::from(Span::styled("  ... (truncated)", theme::dim())));
-    }
-    
-    lines
+    let header_style = Style::new().fg(Color::Yellow).bold();
+    vec![Line::from(vec![
+        Span::styled("🔧 ", header_style),
+        Span::styled(
+            theme::clamp_text(&summary, width.saturating_sub(18).max(20)),
+            header_style,
+        ),
+        Span::styled(format!(" [{}]", short_id(id)), theme::dim()),
+    ])]
 }
 
-fn tool_result_lines(id: &str, content: &str, is_error: bool, width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+/// First 12 characters of a tool-call id (char-safe, unlike a byte slice).
+fn short_id(id: &str) -> String {
+    id.chars().take(12).collect()
+}
+
+/// Compact result row. Successful reads render nothing at all — the call
+/// row already said what was read, and the content is for the model's
+/// history, not the user's screen. Everything else shows its first line
+/// (write/edit results are one-line stats); errors keep a few lines so
+/// they stay diagnosable.
+fn tool_result_lines(
+    id: &str,
+    content: &str,
+    is_error: bool,
+    width: usize,
+    call_name: Option<&str>,
+) -> Vec<Line<'static>> {
+    if !is_error && call_name == Some("read_file") {
+        return Vec::new();
+    }
     let (icon, style) = if is_error {
         ("❌ ", Style::new().fg(theme::ERROR_COLOR))
     } else {
         ("✓ ", Style::new().fg(Color::Green))
     };
-    
-    lines.push(Line::from(vec![
+
+    let total = content.lines().count();
+    let first = content.lines().next().unwrap_or("(no output)");
+    let mut lines = vec![Line::from(vec![
         Span::styled(icon, style),
-        Span::styled("tool result ", Style::new().fg(Color::DarkGray)),
-        Span::styled(format!("[{}]", &id[..id.len().min(12)]), theme::dim()),
-    ]));
-    
-    // Content - clamp and wrap
-    let clamped = theme::clamp_text(content, 2000);
-    for line in clamped.lines().take(15) {
+        Span::styled(
+            theme::clamp_text(first, width.saturating_sub(18).max(20)),
+            style,
+        ),
+        Span::styled(format!(" [{}]", short_id(id)), theme::dim()),
+    ])];
+
+    // Errors stay a bit more verbose so they remain diagnosable.
+    let keep: usize = if is_error { 4 } else { 1 };
+    for line in content.lines().skip(1).take(keep.saturating_sub(1)) {
         lines.extend(theme::wrap_styled(
-            vec![Span::raw(line.to_string())],
+            vec![Span::styled(theme::clamp_text(line, 500), theme::dim())],
             width,
             Span::raw("  "),
             Span::raw("  "),
         ));
     }
-    if clamped.lines().count() > 15 {
+    if total > keep {
         lines.push(Line::from(Span::styled(
-            format!("  ... ({} more lines)", clamped.lines().count() - 15),
+            format!("  … ({} more lines)", total - keep),
             theme::dim(),
         )));
     }
-    
     lines
 }
 
@@ -231,6 +310,8 @@ fn cell_lines(cell: &Cell, width: usize, app: &App) -> Vec<Line<'static>> {
             Span::raw("  "),
         ),
         Cell::ToolCall { name, args, id } => tool_call_lines(name, args, id, width),
-        Cell::ToolResult { id, content, is_error } => tool_result_lines(id, content, *is_error, width),
+        Cell::ToolResult { id, content, is_error } => {
+            tool_result_lines(id, content, *is_error, width, None)
+        }
     }
 }

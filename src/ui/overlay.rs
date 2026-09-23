@@ -1,5 +1,5 @@
 //! Full-screen overlays: the keyboard-shortcuts popup (`?` / `/help`) and the
-//! conversation-history picker (`ctrl+t` / `/history`). Both are dim rounded
+//! conversation-history picker (`ctrl+h` / `/history`). Both are dim rounded
 //! cards centered over the interface.
 
 use crate::app::{App, Overlay};
@@ -15,14 +15,16 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, overlay: Overlay) {
         Overlay::Code { selected } => code(frame, area, app, selected),
         Overlay::Models { selected } => models(frame, area, app, selected),
         Overlay::Providers { selected } => providers(frame, area, app, selected),
+        Overlay::ToolDetail { selected } => tool_detail(frame, area, app, selected),
     }
 }
 
 fn shortcuts(frame: &mut Frame, area: Rect) {
-    let rows: [(&str, &str); 10] = [
+    let rows: [(&str, &str); 11] = [
         ("enter", "send message"),
         ("esc", "close popup · interrupt stream"),
-        ("ctrl+t", "conversation history"),
+        ("ctrl+h", "conversation history"),
+        ("ctrl+t", "inspect tool activity"),
         ("ctrl+g", "copy code blocks"),
         ("ctrl+r", "show / hide model reasoning"),
         ("pgup / pgdn", "scroll transcript"),
@@ -58,6 +60,60 @@ fn shortcuts(frame: &mut Frame, area: Rect) {
             ),
             Span::styled(command.desc, theme::dim()),
         ]));
+    }
+    render_card(frame, area, lines);
+}
+
+/// The `ctrl+t` tool inspector: what a write/edit/list/bash call actually
+/// did — added/removed lines for writes and edits, the full command and its
+/// output for bash. Same toggle mechanic as the reasoning blocks: the key
+/// opens it, the same key (or `esc`) closes it.
+fn tool_detail(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
+    let items = app.tool_details();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Tool activity", Style::new().bold()),
+            Span::styled(
+                "   ↑↓ switch · ctrl+t / esc close",
+                theme::dim(),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    let index = selected.min(items.len().saturating_sub(1));
+    let Some(item) = items.get(index) else {
+        lines.push(Line::styled("no tool activity to inspect yet", theme::dim()));
+        render_card(frame, area, lines);
+        return;
+    };
+    lines.push(Line::from(vec![
+        Span::styled("🔧 ", Style::new().fg(Color::Yellow).bold()),
+        Span::styled(theme::clamp_text(&item.title, 120), Style::new().bold()),
+        Span::styled(
+            format!("   ({}/{})", index + 1, items.len()),
+            theme::dim(),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    // Bounded view: enough lines to inspect, never enough to overflow.
+    let max_detail = 28usize;
+    for raw in item.lines.iter().take(max_detail) {
+        let style = if raw.starts_with("+ ") {
+            Style::new().fg(Color::Green)
+        } else if raw.starts_with("- ") {
+            Style::new().fg(theme::ERROR_COLOR)
+        } else if raw.starts_with("$ ") {
+            Style::new().fg(theme::ACCENT).bold()
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(theme::clamp_text(raw, 500), style)));
+    }
+    if item.lines.len() > max_detail {
+        lines.push(Line::from(Span::styled(
+            format!("… {} more lines", item.lines.len() - max_detail),
+            theme::dim(),
+        )));
     }
     render_card(frame, area, lines);
 }
