@@ -135,7 +135,7 @@ mod tests {
         app.models.loading = true;
         terminal.draw(|frame| render(frame, &app)).unwrap();
         app.models.loading = false;
-        app.models.ids = vec!["MiniMaxAI/MiniMax-M2.7".into()];
+        app.models.ids = vec!["AcmeAI/acme-model-1".into()];
         terminal.draw(|frame| render(frame, &app)).unwrap();
         app.models.ids.clear();
 

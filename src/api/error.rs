@@ -165,7 +165,7 @@ mod tests {
         assert!(matches!(
             classify_failure(
                 403,
-                "Project `proj_x` does not have access to model `gpt-4o-mini`"
+                "Project `proj_x` does not have access to model `acme-model-1`"
             ),
             Failure::Retryable(_)
         ));

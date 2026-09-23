@@ -1,6 +1,6 @@
 //! An OpenAI-compatible chat backend. Covers OpenAI itself and every gateway
 //! that speaks the `POST /chat/completions` dialect (custom providers such
-//! as Dahl, APInex, Ollama, Groq, Mistral, Together, Azure OpenAI, …). This
+//! as Ollama, Groq, Mistral, Together, OpenRouter, Azure OpenAI, …). This
 //! is the workhorse backend: every `custom_providers` entry in `config.json`
 //! uses it.
 //! 
@@ -258,7 +258,7 @@ impl OpenAICompatibleBackend {
                     return Err(classify_failure(0, message));
                 }
 
-                // Content / reasoning deltas (OpenAI content + MiniMax reasoning_content)
+                // Content / reasoning deltas (content + reasoning_content variants)
                 let (reasoning, content) = extract_delta_text(&value);
                 if !reasoning.is_empty() {
                     if !in_think {
@@ -410,7 +410,7 @@ impl ChatBackend for OpenAICompatibleBackend {
 }
 
 /// Pull visible + reasoning text out of one OpenAI-compatible SSE object.
-/// MiniMax (and some gateways) stream thinking in `reasoning_content` /
+/// Some models (and gateways) stream thinking in `reasoning_content` /
 /// `reasoning` while the user-visible answer is `delta.content`.
 fn extract_delta_text(value: &Value) -> (String, String) {
     let delta = &value["choices"][0]["delta"];
@@ -476,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn minimax_reasoning_content_is_not_dropped() {
+    fn reasoning_content_is_not_dropped() {
         let reasoning_only = serde_json::json!({
             "choices": [{
                 "delta": {

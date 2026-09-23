@@ -54,8 +54,9 @@ impl GeminiBackend {
         }
     }
 
-    /// Turn a model id into the `{model}` URL segment. Accepts `gemini-2.0-x`,
-    /// `models/gemini-2.0-x`, or a full `publishers/…/models/…` name.
+    /// Turn a model id into the `{model}` URL segment. Accepts a bare id
+    /// (`some-model-2.0`), a `models/…`-prefixed display name, or a full
+    /// `publishers/…/models/…` path.
     fn path_model(model: &str) -> String {
         let path = model.trim();
         if let Some(pos) = path.rfind("models/") {

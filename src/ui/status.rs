@@ -23,7 +23,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let glyph = SPINNER[(app.elapsed_ms() / 120) as usize % SPINNER.len()];
     
     let working_text = if app.agent_iterations > 0 {
-        format!("Agent working (step {}/{})", app.agent_iterations, crate::app::MAX_AGENT_ITERATIONS)
+        // Rounds completed so far — progress information, not a finish line:
+        // healthy runs keep going until the health guards say otherwise.
+        format!("Agent working (round {})", app.agent_iterations)
     } else if app.agent_mode && app.config.sandbox.enabled {
         "Working (agent)".to_string()
     } else {

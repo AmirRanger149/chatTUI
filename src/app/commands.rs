@@ -281,15 +281,15 @@ mod tests {
     #[test]
     fn slash_model_argument_sets_directly_and_resolves() {
         let mut app = test_app();
-        app.models.ids = vec!["MiniMaxAI/MiniMax-M2.7".into(), "Other/Model".into()];
+        app.models.ids = vec!["AcmeAI/acme-model-1".into(), "OtherOrg/other-model".into()];
         // Exact match, case-insensitive.
-        app.composer = "/model minimaxai/minimax-m2.7".into();
+        app.composer = "/model acmeai/acme-model-1".into();
         app.submit();
-        assert_eq!(app.config.model, "MiniMaxAI/MiniMax-M2.7");
+        assert_eq!(app.config.model, "AcmeAI/acme-model-1");
         // Unique suffix shorthand.
-        app.composer = "/model minimax-m2.7".into();
+        app.composer = "/model acme-model-1".into();
         app.submit();
-        assert_eq!(app.config.model, "MiniMaxAI/MiniMax-M2.7");
+        assert_eq!(app.config.model, "AcmeAI/acme-model-1");
         // Unknown → set exactly as typed.
         app.composer = "/model totally/unknown".into();
         app.submit();
@@ -300,19 +300,19 @@ mod tests {
     #[test]
     fn submit_routes_provider_slash_command() {
         let mut app = test_app();
-        // Dahl/APInex-style gateways are now declared as custom providers.
+        // Gateways are declared as custom providers.
         app.config.custom_providers.push(crate::config::CustomProvider {
-            id: "apinex".into(),
-            name: Some("APInex".into()),
-            base_url: "https://api.apinex.bond/v1".into(),
+            id: "acme".into(),
+            name: Some("Acme".into()),
+            base_url: "https://api.acme.example/v1".into(),
             api_key: None,
-            model: Some("gpt-5-6-terra".into()),
+            model: Some("acme-model-9".into()),
         });
-        app.composer = "/provider apinex".into();
+        app.composer = "/provider acme".into();
         app.submit();
-        assert_eq!(app.config.provider, "apinex");
-        assert_eq!(app.config.base_url, "https://api.apinex.bond/v1");
-        assert_eq!(app.config.model, "gpt-5-6-terra");
+        assert_eq!(app.config.provider, "acme");
+        assert_eq!(app.config.base_url, "https://api.acme.example/v1");
+        assert_eq!(app.config.model, "acme-model-9");
         assert!(matches!(app.cells.last(), Some(Cell::Notice(_))));
         assert!(app.composer.is_empty());
     }

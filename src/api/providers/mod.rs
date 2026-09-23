@@ -48,8 +48,8 @@ impl Default for HttpTimeouts {
 }
 
 /// The wire protocol a provider speaks. OpenAI and every OpenAI-compatible
-/// gateway (the custom providers in `config.json`: Dahl, APInex, Ollama,
-/// Groq, Mistral, Together, …) share one backend; Anthropic and Gemini each
+/// gateway (the custom providers in `config.json`: Ollama, Groq, Mistral,
+/// Together, OpenRouter, …) share one backend; Anthropic and Gemini each
 /// have their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {

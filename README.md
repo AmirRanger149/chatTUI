@@ -16,15 +16,15 @@ The app uses `ratatui` for the interface, `crossterm` for terminal input,
 - Local conversation history saved as JSON
 - History drawer for returning to previous chats
 - Three built-in providers — OpenAI, Anthropic, Google Gemini
-- Custom OpenAI-compatible endpoints (Dahl, APInex, Ollama, Groq, OpenRouter,
-  …) configured directly in `config.json` with your own base URL and key
+- Custom OpenAI-compatible endpoints (Ollama, Groq, OpenRouter, …) configured
+  directly in `config.json` with your own base URL and key
 - `/model` picker that lists the models the API actually offers (`GET /models`)
   and marks the active one
 - Automatic fallback: if a model rejects the request or is at high demand,
   chatTUI switches to another available model and announces the switch
 - Markdown-friendly response output with shaded code boxes
 - Copy any code block from a response to the clipboard (`ctrl+g` or `/code`)
-- Animated reasoning view for thinking models such as `MiniMaxAI/MiniMax-M2.7`
+- Animated reasoning view for thinking models
   (see [Reasoning Models](#reasoning-models))
 - A single native Rust binary with no Python or OpenAI SDK dependency
 
@@ -35,8 +35,7 @@ You need:
 - Rust and Cargo from [rustup.rs](https://rustup.rs/)
 - An API key for at least one provider: [OpenAI](https://platform.openai.com/),
   [Anthropic](https://www.anthropic.com/), [Google Gemini](https://ai.google.dev/),
-  or any OpenAI-compatible gateway (e.g. [Dahl Inference](https://inference.dahl.global/),
-  [APInex](https://api.apinex.bond/v1), a local Ollama)
+  or any OpenAI-compatible gateway (e.g. Groq, OpenRouter, a local Ollama)
 
 Check your Rust installation:
 
@@ -89,20 +88,19 @@ Create a `config.json` file in your root folder:
   "gemini_api_key": "AIza-your-key-here",
   "custom_providers": [
     {
-      "id": "dahl",
-      "name": "Dahl",
-      "base_url": "https://inference.dahl.global/v1",
-      "api_key": "your-dahl-key-here",
-      "model": "MiniMaxAI/MiniMax-M2.7"
+      "id": "groq",
+      "name": "Groq",
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_key": "gsk-your-groq-key-here",
+      "model": "your-model-id"
     },
     {
-      "id": "apinex",
-      "name": "APInex",
-      "base_url": "https://api.apinex.bond/v1",
-      "api_key": "sk-apx-your-apinex-key-here"
+      "id": "ollama",
+      "name": "Ollama (local)",
+      "base_url": "http://127.0.0.1:11434/v1"
     }
   ],
-  "provider": "dahl",
+  "provider": "groq",
   "temperature": 0.7
 }
 ```
@@ -144,23 +142,22 @@ a `POST /chat/completions` endpoint with your base URL and key:
 | --- | --- |
 | `id` | Unique id used with `/provider <id>` and the `provider` field (lowercase recommended) |
 | `name` | Optional display name (defaults to the id) |
-| `base_url` | OpenAI-compatible base URL, e.g. `https://inference.dahl.global/v1` |
+| `base_url` | OpenAI-compatible base URL, e.g. `https://api.groq.com/openai/v1` |
 | `api_key` | API key; the `{ID}_API_KEY` environment variable is the fallback |
 | `model` | Optional default model; when omitted, chatTUI picks one from the endpoint's live model list (a `free/` model first) |
 
-**Example — one custom provider (Dahl):**
+**Example — one custom provider:**
 ```json
 {
   "custom_providers": [
     {
-      "id": "dahl",
-      "name": "Dahl",
-      "base_url": "https://inference.dahl.global/v1",
-      "api_key": "your-dahl-key-here",
-      "model": "MiniMaxAI/MiniMax-M2.7"
+      "id": "ollama",
+      "name": "Ollama (local)",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "model": "your-model-id"
     }
   ],
-  "provider": "dahl"
+  "provider": "ollama"
 }
 ```
 
@@ -173,19 +170,19 @@ a `POST /chat/completions` endpoint with your base URL and key:
       "name": "Groq",
       "base_url": "https://api.groq.com/openai/v1",
       "api_key": "gsk-your-groq-key-here",
-      "model": "llama-3.3-70b-versatile"
+      "model": "your-model-id"
     },
     {
       "id": "ollama",
       "name": "Ollama (local)",
       "base_url": "http://127.0.0.1:11434/v1",
-      "model": "llama3.2"
+      "model": "your-model-id"
     },
     {
-      "id": "apinex",
-      "name": "APInex",
-      "base_url": "https://api.apinex.bond/v1",
-      "api_key": "sk-apx-your-apinex-key-here"
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key": "sk-or-your-openrouter-key-here"
     }
   ]
 }
@@ -215,6 +212,7 @@ marked `· custom`) or directly with `/provider openai|anthropic|gemini|<custom-
 | `base_url` | Optional endpoint override for the active provider | Provider default |
 | `connect_timeout_secs` | Max seconds to wait while establishing an API connection | `15` |
 | `idle_timeout_secs` | Max seconds a stream may stay quiet between chunks before the connection counts as dead — this is *not* a cap on total generation time | `90` |
+| `agent.max_rounds` | Backstop ceiling for agent tool rounds. A safety net only — healthy runs keep going as long as they make progress; broken loops are stopped earlier by the stagnation and consecutive-failure guards | `50` |
 
 > **Retries & timeouts.** Transient failures (network errors, timeouts,
 > HTTP 408/429/5xx) retry the *same* model up to three times with
@@ -226,15 +224,9 @@ marked `· custom`) or directly with `/provider openai|anthropic|gemini|<custom-
 > off as long as tokens keep arriving, and a lone malformed SSE line from a
 > gateway no longer kills the stream.
 
-> **Deprecated fields still work.** Older configs that use `dahl_api_key`,
-> `apinex_api_key`, or the legacy single `api_key` field keep working: those
-> fields are automatically migrated into equivalent `custom_providers` entries
-> on startup (Dahl → `https://inference.dahl.global/v1`, APInex →
-> `https://api.apinex.bond/v1`). New configs should use `custom_providers`.
-
 > **Endpoints & models.** Each provider's endpoint/model can be overridden
 > with `{ID}_BASE_URL` / `{ID}_MODEL` environment variables (e.g.
-> `ANTHROPIC_BASE_URL`, `GEMINI_MODEL`, `DAHL_BASE_URL`) — this works for
+> `ANTHROPIC_BASE_URL`, `GEMINI_MODEL`, `GROQ_BASE_URL`) — this works for
 > custom providers too.
 
 ### Environment Variables (Alternative)
@@ -248,12 +240,12 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 export GEMINI_API_KEY="AIza..."
 
 # Custom providers: {ID}_API_KEY, built from the uppercased id
-export DAHL_API_KEY="your-dahl-key"
-export APINEX_API_KEY="sk-apx..."
+export GROQ_API_KEY="gsk-..."
+export OPENROUTER_API_KEY="sk-or-..."
 
 # Optional endpoint/model overrides for any provider
-export DAHL_BASE_URL="https://inference.dahl.global/v1"
-export GEMINI_MODEL="gemini-2.5-flash"
+export GROQ_BASE_URL="https://api.groq.com/openai/v1"
+export GEMINI_MODEL="your-model-id"
 
 cargo run --release
 ```
@@ -306,10 +298,9 @@ terminal.
 ## Reasoning Models
 
 Some models expose their private chain of thought by wrapping it in
-`<think> … </think>` before the actual answer. `MiniMaxAI/MiniMax-M2.7` — the
-Dahl example's default model — is one of them. chatTUI understands that format
-and gives it its own animated treatment instead of dumping raw tags into the
-transcript.
+`<think> … </think>` before the actual answer (others stream it in a
+`reasoning_content` field). chatTUI understands both shapes and gives them
+their own animated treatment instead of dumping raw tags into the transcript.
 
 **While the model is thinking**, the status row above the composer turns into a
 shimmering indicator with a live preview of the thought being written:
@@ -359,8 +350,8 @@ GET /models
 ### Availability-Based Default (Custom Providers)
 
 Some gateways serve a rotating list of models — including free models
-published under the `free/` namespace, e.g. `free/deepseek-v4-flash-0731` on
-APInex — so a hardcoded default model can disappear or be replaced. When a
+published under a `free/` namespace — so a hardcoded default model can
+disappear or be replaced. When a
 custom provider's entry omits `model` (at startup, or after switching to it
 with `/provider`), chatTUI fetches its live `GET /models` list in the
 background and sets the default model from what is actually available:
@@ -369,7 +360,7 @@ background and sets the default model from what is actually available:
 2. the first model in the live list.
 
 The pick is announced in the transcript (e.g.
-`APInex default set to available free model: free/deepseek-v4-flash-0731`).
+`mygateway default set to available free model: free/your-model`).
 An explicit choice always wins — a model set with `{ID}_MODEL`, the entry's
 `model` field, or `/model` is never overridden — and if the fetch fails the
 send-time fallback still covers it. The fetched list doubles as the cached
@@ -387,8 +378,8 @@ reopening the picker is instant.
 
 `/model <id>` still sets a model directly. When a fetched list is cached, the
 id is resolved against it — exact match (case-insensitive), then a unique
-prefix, then a unique suffix — so both `/model minimaxai/minimax-m2.7` and the
-shorthand `/model minimax-m2.7` find `MiniMaxAI/MiniMax-M2.7`. Anything
+prefix, then a unique suffix — so both `/model acmeai/acme-model-1` and the
+shorthand `/model acme-model-1` find `AcmeAI/acme-model-1`. Anything
 ambiguous or unknown is set exactly as typed.
 
 ### Automatic Model Fallback
@@ -397,12 +388,12 @@ When a send fails because of the model — a bad request against it, a
 model that no longer exists, throttling, or the classic "currently
 experiencing high demand" overload — chatTUI fetches the endpoint's model
 list, picks another available model (preferring one from the same family,
-e.g. another `MiniMaxAI/…`), and retries. Every switch is announced in the
+e.g. another `AcmeAI/…`), and retries. Every switch is announced in the
 transcript, so you always know which model answered:
 
 ```text
-⚠ MiniMaxAI/MiniMax-M2.7 is unavailable — the model rejected the request (HTTP 429: rate limit exceeded)
-  switching to MiniMaxAI/MiniMax-M1
+⚠ AcmeAI/acme-model-2 is unavailable — the model rejected the request (HTTP 429: rate limit exceeded)
+  switching to AcmeAI/acme-model-1
 ```
 
 Up to three fallbacks are tried per message, and the request is only retried
@@ -450,8 +441,13 @@ and a shell. What is actually enforced — and what is not:
   When unset, the legacy `auto_approve` / `allow_shell` flags decide.
   `ask-*` modes currently deny the gated action (interactive approval is
   not implemented yet) instead of allowing it silently.
-- **Agent loop:** tool-call rounds are capped (`MAX_AGENT_ITERATIONS = 10`),
-  and `Esc` aborts the in-flight model request.
+- **Agent loop:** the agent keeps working for as long as it makes
+  progress — there is no fixed step cap. It is stopped by specific guards
+  instead: the same failing tool call 3 rounds in a row (stagnation), 4
+  consecutive rounds where every tool errored, or a generous backstop
+  ceiling (`agent.max_rounds` in `config.json`, default 50). Every stop is
+  announced in the transcript with its reason, and `Esc` aborts the
+  in-flight model request.
 
 When kernel isolation is unavailable or disabled, this system is accurately
 described as *workspace-restricted tool execution*, not a sandbox; with

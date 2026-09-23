@@ -118,22 +118,22 @@ mod tests {
     fn switching_to_a_custom_provider_uses_its_endpoint() {
         let mut app = test_app();
         app.config.custom_providers.push(CustomProvider {
-            id: "dahl".into(),
-            name: Some("Dahl".into()),
-            base_url: "https://inference.dahl.global/v1".into(),
-            api_key: Some("dahl-key".into()),
-            model: Some("MiniMaxAI/MiniMax-M2.7".into()),
+            id: "acme".into(),
+            name: Some("Acme".into()),
+            base_url: "https://api.acme.example/v1".into(),
+            api_key: Some("acme-key".into()),
+            model: Some("AcmeAI/acme-model-1".into()),
         });
-        app.set_active_provider("dahl");
-        assert_eq!(app.config.provider, "dahl");
-        assert_eq!(app.config.base_url, "https://inference.dahl.global/v1");
-        assert_eq!(app.config.model, "MiniMaxAI/MiniMax-M2.7");
-        assert_eq!(app.config.api_key.as_deref(), Some("dahl-key"));
+        app.set_active_provider("acme");
+        assert_eq!(app.config.provider, "acme");
+        assert_eq!(app.config.base_url, "https://api.acme.example/v1");
+        assert_eq!(app.config.model, "AcmeAI/acme-model-1");
+        assert_eq!(app.config.api_key.as_deref(), Some("acme-key"));
         assert!(matches!(app.cells.last(), Some(Cell::Notice(_))));
 
         // Unknown ids (no such custom, no such built-in) are reported.
-        app.set_active_provider("apinex");
-        assert_eq!(app.config.provider, "dahl");
+        app.set_active_provider("zeta");
+        assert_eq!(app.config.provider, "acme");
         assert!(matches!(app.cells.last(), Some(Cell::Error(_))));
     }
 }

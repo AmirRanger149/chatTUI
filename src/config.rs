@@ -10,7 +10,7 @@ use std::{env, fs, path::PathBuf};
 ///
 /// There are two kinds: the three built-ins (`openai`, `anthropic`, `gemini`)
 /// and user-defined custom gateways declared under `custom_providers` in
-/// `config.json` (Dahl, APInex, Ollama, Groq, and anything else that speaks
+/// `config.json` (Ollama, Groq, OpenRouter, and anything else that speaks
 /// the OpenAI-compatible protocol).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Provider {
@@ -93,7 +93,7 @@ pub struct CustomProvider {
     /// Display name; defaults to the id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// OpenAI-compatible base URL, e.g. `https://inference.dahl.global/v1`.
+    /// OpenAI-compatible base URL, e.g. `https://api.groq.com/openai/v1`.
     pub base_url: String,
     /// API key; `{ID}_API_KEY` in the environment is the fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -177,17 +177,12 @@ pub struct Config {
     pub anthropic_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gemini_api_key: Option<String>,
-    /// User-defined OpenAI-compatible gateways (Dahl, APInex, Ollama, Groq, …).
+    /// User-defined OpenAI-compatible gateways (Ollama, Groq, OpenRouter, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_providers: Vec<CustomProvider>,
-    /// Deprecated fields of the removed Dahl/APInex built-ins; migrated into
-    /// `custom_providers` on load so old config files keep working.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dahl_api_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub apinex_api_key: Option<String>,
-    /// Legacy single-key field: routed to its provider on load.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The resolved API key of the active provider — runtime state set by
+    /// `set_provider`, never read from config.json.
+    #[serde(skip)]
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base_url: String,
@@ -215,6 +210,35 @@ pub struct Config {
     pub idle_timeout_secs: u64,
     #[serde(default, skip_serializing_if = "is_default_sandbox")]
     pub sandbox: SandboxConfigFile,
+    #[serde(default, skip_serializing_if = "is_default_agent")]
+    pub agent: AgentConfigFile,
+}
+
+/// Agent-loop settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfigFile {
+    /// Backstop ceiling for agent tool rounds. This is a safety net, not
+    /// the normal stopping rule: the agent keeps working as long as it
+    /// makes progress, and broken loops are stopped much earlier by the
+    /// stagnation and consecutive-failure guards.
+    #[serde(default = "default_agent_max_rounds")]
+    pub max_rounds: u64,
+}
+
+impl Default for AgentConfigFile {
+    fn default() -> Self {
+        Self {
+            max_rounds: default_agent_max_rounds(),
+        }
+    }
+}
+
+fn default_agent_max_rounds() -> u64 {
+    crate::app::DEFAULT_AGENT_MAX_ROUNDS
+}
+
+fn is_default_agent(cfg: &AgentConfigFile) -> bool {
+    cfg.max_rounds == default_agent_max_rounds()
 }
 
 fn is_default_sandbox(cfg: &SandboxConfigFile) -> bool {
@@ -251,8 +275,6 @@ impl Default for Config {
             anthropic_api_key: None,
             gemini_api_key: None,
             custom_providers: Vec::new(),
-            dahl_api_key: None,
-            apinex_api_key: None,
             api_key: None,
             base_url: String::new(),
             model: String::new(),
@@ -261,6 +283,7 @@ impl Default for Config {
             connect_timeout_secs: default_connect_timeout_secs(),
             idle_timeout_secs: default_idle_timeout_secs(),
             sandbox: SandboxConfigFile::default(),
+            agent: AgentConfigFile::default(),
         };
         // Pick up every provider's key from its environment variable.
         for provider in builtin_providers() {
@@ -350,74 +373,6 @@ impl Config {
         None
     }
 
-    fn custom_has(&self, id: &str) -> bool {
-        self.custom_providers
-            .iter()
-            .any(|c| c.id.eq_ignore_ascii_case(id))
-    }
-
-    /// Legacy `config.json` support: the Dahl/APInex gateways used to be
-    /// built-in providers with dedicated `dahl_api_key` / `apinex_api_key`
-    /// fields (and, before that, a single `api_key`). They are now regular
-    /// custom providers, so old fields are quietly migrated into
-    /// `custom_providers`, keeping each gateway's endpoint and default model.
-    /// Dahl keeps its pinned MiniMax default; APInex keeps its
-    /// availability-based default (no `model`, resolved from the live list).
-    fn migrate_legacy_fields(&mut self) {
-        const DAHL_URL: &str = "https://inference.dahl.global/v1";
-        const DAHL_MODEL: &str = "MiniMaxAI/MiniMax-M2.7";
-        const APINEX_URL: &str = "https://api.apinex.bond/v1";
-
-        let legacy = [
-            (
-                "dahl",
-                "Dahl",
-                DAHL_URL,
-                Some(DAHL_MODEL),
-                self.dahl_api_key.take(),
-            ),
-            ("apinex", "APInex", APINEX_URL, None, self.apinex_api_key.take()),
-        ];
-        for (id, name, base_url, model, key) in legacy {
-            let Some(key) = key.filter(|key| !key.trim().is_empty()) else {
-                continue;
-            };
-            if self.custom_has(id) {
-                continue;
-            }
-            self.custom_providers.push(CustomProvider {
-                id: id.to_string(),
-                name: Some(name.to_string()),
-                base_url: base_url.to_string(),
-                api_key: Some(key),
-                model: model.map(str::to_string),
-            });
-        }
-
-        // The oldest single-key field: `sk-apx…` belonged to APInex,
-        // anything else to Dahl.
-        let Some(key) = self.api_key.clone().filter(|key| !key.trim().is_empty()) else {
-            return;
-        };
-        let (id, name, base_url, model): (&str, &str, &str, Option<&str>) =
-            if key.starts_with("sk-apx") {
-                ("apinex", "APInex", APINEX_URL, None)
-            } else {
-                ("dahl", "Dahl", DAHL_URL, Some(DAHL_MODEL))
-            };
-        if !self.custom_has(id) {
-            self.custom_providers.push(CustomProvider {
-                id: id.to_string(),
-                name: Some(name.to_string()),
-                base_url: base_url.to_string(),
-                api_key: Some(key),
-                model: model.map(str::to_string),
-            });
-        } else if self.api_key_for_provider(id).is_none() {
-            self.set_provider_key(id, key);
-        }
-    }
-
     /// Build an [`ApiClient`] for the active provider: its protocol backend,
     /// bound to the configured API key and base URL.
     pub fn api_client(&self) -> ApiClient {
@@ -497,8 +452,6 @@ impl Config {
         let candidates = [
             executable_dir.as_ref().map(|dir| dir.join("config.json")),
             Some(PathBuf::from("config.json")),
-            executable_dir.as_ref().map(|dir| dir.join("dahl.json")),
-            Some(PathBuf::from("dahl.json")),
         ];
         for candidate in candidates {
             let Some(path) = candidate else { continue };
@@ -509,10 +462,6 @@ impl Config {
                 fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             let mut config: Self = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
-
-            // Retire the removed Dahl/APInex built-ins into
-            // `custom_providers` so old config files keep working.
-            config.migrate_legacy_fields();
 
             // Environment keys always win over the file's values, both for
             // the built-ins and, via `{ID}_API_KEY`, for custom providers.
@@ -565,18 +514,6 @@ impl Config {
                     .unwrap_or_else(|_| provider.default_model.clone());
             }
 
-            // The legacy `api_key` field also acts as the active provider's
-            // key when no dedicated field is present
-            // (e.g. `{"provider": "openai", "api_key": "…"}`).
-            if config.api_key_for_provider(&config.provider).is_none() {
-                if let Some(key) = config.api_key.clone() {
-                    if !key.trim().is_empty() {
-                        let provider_id = config.provider.clone();
-                        config.set_provider_key(&provider_id, key);
-                    }
-                }
-            }
-
             config.api_key = config.api_key_for_provider(&config.provider);
             return Ok(config);
         }
@@ -604,8 +541,8 @@ mod tests {
             "https://generativelanguage.googleapis.com/v1beta"
         );
         assert!(providers.iter().all(|p| !p.is_custom));
-        assert!(config.find_provider("dahl").is_none());
-        assert!(config.find_provider("apinex").is_none());
+        assert!(config.find_provider("acme").is_none());
+        assert!(config.find_provider("beta").is_none());
     }
 
     #[test]
@@ -614,33 +551,33 @@ mod tests {
             r#"{
                 "custom_providers": [
                     {
-                        "id": "dahl",
-                        "name": "Dahl",
-                        "base_url": "https://inference.dahl.global/v1",
-                        "api_key": "dahl-key",
-                        "model": "MiniMaxAI/MiniMax-M2.7"
+                        "id": "acme",
+                        "name": "Acme",
+                        "base_url": "https://api.acme.example/v1",
+                        "api_key": "acme-key",
+                        "model": "AcmeAI/acme-model-1"
                     },
-                    {"id": "groq", "base_url": "https://api.groq.com/openai/v1"}
+                    {"id": "beta", "base_url": "https://api.beta.example/v1"}
                 ]
             }"#,
         )
         .unwrap();
-        let dahl = config.find_provider("dahl").unwrap();
-        assert!(dahl.is_custom);
-        assert_eq!(dahl.kind, ProviderKind::OpenAICompatible);
-        assert_eq!(dahl.name, "Dahl");
-        assert_eq!(dahl.base_url, "https://inference.dahl.global/v1");
-        assert_eq!(dahl.default_model, "MiniMaxAI/MiniMax-M2.7");
-        assert_eq!(dahl.env_key, "DAHL_API_KEY");
+        let acme = config.find_provider("acme").unwrap();
+        assert!(acme.is_custom);
+        assert_eq!(acme.kind, ProviderKind::OpenAICompatible);
+        assert_eq!(acme.name, "Acme");
+        assert_eq!(acme.base_url, "https://api.acme.example/v1");
+        assert_eq!(acme.default_model, "AcmeAI/acme-model-1");
+        assert_eq!(acme.env_key, "ACME_API_KEY");
         assert_eq!(
-            config.api_key_for_provider("dahl").as_deref(),
-            Some("dahl-key")
+            config.api_key_for_provider("acme").as_deref(),
+            Some("acme-key")
         );
         // No name → falls back to the id; no model → availability-based.
-        let groq = config.find_provider("groq").unwrap();
-        assert_eq!(groq.name, "groq");
-        assert_eq!(groq.default_model, "");
-        assert!(groq.availability_based_model());
+        let beta = config.find_provider("beta").unwrap();
+        assert_eq!(beta.name, "beta");
+        assert_eq!(beta.default_model, "");
+        assert!(beta.availability_based_model());
         // Custom ids may not shadow the built-ins.
         let shadowing: Config = serde_json::from_str(
             r#"{"custom_providers": [{"id": "openai", "base_url": "https://evil.example/v1"}]}"#,
@@ -656,18 +593,18 @@ mod tests {
         let config: Config = serde_json::from_str(
             r#"{
                 "custom_providers": [
-                    {"id": "dahl", "name": "Dahl", "base_url": "https://inference.dahl.global/v1"},
-                    {"id": "apinex", "name": "APInex", "base_url": "https://api.apinex.bond/v1"}
+                    {"id": "acme", "name": "Acme", "base_url": "https://api.acme.example/v1"},
+                    {"id": "beta", "name": "Beta", "base_url": "https://api.beta.example/v1"}
                 ]
             }"#,
         )
         .unwrap();
-        assert_eq!(config.find_provider("dahl").unwrap().id, "dahl");
-        assert_eq!(config.find_provider("DAHL").unwrap().id, "dahl");
-        assert_eq!(config.find_provider("apinex").unwrap().id, "apinex");
-        assert_eq!(config.find_provider("APInex").unwrap().id, "apinex");
-        assert_eq!(config.find_provider("api").unwrap().id, "apinex");
-        assert_eq!(config.find_provider("d").unwrap().id, "dahl");
+        assert_eq!(config.find_provider("acme").unwrap().id, "acme");
+        assert_eq!(config.find_provider("ACME").unwrap().id, "acme");
+        assert_eq!(config.find_provider("beta").unwrap().id, "beta");
+        assert_eq!(config.find_provider("Beta").unwrap().id, "beta");
+        assert_eq!(config.find_provider("be").unwrap().id, "beta");
+        assert_eq!(config.find_provider("ac").unwrap().id, "acme");
         assert!(config.find_provider("unknown").is_none());
     }
 
@@ -676,7 +613,7 @@ mod tests {
         let mut config: Config = serde_json::from_str(
             r#"{
                 "custom_providers": [
-                    {"id": "apinex", "name": "APInex", "base_url": "https://api.apinex.bond/v1", "model": "gpt-5-6-terra"}
+                    {"id": "acme", "name": "Acme", "base_url": "https://api.acme.example/v1", "model": "acme-model-9"}
                 ]
             }"#,
         )
@@ -686,10 +623,10 @@ mod tests {
         assert_eq!(config.base_url, "https://api.anthropic.com/v1");
         assert_eq!(config.model, "claude-sonnet-4-5");
 
-        config.set_provider("apinex").unwrap();
-        assert_eq!(config.provider, "apinex");
-        assert_eq!(config.base_url, "https://api.apinex.bond/v1");
-        assert_eq!(config.model, "gpt-5-6-terra");
+        config.set_provider("acme").unwrap();
+        assert_eq!(config.provider, "acme");
+        assert_eq!(config.base_url, "https://api.acme.example/v1");
+        assert_eq!(config.model, "acme-model-9");
 
         // An empty `model` entry stays empty: it is resolved from the
         // endpoint's live model list at runtime.
@@ -747,60 +684,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_dahl_and_apinex_fields_migrate_into_custom_providers() {
-        let mut config: Config = serde_json::from_str(
-            r#"{"dahl_api_key": "dahl-key", "apinex_api_key": "sk-apx-apinex-key"}"#,
-        )
-        .unwrap();
-        config.migrate_legacy_fields();
-        let dahl = config.find_provider("dahl").unwrap();
-        assert!(dahl.is_custom);
-        assert_eq!(dahl.base_url, "https://inference.dahl.global/v1");
-        assert_eq!(dahl.default_model, "MiniMaxAI/MiniMax-M2.7");
-        assert_eq!(
-            config.api_key_for_provider("dahl").as_deref(),
-            Some("dahl-key")
-        );
-        let apinex = config.find_provider("apinex").unwrap();
-        assert_eq!(apinex.base_url, "https://api.apinex.bond/v1");
-        // APInex keeps its availability-based default (no pinned model).
-        assert_eq!(apinex.default_model, "");
-        assert_eq!(
-            config.api_key_for_provider("apinex").as_deref(),
-            Some("sk-apx-apinex-key")
-        );
-
-        // The oldest single-key field routes by its `sk-apx` prefix.
-        let mut config: Config =
-            serde_json::from_str(r#"{"api_key": "sk-apx-single-key"}"#).unwrap();
-        config.migrate_legacy_fields();
-        assert_eq!(
-            config.api_key_for_provider("apinex").as_deref(),
-            Some("sk-apx-single-key")
-        );
-        assert!(config.find_provider("dahl").is_none());
-    }
-
-    #[test]
-    fn explicit_custom_entries_win_over_the_legacy_migration() {
-        let mut config: Config = serde_json::from_str(
-            r#"{
-                "apinex_api_key": "old-key",
-                "custom_providers": [
-                    {"id": "apinex", "base_url": "https://api.apinex.bond/v1", "api_key": "new-key"}
-                ]
-            }"#,
-        )
-        .unwrap();
-        config.migrate_legacy_fields();
-        assert_eq!(config.custom_providers.len(), 1);
-        assert_eq!(
-            config.api_key_for_provider("apinex").as_deref(),
-            Some("new-key")
-        );
-    }
-
-    #[test]
     fn sandbox_config_defaults_are_backward_compatible() {
         // A config without any sandbox keys keeps the historical behavior:
         // enabled, auto-approved, shell allowed, 30s timeout.
@@ -838,6 +721,14 @@ mod tests {
         assert_eq!(config.sandbox.os_isolation.as_deref(), Some("require"));
         assert_eq!(config.sandbox.extra_sensitive_names.len(), 2);
         assert!(!is_default_sandbox(&config.sandbox));
+    }
+
+    #[test]
+    fn agent_max_rounds_defaults_and_parses() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.agent.max_rounds, crate::app::DEFAULT_AGENT_MAX_ROUNDS);
+        let config: Config = serde_json::from_str(r#"{"agent": {"max_rounds": 120}}"#).unwrap();
+        assert_eq!(config.agent.max_rounds, 120);
     }
 
     #[test]

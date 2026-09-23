@@ -31,8 +31,8 @@ impl App {
 
     /// Resolve a `/model <arg>` argument against the cached model list:
     /// exact (case-insensitive) first, then a unique prefix, then a unique
-    /// suffix, so `minimaxai/minimax-m2.7` and even `minimax-m2.7` both find
-    /// `MiniMaxAI/MiniMax-M2.7`. Anything ambiguous or unknown comes back
+    /// suffix, so `acmeai/acme-model-1` and even `acme-model-1` both find
+    /// `AcmeAI/acme-model-1`. Anything ambiguous or unknown comes back
     /// exactly as typed.
     pub(crate) fn lookup_model(&self, argument: &str) -> String {
         if let Some(id) = self
@@ -134,7 +134,7 @@ impl App {
     /// Background fetch that resolves an availability-based default model:
     /// a custom provider whose config entry omits `model` gets its active
     /// model resolved against the endpoint's live list (a free model first,
-    /// e.g. `free/deepseek-v4-flash-0731` on APInex-style gateways). When it
+    /// e.g. `free/…` on gateways that publish a free namespace). When it
     /// finishes, the active model is set to the best available match, unless
     /// the user has picked one themselves. Failures stay quiet: the send-time
     /// model fallback still covers an empty choice.
@@ -299,7 +299,7 @@ impl App {
 
 /// Choose the default model for an availability-based provider from its live
 /// model list: a free model (the `free/` namespace, e.g.
-/// `free/deepseek-v4-flash-0731`) wins; otherwise the built-in default if it
+/// a `free/` model) wins; otherwise the built-in default if it
 /// is still offered; otherwise the first model in the list. The list arrives
 /// sorted case-insensitively (see `crate::api::client::ApiClient::list_models`), so both the
 /// free pick and the fallback are deterministic.
@@ -417,19 +417,22 @@ mod tests {
     fn model_lookup_resolves_exact_prefix_and_suffix() {
         let mut app = test_app();
         app.models.ids = vec![
-            "MiniMaxAI/MiniMax-M1".into(),
-            "MiniMaxAI/MiniMax-M2.7".into(),
-            "OpenAI/gpt-x".into(),
+            "AcmeAI/acme-model-1".into(),
+            "AcmeAI/acme-model-2".into(),
+            "OtherOrg/other-model".into(),
         ];
-        assert_eq!(app.lookup_model("openai/gpt-x"), "OpenAI/gpt-x");
         assert_eq!(
-            app.lookup_model("minimaxai/minimax-m1"),
-            "MiniMaxAI/MiniMax-M1"
+            app.lookup_model("otherorg/other-model"),
+            "OtherOrg/other-model"
+        );
+        assert_eq!(
+            app.lookup_model("acmeai/acme-model-1"),
+            "AcmeAI/acme-model-1"
         );
         // Unique suffix shorthand.
-        assert_eq!(app.lookup_model("minimax-m2.7"), "MiniMaxAI/MiniMax-M2.7");
+        assert_eq!(app.lookup_model("acme-model-2"), "AcmeAI/acme-model-2");
         // Ambiguous prefixes/suffixes stay untouched.
-        assert_eq!(app.lookup_model("minimax"), "minimax");
+        assert_eq!(app.lookup_model("acme"), "acme");
         assert_eq!(app.lookup_model("nonexistent"), "nonexistent");
         // No catalog → as typed.
         app.models.ids.clear();

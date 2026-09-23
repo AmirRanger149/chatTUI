@@ -43,7 +43,19 @@ pub const MAX_COMPOSER_ROWS: usize = 8;
 /// the page size for pgup/pgdn navigation within an overlay.
 pub const OVERLAY_ROWS: usize = 12;
 const QUIT_PRIME_WINDOW: Duration = std::time::Duration::from_secs(2);
-pub const MAX_AGENT_ITERATIONS: usize = 10;
+
+/// Identical failing tool rounds in a row before the agent is stopped —
+/// the stagnation guard. The same call failing repeatedly means the model
+/// is looping, not working; three repetitions prove it within a few rounds
+/// instead of letting it run to a step counter.
+pub const AGENT_STAGNATION_LIMIT: usize = 3;
+/// Consecutive rounds in which every tool result is an error before the
+/// agent is stopped — the "nothing is working anymore" guard.
+pub const AGENT_CONSECUTIVE_FAILURE_LIMIT: usize = 4;
+/// Backstop ceiling for agent tool rounds when config.json does not set
+/// one. This is insurance, not policy: healthy runs keep going as long as
+/// they make progress and are stopped by the guards above when they don't.
+pub const DEFAULT_AGENT_MAX_ROUNDS: u64 = 50;
 
 /// A rendered entry of the conversation transcript.
 #[derive(Debug, Clone, PartialEq)]
@@ -106,8 +118,18 @@ pub struct App {
     // Agent / Sandbox state
     pub sandbox: Sandbox,
     pub pending_tool_calls: Vec<ToolCall>,
+    /// Tool rounds completed in the current agent run (display + ceiling).
     pub agent_iterations: usize,
     pub agent_mode: bool,
+    /// Configured backstop ceiling for tool rounds (`agent.max_rounds`).
+    pub agent_max_rounds: usize,
+    /// Fingerprint (sorted name+arguments) of the previous tool round —
+    /// lets the stagnation guard recognize the same round coming back.
+    pub agent_last_round_key: Option<String>,
+    /// Identical failing rounds seen in a row so far.
+    pub agent_repeat_failures: usize,
+    /// Rounds in a row where every tool result was an error.
+    pub agent_consecutive_failures: usize,
     /// Ids of tool calls whose arguments arrived unparseable (a stream cut
     /// mid-arguments). They get an explicit truncation error instead of a
     /// misleading "missing field", and are persisted with clean JSON.
@@ -175,6 +197,9 @@ impl App {
             }
         }
 
+        // Bind before the struct literal: the `config` shorthand moves the
+        // value, so later initializers may not read it.
+        let agent_max_rounds = config.agent.max_rounds.max(1).min(10_000) as usize;
         let mut app = Self {
             config,
             sessions,
@@ -201,6 +226,10 @@ impl App {
             pending_tool_calls: Vec::new(),
             agent_iterations: 0,
             agent_mode: true, // Agent mode enabled by default when sandbox enabled
+            agent_max_rounds,
+            agent_last_round_key: None,
+            agent_repeat_failures: 0,
+            agent_consecutive_failures: 0,
             truncated_tool_calls: HashSet::new(),
             retry_state: None,
         };
@@ -290,10 +319,20 @@ impl App {
         self.streaming = false;
         self.stream_started = None;
         self.pending_tool_calls.clear();
-        self.agent_iterations = 0;
+        self.reset_agent_health();
         self.truncated_tool_calls.clear();
         self.retry_state = None;
         self.finish_partial();
+    }
+
+    /// Reset the per-run agent health tracking (round count, stagnation
+    /// fingerprint, failure streaks). Called whenever an agent run ends —
+    /// finished normally, stopped by a guard, or interrupted.
+    pub(crate) fn reset_agent_health(&mut self) {
+        self.agent_iterations = 0;
+        self.agent_last_round_key = None;
+        self.agent_repeat_failures = 0;
+        self.agent_consecutive_failures = 0;
     }
 
     /// `ctrl+r`: expand / collapse completed reasoning blocks.
@@ -342,7 +381,7 @@ impl App {
             if crate::ui::thinking::is_thinking(&text) {
                 text.push_str(crate::ui::thinking::CLOSE_TAG);
             }
-            // If the model only streamed reasoning (MiniMax-style), still
+            // If the model only streamed reasoning (reasoning-only reply), still
             // surface that text as the visible answer instead of an empty cell.
             if crate::ui::thinking::strip(&text).is_empty() {
                 if let Some(inner) = crate::ui::thinking::reasoning_text(&text) {

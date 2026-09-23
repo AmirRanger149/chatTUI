@@ -1,6 +1,6 @@
 //! Reasoning ("thinking") support.
 //!
-//! Some models (MiniMax-M2.7 is one) stream their private chain of thought
+//! Some models stream their private chain of thought
 //! wrapped in `<think> … </think>` ahead of the real answer. This module splits
 //! that out of the message body and renders it as its own animated cell: a
 //! shimmering `✻ Thinking…` header while the tokens arrive, collapsing into a

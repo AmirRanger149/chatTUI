@@ -168,7 +168,7 @@ fn backoff(attempt: usize) -> Duration {
 }
 
 /// Rank the models left after a failure: models from the same family (the
-/// namespace before the `/`, e.g. `MiniMaxAI/…`) first, since a sibling
+/// namespace before the `/`, e.g. `AcmeAI/…`) first, since a sibling
 /// model is the likeliest drop-in replacement; everything else keeps the
 /// API's own order. The failed model and duplicates are dropped.
 fn order_fallbacks(models: Vec<String>, failed: &str) -> Vec<String> {
@@ -215,20 +215,20 @@ mod tests {
     fn fallback_order_prefers_the_same_family() {
         let ordered = order_fallbacks(
             vec![
-                "Other/Model".into(),
-                "Minimaxai/MiniMax-M1".into(),
-                "MiniMaxAI/MiniMax-M2.7".into(),
-                "Other/Model".into(),
-                "MiniMaxAI/MiniMax-M2.7".into(),
+                "OtherOrg/other-model".into(),
+                "Acmeai/acme-model-1".into(),
+                "AcmeAI/acme-model-2".into(),
+                "OtherOrg/other-model".into(),
+                "AcmeAI/acme-model-2".into(),
             ],
-            "MiniMaxAI/MiniMax-M3",
+            "AcmeAI/acme-model-3",
         );
         assert_eq!(
             ordered,
             vec![
-                "Minimaxai/MiniMax-M1",
-                "MiniMaxAI/MiniMax-M2.7",
-                "Other/Model"
+                "Acmeai/acme-model-1",
+                "AcmeAI/acme-model-2",
+                "OtherOrg/other-model"
             ]
         );
     }

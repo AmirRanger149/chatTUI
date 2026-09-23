@@ -3,7 +3,7 @@
 //! Now with agent loop for tool calling.
 
 use crate::api::types::{Message, Role, StreamEvent, ToolDefinition};
-use crate::app::{App, Cell, RetryView, MAX_AGENT_ITERATIONS};
+use crate::app::{App, Cell, RetryView, AGENT_CONSECUTIVE_FAILURE_LIMIT, AGENT_STAGNATION_LIMIT};
 use crate::session::manager::ToolCallRecord;
 use crate::tools;
 use anyhow::Result;
@@ -232,7 +232,7 @@ impl App {
                     self.streaming = false;
                     self.stream_started = None;
                     self.pending_tool_calls.clear();
-                    self.agent_iterations = 0;
+                    self.reset_agent_health();
                     self.push_error(error);
                     return;
                 }
@@ -329,33 +329,78 @@ impl App {
                         self.sessions.add_tool_result(tc.id.clone(), content);
                     }
                 }
-                self.agent_iterations = 0;
+                self.reset_agent_health();
                 return;
             }
 
-            // Continue agent loop if iterations left
-            if self.agent_iterations < MAX_AGENT_ITERATIONS {
+            // -- Agent health guards: decide whether the loop may continue.
+            // Progress, not a step counter, decides: a healthy run keeps
+            // going; these guards stop the specific broken patterns.
+
+            // Stagnation: fingerprint the round (sorted name+arguments) and
+            // count identical failing rounds in a row.
+            let mut keys: Vec<String> = pending
+                .iter()
+                .map(|tc| format!("{}\u{0}{}", tc.name, tc.arguments))
+                .collect();
+            keys.sort();
+            let round_key = keys.join("\u{1f}");
+            let round_failed = tool_results.iter().any(|(_, _, is_error)| *is_error);
+            if round_failed && self.agent_last_round_key.as_deref() == Some(round_key.as_str()) {
+                self.agent_repeat_failures += 1;
+            } else {
+                self.agent_repeat_failures = usize::from(round_failed);
+            }
+            self.agent_last_round_key = Some(round_key);
+
+            // Consecutive rounds where every tool errored.
+            let all_failed = !tool_results.is_empty()
+                && tool_results.iter().all(|(_, _, is_error)| *is_error);
+            if all_failed {
+                self.agent_consecutive_failures += 1;
+            } else {
+                self.agent_consecutive_failures = 0;
+            }
+
+            let stop_reason: Option<String> =
+                if self.agent_repeat_failures >= AGENT_STAGNATION_LIMIT {
+                    Some(format!(
+                        "agent stopped: the same tool call failed {AGENT_STAGNATION_LIMIT} rounds in a row — it is not making progress"
+                    ))
+                } else if self.agent_consecutive_failures >= AGENT_CONSECUTIVE_FAILURE_LIMIT {
+                    Some(format!(
+                        "agent stopped: {AGENT_CONSECUTIVE_FAILURE_LIMIT} consecutive rounds failed — check the workspace and try again"
+                    ))
+                } else if self.agent_iterations >= self.agent_max_rounds {
+                    // Safety net only — healthy runs are stopped by the
+                    // guards above, not by this ceiling.
+                    Some(format!(
+                        "agent stopped after {} rounds — raise agent.max_rounds in config.json if this task needs more",
+                        self.agent_max_rounds
+                    ))
+                } else {
+                    None
+                };
+
+            if let Some(reason) = stop_reason {
+                self.push_notice(reason);
+                self.reset_agent_health();
+            } else {
                 self.agent_iterations += 1;
                 if let Err(e) = self.start_stream() {
                     self.push_error(e.to_string());
                     self.streaming = false;
                     self.stream_started = None;
-                    self.agent_iterations = 0;
+                    self.reset_agent_health();
                 }
                 return;
-            } else {
-                self.push_notice(format!(
-                    "agent stopped after {} iterations",
-                    MAX_AGENT_ITERATIONS
-                ));
-                self.agent_iterations = 0;
             }
         }
 
         self.streaming = false;
         self.stream_started = None;
         self.finish_partial();
-        self.agent_iterations = 0;
+        self.reset_agent_health();
         self.pending_tool_calls.clear();
     }
 }
@@ -364,7 +409,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::api::types::ToolCall;
-    use crate::app::{App, Cell, MAX_AGENT_ITERATIONS};
+    use crate::app::{App, Cell};
     use crate::config::Config;
     use crate::sandbox::permissions::PermissionMode;
     use crate::session::manager::SessionManager;
@@ -447,9 +492,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_loop_stops_at_max_iterations() {
-        let mut app = agent_app("max-iterations");
-        app.agent_iterations = MAX_AGENT_ITERATIONS;
+    async fn agent_loop_stops_at_the_configured_ceiling() {
+        let mut app = agent_app("ceiling");
+        app.agent_iterations = app.agent_max_rounds;
         feed(&mut app, vec![tool_call_event("c1", "list_files", "{}")]);
         app.receive_token().await;
 
@@ -463,18 +508,19 @@ mod tests {
         assert_eq!(app.agent_iterations, 0);
         assert!(app.cells.iter().any(|c| matches!(
             c,
-            Cell::Notice(text) if text.contains("agent stopped")
+            Cell::Notice(text) if text.contains("agent stopped") && text.contains("max_rounds")
         )));
     }
 
     #[tokio::test]
-    async fn repeated_tool_rounds_cannot_exceed_max_iterations() {
+    async fn successful_rounds_run_until_the_ceiling() {
         // Restart streams succeed (the legacy `api_key` field satisfies
         // start_stream; the endpoint is a closed local port that fails
         // fast), so the agent loop really runs round after round — exactly
-        // the setup that would spin forever if the cap were bypassable.
+        // the setup that would spin forever without a backstop. Identical
+        // SUCCEEDING rounds must not trip the stagnation guard.
         let config: Config = serde_json::from_str(
-            r#"{"provider":"openai","base_url":"http://127.0.0.1:9/v1","api_key":"test-key"}"#,
+            r#"{"provider":"openai","base_url":"http://127.0.0.1:9/v1","api_key":"test-key","agent":{"max_rounds":12}}"#,
         )
         .unwrap();
         let mut app = App::new(config, SessionManager::for_tests());
@@ -487,10 +533,10 @@ mod tests {
 
         let mut rounds = 0;
         loop {
-            // The counter may reach but never exceed the maximum.
+            // The round counter may reach but never exceed the ceiling.
             assert!(
-                app.agent_iterations <= MAX_AGENT_ITERATIONS,
-                "iteration counter exceeded its maximum"
+                app.agent_iterations <= app.agent_max_rounds,
+                "round counter exceeded its ceiling"
             );
             feed(
                 &mut app,
@@ -504,7 +550,7 @@ mod tests {
             }
         }
 
-        assert_eq!(rounds, MAX_AGENT_ITERATIONS + 1);
+        assert_eq!(rounds, app.agent_max_rounds + 1);
         assert!(app.cells.iter().any(|c| matches!(
             c,
             Cell::Notice(text) if text.contains("agent stopped")
@@ -520,7 +566,7 @@ mod tests {
         app.sandbox.config.permission_mode = PermissionMode::ReadOnly;
         let rounds = 3;
         for round in 0..rounds {
-            assert!(app.agent_iterations < MAX_AGENT_ITERATIONS);
+            assert!(app.agent_iterations < app.agent_max_rounds);
             feed(
                 &mut app,
                 vec![tool_call_event(&format!("c{round}"), "write_file", r#"{"path":"x","content":"y"}"#)],
@@ -607,5 +653,72 @@ mod tests {
             Cell::Notice(text) if text.contains("backfilled 1 missing tool result")
         )));
         app.interrupt();
+    }
+
+    /// An app with a satisfied API key (pointed at a closed endpoint), a
+    /// temp workspace and read-only permissions — for exercising the agent
+    /// health guards round after round without real network traffic.
+    fn guarded_agent_app(name: &str) -> App {
+        let config: Config = serde_json::from_str(
+            r#"{"provider":"openai","base_url":"http://127.0.0.1:9/v1","api_key":"test-key"}"#,
+        )
+        .unwrap();
+        let mut app = App::new(config, SessionManager::for_tests());
+        let dir =
+            std::env::temp_dir().join(format!("chatTUI_guard_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.sandbox.set_target(dir.to_str().unwrap()).unwrap();
+        app.agent_mode = true;
+        app.sandbox.config.permission_mode = PermissionMode::ReadOnly;
+        app
+    }
+
+    #[tokio::test]
+    async fn identical_failing_rounds_stop_the_agent() {
+        let mut app = guarded_agent_app("stagnant");
+        for round in 0..3 {
+            feed(
+                &mut app,
+                vec![tool_call_event(
+                    &format!("c{round}"),
+                    "write_file",
+                    r#"{"path":"x","content":"y"}"#,
+                )],
+            );
+            app.receive_token().await;
+        }
+
+        // Third identical failing round: the stagnation guard stops the run.
+        assert!(!app.streaming);
+        assert_eq!(app.agent_iterations, 0);
+        assert!(app.cells.iter().any(|c| matches!(
+            c,
+            Cell::Notice(text) if text.contains("not making progress")
+        )));
+    }
+
+    #[tokio::test]
+    async fn consecutive_failing_rounds_stop_the_agent() {
+        let mut app = guarded_agent_app("failing");
+        // A different call each round keeps the stagnation guard quiet;
+        // every round still fails (read-only permission).
+        for round in 0..4 {
+            feed(
+                &mut app,
+                vec![tool_call_event(
+                    &format!("c{round}"),
+                    "write_file",
+                    &format!(r#"{{"path":"f{round}","content":"y"}}"#),
+                )],
+            );
+            app.receive_token().await;
+        }
+
+        assert!(!app.streaming);
+        assert!(app.cells.iter().any(|c| matches!(
+            c,
+            Cell::Notice(text) if text.contains("consecutive rounds failed")
+        )));
     }
 }
