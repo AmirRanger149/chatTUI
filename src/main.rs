@@ -6,14 +6,17 @@ mod code;
 mod config;
 mod session;
 mod app;
+mod instructions;
 mod ui;
 
 use anyhow::{Context, Result};
 use app::App;
 use config::Config;
 use crossterm::{
+    cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
+    style::ResetColor,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -30,6 +33,10 @@ async fn main() -> Result<()> {
     let mut app = App::new(config, sessions);
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal, &mut app).await;
+    // A session is its own process session, so it would survive chatTUI and
+    // leave the user with a dev server they did not ask to keep. Kill them
+    // first, while the terminal is still ours and errors can be reported.
+    app.sandbox.sessions.kill_all();
     restore_terminal(&mut terminal)?;
     result
 }
@@ -63,6 +70,12 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
     loop {
         app.receive_token().await;
         app.receive_models();
+        // A tool ran since the last frame: make sure the terminal is still
+        // ours before drawing into it. See `reassert_terminal`.
+        if app.terminal_dirty {
+            app.terminal_dirty = false;
+            reassert_terminal()?;
+        }
         terminal.draw(|frame| ui::render(frame, app))?;
 
         if event::poll(Duration::from_millis(50))? {
@@ -211,6 +224,58 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             None => {}
     }
 
+    // An approval prompt owns the keyboard until it is answered: y, a and n
+    // are answers here, and letting them through would put stray letters in
+    // the composer while the agent waits.
+    if app.awaiting_approval.is_some() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                app.resolve_approval(app::Approval::Once)
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                app.resolve_approval(app::Approval::Always)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                app.resolve_approval(app::Approval::Deny)
+            }
+            _ => {}
+        }
+        return true;
+    }
+
+    // A question is on screen: digits pick an option. Everything else still
+    // belongs to the composer, because typing an answer is the other half of
+    // the interaction.
+    let picked = app
+        .awaiting_questions
+        .as_ref()
+        .and_then(|pending| match key.code {
+            KeyCode::Char(digit @ '1'..='9') => {
+                let index = pending.current.min(pending.questions.len().saturating_sub(1));
+                let option = digit as usize - '1' as usize;
+                pending
+                    .questions
+                    .get(index)
+                    .and_then(|question| question.options.get(option))
+                    .map(|option| option.label.clone())
+            }
+            _ => None,
+        });
+    if let Some(label) = picked {
+        app.answer_current_question(label);
+        return true;
+    }
+    // Enter answers with whatever is in the composer; an empty composer is
+    // not an answer, so it is swallowed rather than sent as a message.
+    if app.awaiting_questions.is_some() && key.code == KeyCode::Enter {
+        let text = app.composer.clone();
+        if !text.trim().is_empty() {
+            app.clear_composer();
+            app.answer_current_question(text);
+        }
+        return true;
+    }
+
     // Transcript scrolling (only when no overlay is open): pgup moves the
     // view up toward older messages, pgdn back down to the newest ones.
     match key.code {
@@ -269,6 +334,30 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         _ => {}
     }
     true
+}
+
+/// Put the terminal back into the exact state chatTUI needs.
+///
+/// A command the agent runs has no controlling terminal and its captured
+/// output is stripped of control sequences, so nothing it does should reach
+/// this terminal. This is the belt to those braces: the failure mode it
+/// prevents is a session left in canonical mode with the cursor hidden,
+/// which is unrecoverable without killing the process, and the cost is a few
+/// terminal writes after a tool call.
+///
+/// Every part is idempotent, and the transcript is redrawn in full on the
+/// next frame, so re-asserting state that is already correct is invisible.
+fn reassert_terminal() -> Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        cursor::Show,
+        event::EnableBracketedPaste,
+        event::DisableMouseCapture,
+        ResetColor
+    )?;
+    Ok(())
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {

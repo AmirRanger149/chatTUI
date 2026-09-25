@@ -14,6 +14,15 @@
 //!      which only OS primitives such as `openat2` could close portably.
 //!    - The permission layer ([`permissions::PermissionMode`]) gates which
 //!      tool *classes* may run at all.
+//!    - A command never gets the user's terminal: stdin is `/dev/null`,
+//!      stdout/stderr are pipes, and the child runs in its own **session**
+//!      (`setsid`), so it has no controlling terminal and `/dev/tty` cannot
+//!      be opened. Without this, a single `cargo run` of a TUI would put the
+//!      real terminal into raw mode and the alternate screen, and being
+//!      killed at the timeout would leave it that way. Captured output is
+//!      also stripped of terminal control sequences (see [`ansi`]) before it
+//!      reaches the transcript, so escape bytes cannot be replayed at the
+//!      user's terminal either.
 //!    - `bash` refuses commands that *name* sensitive files and keeps a tiny
 //!      advisory denylist — both are string scans and both are trivially
 //!      bypassable; they are foot-gun guards, never security controls.
@@ -50,12 +59,15 @@
 //! **workspace-restricted tool execution** — never as a sandbox — unless
 //! kernel isolation is verified active.
 
+pub(crate) mod ansi;
 pub mod os_isolation;
+pub(crate) mod patch;
+pub(crate) mod sessions;
 pub mod permissions;
 
 use crate::api::types::ToolCall;
 use crate::sandbox::os_isolation::OsIsolation;
-use crate::sandbox::permissions::{authorize, PermissionMode, ToolKind};
+use crate::sandbox::permissions::{authorize, Gate, PermissionMode, ToolKind};
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::ffi::OsStr;
@@ -71,7 +83,13 @@ pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 30;
 /// configured (or tricked) into blocking forever.
 pub const MIN_SHELL_TIMEOUT_SECS: u64 = 1;
 /// Tool output larger than this is truncated before it reaches the model.
-const MAX_TOOL_OUTPUT_BYTES: usize = 20_000;
+/// Visible to [`crate::instructions`] so the prompt quotes the real budget
+/// instead of a number that can drift away from it.
+pub(crate) const MAX_TOOL_OUTPUT_BYTES: usize = 20_000;
+
+/// Upper bound for a per-call shell timeout. A build longer than this wants a
+/// session, not a longer timer.
+pub const MAX_SHELL_TIMEOUT_SECS: u64 = 1800;
 
 /// Default line window for ranged reads. Reading files window by window
 /// keeps a 10,000-line file from flooding the conversation context — the
@@ -136,11 +154,102 @@ impl SandboxConfig {
 #[derive(Debug, Clone)]
 pub struct Sandbox {
     pub config: SandboxConfig,
+    /// What the user has already approved this session: tool names for file
+    /// tools, command prefixes for shell. Approving one `git push` covers the
+    /// next, so an ask-mode stays usable without a prompt per command.
+    pub allowances: Vec<String>,
+    /// Commands still running from an earlier tool call. Shared behind an
+    /// `Arc` so a session started in one round is reachable from the next.
+    pub sessions: sessions::Sessions,
+}
+
+/// The permission layer's verdict on one call, plus the line to show the
+/// user when the verdict is "ask".
+#[derive(Debug, Clone)]
+pub struct CallVerdict {
+    pub gate: Gate,
+    /// What the call would do, in one line.
+    pub summary: String,
 }
 
 impl Sandbox {
     pub fn new(config: SandboxConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            allowances: Vec::new(),
+            sessions: sessions::Sessions::new(),
+        }
+    }
+
+    /// Remember an approval for the rest of the session.
+    pub fn allow(&mut self, key: String) {
+        if !self.allowances.contains(&key) {
+            self.allowances.push(key);
+        }
+    }
+
+    /// A copy of this sandbox with kernel isolation switched off, for the one
+    /// call the user has just agreed to run unconfined. Nothing else about it
+    /// changes: the workspace restriction, the sensitive-file policy and the
+    /// permission mode all still apply.
+    pub fn without_isolation(&self) -> Sandbox {
+        let mut unconfined = self.clone();
+        unconfined.config.os_isolation = OsIsolation::Off;
+        unconfined
+    }
+
+    /// Forget every approval — used when the mode changes.
+    pub fn clear_allowances(&mut self) {
+        self.allowances.clear();
+    }
+
+    /// The key an approval for `tool_call` would be remembered under.
+    pub fn allowance_key_for(&self, tool_call: &ToolCall) -> String {
+        let args: Value = serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
+        crate::sandbox::permissions::allowance_key(&tool_call.name, args["command"].as_str())
+    }
+
+    /// Ask the permission layer what would happen to `tool_call`, without
+    /// running it. `allow_once` is an approval granted for a single attempt,
+    /// so "allow this one" does not have to be remembered anywhere.
+    pub fn gate_call(&self, tool_call: &ToolCall, allow_once: Option<&str>) -> CallVerdict {
+        let kind = match ToolKind::from_tool_name(&tool_call.name) {
+            Some(kind) => kind,
+            None => {
+                return CallVerdict {
+                    gate: Gate::Deny {
+                        reason: format!("unknown tool: {}", tool_call.name),
+                    },
+                    summary: tool_call.name.clone(),
+                }
+            }
+        };
+        // Unparseable arguments are reported by `execute_tool`; the gate only
+        // needs the command for its lookup, and treats missing arguments as
+        // "no command" rather than guessing.
+        let args: Value = serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
+        let command = args["command"].as_str();
+        let target = args["path"]
+            .as_str()
+            .or_else(|| args["session_id"].as_str());
+        let allowed: Vec<String> = match allow_once {
+            Some(key) => {
+                let mut allowed = self.allowances.clone();
+                allowed.push(key.to_string());
+                allowed
+            }
+            None => self.allowances.clone(),
+        };
+        CallVerdict {
+            gate: crate::sandbox::permissions::gate(
+                self.config.permission_mode,
+                kind,
+                &tool_call.name,
+                command,
+                &allowed,
+            ),
+            summary: crate::sandbox::permissions::describe_call(&tool_call.name, command, target),
+        }
     }
 
     #[allow(dead_code)] // test helper; not used by the app itself
@@ -347,6 +456,71 @@ impl Sandbox {
         }
     }
 
+    /// Apply a patch document: several files, all or nothing.
+    ///
+    /// Unlike `edit_file`, which fails the moment one exact string does not
+    /// match, a patch is *planned* in full against the current contents of
+    /// every file it touches and only then written. A hunk that does not
+    /// apply therefore changes nothing at all, instead of leaving the tree
+    /// half-edited.
+    ///
+    /// Path resolution, the sensitive-file policy and the permission mode
+    /// are checked for every path up front, so a patch cannot use one
+    /// allowed file to smuggle a forbidden one past the first write.
+    pub async fn apply_patch(&self, text: &str) -> Result<String> {
+        self.authorize(ToolKind::Edit)?;
+        let parsed = patch::parse(text)?;
+
+        // Resolve and policy-check every path before reading anything.
+        let mut targets: Vec<(String, PathBuf)> = Vec::new();
+        for op in &parsed.ops {
+            let raw = match op {
+                patch::FileOp::Add { path, .. }
+                | patch::FileOp::Update { path, .. }
+                | patch::FileOp::Delete { path } => path,
+            };
+            let full = self.resolve_path(raw)?;
+            self.check_access(&full, Access::Write)?;
+            if !targets.iter().any(|(known, _)| known == raw) {
+                targets.push((raw.clone(), full));
+            }
+        }
+
+        // Snapshot what is there now; the planner is pure and reads through
+        // this closure.
+        let mut current: Vec<(String, Option<String>)> = Vec::with_capacity(targets.len());
+        for (raw, full) in &targets {
+            current.push((raw.clone(), fs::read_to_string(full).await.ok()));
+        }
+        let planned = patch::plan(&parsed, |path| {
+            current
+                .iter()
+                .find(|(known, _)| known == path)
+                .and_then(|(_, contents)| contents.clone())
+        })?;
+
+        // Everything is validated; now write.
+        for file in &planned {
+            let full = targets
+                .iter()
+                .find(|(known, _)| *known == file.path)
+                .map(|(_, full)| full.clone())
+                .ok_or_else(|| anyhow!("patch planned a path that was not checked: {}", file.path))?;
+            match &file.content {
+                Some(text) => {
+                    if let Some(parent) = full.parent() {
+                        fs::create_dir_all(parent).await.context("creating parent dirs")?;
+                    }
+                    fs::write(&full, text).await.context("writing file")?;
+                }
+                None => {
+                    fs::remove_file(&full).await.context("deleting file")?;
+                }
+            }
+        }
+        Ok(patch::format_report(&planned))
+    }
+
     pub async fn edit_file(&self, path: &str, old_string: &str, new_string: &str) -> Result<String> {
         self.authorize(ToolKind::Edit)?;
         let full = self.resolve_path(path)?;
@@ -402,8 +576,9 @@ impl Sandbox {
     /// Run a shell command. **Read the module docs first.** What this method
     /// actually guarantees:
     /// - the workspace root is the command's current directory (cwd only);
-    /// - the command runs in its own process group and is killed — group
-    ///   included — when the configured timeout expires;
+    /// - the command runs in its own session and process group, with no
+    ///   controlling terminal, and is killed — tree included — when the
+    ///   configured timeout expires;
     /// - the environment is reduced to [`ENV_ALLOWLIST`], so API keys and
     ///   other credentials are not inherited;
     /// - commands that name sensitive files are refused (best effort);
@@ -421,8 +596,21 @@ impl Sandbox {
     ///   output and `require` mode refuses to run; neither pretends the
     ///   command was confined, and neither can panic the worker.
     pub async fn bash(&self, command: &str) -> Result<String> {
+        self.bash_timed(command, None).await
+    }
+
+    /// `bash` with a per-call timeout.
+    ///
+    /// A model that knows it is about to run a full release build should be
+    /// able to say so, instead of the command being killed at the default and
+    /// the model concluding the build is broken. Clamped, because an unbounded
+    /// timeout is a hung round.
+    pub async fn bash_timed(&self, command: &str, timeout_secs: Option<u64>) -> Result<String> {
         let cmd = self.prepare_shell(command)?;
-        let timeout = self.config.effective_shell_timeout();
+        let timeout = match timeout_secs {
+            Some(secs) => Duration::from_secs(secs.clamp(1, MAX_SHELL_TIMEOUT_SECS)),
+            None => self.config.effective_shell_timeout(),
+        };
 
         #[cfg(unix)]
         {
@@ -461,7 +649,7 @@ impl Sandbox {
                         kill_process_group(pid as u32).await;
                     }
                     return Err(anyhow!(
-                        "command timed out after {}s and was killed: {}",
+                        "command timed out after {}s and was killed: {}\n\nThere is no terminal here: stdin is /dev/null and the command has no controlling tty, so an interactive program (an editor, a pager, a TUI app, ssh, sudo, a dev server) cannot work and will only ever reach this timeout. Use a non-interactive equivalent — a build, a test run, `--help`, or the program's headless flags — or a command that exits on its own.",
                         timeout.as_secs(),
                         cmd
                     ));
@@ -469,7 +657,19 @@ impl Sandbox {
             };
 
             let outcome = outcome.map_err(|error| anyhow!("{error}"))?;
-            Ok(format_shell_parts(&outcome.stdout, &outcome.stderr, &outcome.status_text))
+            let output =
+                format_shell_parts(&outcome.stdout, &outcome.stderr, &outcome.status_text);
+            // Deliberately a heuristic, and deliberately checked here rather
+            // than by the caller: this is the one place that still knows both
+            // the exit status and whether isolation was actually applied. A
+            // false positive costs the user one question; a false negative
+            // costs the three-round retry loop the stagnation guard exists to
+            // kill.
+            let failed = !outcome.status_text.contains("exit status: 0");
+            if failed && mode != OsIsolation::Off && contains_denial_marker(&output) {
+                return Ok(format!("{output}\n{SANDBOX_DENIAL_MARKER}"));
+            }
+            Ok(output)
         }
 
         #[cfg(not(unix))]
@@ -488,6 +688,84 @@ impl Sandbox {
             let _ = timeout; // no timeout on this platform yet; documented gap
             Ok(format_shell_output(output))
         }
+    }
+
+    /// Start a command that keeps running after this call returns.
+    ///
+    /// The command is spawned exactly as a one-shot `bash` would be — filtered
+    /// environment, own session, kernel isolation — so this buys time, not
+    /// privilege.
+    pub async fn bash_session(&self, command: &str, yield_ms: u64) -> Result<String> {
+        let cmd = self.prepare_shell(command)?.to_string();
+        let workspace = self.config.workspace_root.clone();
+        #[cfg(unix)]
+        let roots = os_isolation::writable_roots(&workspace);
+        #[cfg(unix)]
+        let mode = self.config.os_isolation;
+
+        let (child, stdin, output) = {
+            #[cfg(unix)]
+            let mut builder =
+                shell_builder(&cmd, &workspace, mode, &roots, std::process::Stdio::piped());
+            // No kernel isolation on this platform; the workspace restriction
+            // and the filtered environment still apply.
+            #[cfg(not(unix))]
+            let mut builder = {
+                let mut builder = std::process::Command::new("sh");
+                builder
+                    .arg("-c")
+                    .arg(&cmd)
+                    .current_dir(&workspace)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true);
+                builder
+            };
+            let mut child = builder
+                .spawn()
+                .map_err(|error| anyhow!("spawning sh: {error}"))?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("stdin unavailable"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("stdout unavailable"))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| anyhow!("stderr unavailable"))?;
+            let output: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+                std::sync::Arc::default();
+            sessions::spawn_pipe_reader(stdout, output.clone());
+            sessions::spawn_pipe_reader(stderr, output.clone());
+            (child, stdin, output)
+        };
+        // `insert` kills the command if it refuses it (too many sessions
+        // alive), so a rejected start never leaves an unreachable process.
+        let id = self.sessions.insert(child, stdin, cmd, output)?;
+        let report = self
+            .sessions
+            .wait_and_report(&id, std::time::Duration::from_millis(yield_ms))
+            .await?;
+        Ok(format_session_report(&id, &report, true))
+    }
+
+    /// Send input to a running session and return whatever it printed next.
+    pub async fn session_input(&self, id: &str, input: &str, yield_ms: u64) -> Result<String> {
+        self.sessions.write(id, input)?;
+        let report = self
+            .sessions
+            .wait_and_report(id, std::time::Duration::from_millis(yield_ms))
+            .await?;
+        Ok(format_session_report(id, &report, false))
+    }
+
+    /// Kill one running session.
+    pub fn kill_session(&self, id: &str) -> Result<String> {
+        self.sessions.kill(id)
     }
 
     /// Shared pre-flight checks for shell execution; returns the trimmed
@@ -557,10 +835,15 @@ impl Sandbox {
 
     /// Execute a ToolCall by name, after the permission layer approves the
     /// tool's capability class.
-    pub async fn execute_tool(&self, tool_call: &ToolCall) -> Result<String> {
-        let kind = ToolKind::from_tool_name(&tool_call.name)
-            .ok_or_else(|| anyhow!("unknown tool: {}", tool_call.name))?;
-        self.authorize(kind)?;
+    /// `allow_once` is an approval granted for a single attempt. It has to be
+    /// handed down rather than looked up: an "allow this one" answer lives in
+    /// the caller, not in the session's remembered approvals, and re-gating
+    /// without it denies the call the user just said yes to.
+    pub async fn execute_tool(
+        &self,
+        tool_call: &ToolCall,
+        allow_once: Option<&str>,
+    ) -> Result<String> {
         // Never silently fall back to empty arguments: unparseable JSON
         // almost always means the call was truncated mid-stream, and the
         // model deserves an error that says so (and how to recover).
@@ -572,7 +855,40 @@ impl Sandbox {
                 ));
             }
         };
+        // Decided here, once, with the session's approvals *and* any approval
+        // granted for this one attempt — rather than inside each tool, where
+        // an approval the user just gave would be denied a second time.
+        match self.gate_call(tool_call, allow_once).gate {
+            Gate::Allow => {}
+            Gate::Deny { reason } => {
+                return Err(anyhow!(
+                    "permission denied: {reason}. {}",
+                    self.config.permission_mode.remedy()
+                ))
+            }
+            Gate::Ask { reason } => {
+                // Spell out what the gate saw. "permission denied" alone tells
+                // nobody whether the user was never asked, the answer was lost
+                // on the way here, or the key simply did not match.
+                let key = self.allowance_key_for(tool_call);
+                return Err(anyhow!(
+                    "permission denied: {reason}, and this call was not approved \
+                     (mode {}, approval key '{key}', remembered approvals: [{}], \
+                     one-time approval: {})",
+                    self.config.permission_mode.as_str(),
+                    if self.allowances.is_empty() {
+                        "none".to_string()
+                    } else {
+                        self.allowances.join(", ")
+                    },
+                    allow_once.unwrap_or("none"),
+                ));
+            }
+        }
         match tool_call.name.as_str() {
+            "ask_user" => Err(anyhow!(
+                "ask_user is answered by the client, not by the sandbox"
+            )),
             "read_file" => {
                 let path = args["path"].as_str().ok_or_else(|| anyhow!("missing path"))?;
                 let offset = args["offset"].as_u64().map(|v| v as usize).unwrap_or(1);
@@ -597,9 +913,32 @@ impl Sandbox {
                 let path = args["path"].as_str().unwrap_or(".");
                 self.list_files(path).await
             }
+            "apply_patch" => {
+                let text = args["patch"].as_str().ok_or_else(|| anyhow!("missing patch"))?;
+                self.apply_patch(text).await
+            }
             "bash" => {
                 let cmd = args["command"].as_str().ok_or_else(|| anyhow!("missing command"))?;
-                self.bash(cmd).await
+                if args["session"].as_bool().unwrap_or(false) {
+                    let yield_ms = args["yield_time_ms"].as_u64().unwrap_or(10_000);
+                    return self.bash_session(cmd, yield_ms).await;
+                }
+                let timeout_secs = args["timeout_secs"].as_u64();
+                self.bash_timed(cmd, timeout_secs).await
+            }
+            "write_stdin" => {
+                let id = args["session_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing session_id"))?;
+                let input = args["input"].as_str().unwrap_or("");
+                let yield_ms = args["yield_time_ms"].as_u64().unwrap_or(5_000);
+                self.session_input(id, input, yield_ms).await
+            }
+            "kill_session" => {
+                let id = args["session_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing session_id"))?;
+                self.kill_session(id)
             }
             other => Err(anyhow!("unknown tool: {}", other)),
         }
@@ -760,14 +1099,20 @@ struct ShellOutcome {
 /// clean errors here (std plumbs `pre_exec` errors through its spawn-error
 /// channel); auto-mode failures are announced by the child on stderr.
 #[cfg(unix)]
-fn run_shell_process(
+/// Build the `sh -c` command with chatTUI's environment filtering, its own
+/// session, and kernel isolation.
+///
+/// Shared by the one-shot path and by long-running sessions on purpose: the
+/// `setsid` and `pre_exec` blocks below are the reason a command cannot take
+/// over the user's terminal, and two copies of them would eventually disagree.
+#[cfg(unix)]
+fn shell_builder(
     cmd: &str,
     workspace: &Path,
-    pid_slot: &AtomicI32,
     isolation: OsIsolation,
     writable_roots: &[PathBuf],
-) -> Result<ShellOutcome, String> {
-    use std::io::Read;
+    stdin: Stdio,
+) -> std::process::Command {
     use std::os::unix::process::CommandExt;
 
     let mut builder = std::process::Command::new("sh");
@@ -775,7 +1120,7 @@ fn run_shell_process(
         .arg("-c")
         .arg(cmd)
         .current_dir(workspace)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear();
@@ -809,9 +1154,24 @@ fn run_shell_process(
     //   included — that is inherent to unprivileged same-uid sandboxing
     //   (the agent can always read /proc and find the pid) and is called
     //   out in the module security-model docs.
+    // Own *session*, not merely an own process group.
+    //
+    // `setpgid` alone leaves the command attached to chatTUI's controlling
+    // terminal, so anything the agent runs can open `/dev/tty` and take the
+    // real terminal over: a TUI or an editor switches to the alternate
+    // screen, hides the cursor and puts the terminal into raw mode, and when
+    // the command is killed at the timeout it never restores any of it.
+    // `setsid` detaches the controlling terminal, which makes that open fail
+    // — an interactive program simply cannot run, instead of silently
+    // destroying the session it was launched from.
+    //
+    // It also makes the child its own session and process-group leader
+    // (pgid == pid), which is exactly what the timeout kill targets, so the
+    // whole process tree is still taken down. `setpgid` stays as the
+    // fallback for the rare kernel that refuses `setsid` here.
     unsafe {
         builder.pre_exec(|| {
-            if libc::setpgid(0, 0) != 0 {
+            if libc::setsid() == -1 && libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -826,6 +1186,20 @@ fn run_shell_process(
             });
         }
     }
+    builder
+}
+
+#[cfg(unix)]
+fn run_shell_process(
+    cmd: &str,
+    workspace: &Path,
+    pid_slot: &AtomicI32,
+    isolation: OsIsolation,
+    writable_roots: &[PathBuf],
+) -> Result<ShellOutcome, String> {
+    use std::io::Read;
+
+    let mut builder = shell_builder(cmd, workspace, isolation, writable_roots, Stdio::null());
 
     let mut child = match builder.spawn() {
         Ok(child) => child,
@@ -869,9 +1243,82 @@ fn run_shell_process(
     Ok(ShellOutcome { stdout, stderr, status_text: status.to_string() })
 }
 
+/// Appended to shell output when the kernel sandbox looks like the reason the
+/// command failed. The caller strips it before the output is shown or stored;
+/// it exists only to turn "the sandbox said no" into a question instead of an
+/// error the model will retry three times. Control characters keep it from
+/// colliding with anything a program would actually print.
+pub const SANDBOX_DENIAL_MARKER: &str = "\u{1}sandbox-denial\u{1}";
+
+/// Render one look at a session for the model.
+///
+/// The state matters more than the text: a model that cannot tell "still
+/// running" from "finished with no output" will either wait forever or assume
+/// success.
+fn format_session_report(
+    id: &str,
+    report: &sessions::SessionReport,
+    started: bool,
+) -> String {
+    let head = if started {
+        format!(
+            "session {id} started ({}s of output below). It is still running: use write_stdin to send it input, or ask for more output later.",
+            report.running_for.as_secs()
+        )
+    } else {
+        format!("session {id}, {}s in.", report.running_for.as_secs())
+    };
+    let state = match &report.exited {
+        Some(status) => format!("It has now exited ({status})."),
+        None => "It is still running.".to_string(),
+    };
+    let body = if report.output.trim().is_empty() {
+        "(no output yet)".to_string()
+    } else {
+        report.output.clone()
+    };
+    let truncated = if report.truncated {
+        "\n(output shortened — the beginning and the end were kept)"
+    } else {
+        ""
+    };
+    format!("{head}\n\n{body}{truncated}\n\n{state}")
+}
+
+/// Phrases that mean "the kernel refused this", as opposed to the program
+/// failing on its own merits. The first two are filesystem denials (Landlock);
+/// the rest are what a blocked `socket()` looks like from the programs that
+/// hit it most often — cargo, npm, pip, curl, git.
+const SANDBOX_DENIAL_MARKERS: [&str; 6] = [
+    "permission denied",
+    "operation not permitted",
+    "network is unreachable",
+    "address family not supported by protocol",
+    "temporary failure in name resolution",
+    "couldn't connect to server",
+];
+
+fn contains_denial_marker(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    SANDBOX_DENIAL_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+/// Remove the denial marker, and the newline it was appended with.
+pub fn strip_denial_marker(output: &str) -> String {
+    output.replace(&format!("\n{SANDBOX_DENIAL_MARKER}"), "")
+}
+
 fn format_shell_parts(stdout: &[u8], stderr: &[u8], status_text: &str) -> String {
-    let stdout = String::from_utf8_lossy(stdout);
-    let stderr = String::from_utf8_lossy(stderr);
+    // Strip terminal control sequences before anything else. These bytes were
+    // written by a program that may believe it owns a terminal — a TUI, a
+    // coloured build log, a progress bar — and displaying them verbatim in
+    // the transcript would hand the user's terminal to whatever the agent
+    // last ran. Stripping first also means the byte budget below is spent on
+    // real content rather than on escapes.
+    let stdout = ansi::strip(&String::from_utf8_lossy(stdout));
+    let stderr = ansi::strip(&String::from_utf8_lossy(stderr));
     let mut result = String::new();
     if !stdout.is_empty() {
         result.push_str(&stdout);
@@ -886,16 +1333,71 @@ fn format_shell_parts(stdout: &[u8], stderr: &[u8], status_text: &str) -> String
         result = format!("(command exited with status {status_text})");
     }
     if result.len() > MAX_TOOL_OUTPUT_BYTES {
-        // Byte-truncating a String can split a multi-byte character and
-        // panic; back off to the nearest char boundary.
-        let mut cut = MAX_TOOL_OUTPUT_BYTES;
-        while !result.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        result.truncate(cut);
-        result.push_str("\n... truncated");
+        result = keep_head_and_tail(&result, MAX_TOOL_OUTPUT_BYTES);
     }
     result
+}
+
+/// Largest byte index at or before `index` that falls on a char boundary.
+/// Slicing a `str` anywhere else panics, and tool output is arbitrary bytes
+/// from an arbitrary program.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut at = index;
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// Smallest byte index at or after `index` that falls on a char boundary.
+fn ceil_char_boundary(text: &str, index: usize) -> usize {
+    let mut at = index.min(text.len());
+    while at < text.len() && !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
+/// Keep the beginning and the end of a long output, dropping the middle.
+///
+/// Cutting only the end deletes exactly the part that matters: a build or a
+/// test run reports its failure last, so head-only truncation hands the model
+/// a log whose conclusion was removed, and it retries blind. Half the budget
+/// goes to each end, cut on line boundaries where possible, with a marker
+/// saying how much was dropped — so nobody has to guess whether what they are
+/// reading is the whole output.
+pub(crate) fn keep_head_and_tail(input: &str, budget: usize) -> String {
+    const MARKER: &str = "output truncated: ";
+    // Room for the marker, the dropped-byte count and the newlines.
+    let usable = budget.saturating_sub(MARKER.len() + 40).max(256);
+    let half = usable / 2;
+
+    let mut head_end = floor_char_boundary(input, half);
+    if let Some(newline) = input[..head_end].rfind('\n') {
+        head_end = newline + 1;
+    }
+    let mut tail_from = ceil_char_boundary(input, input.len().saturating_sub(usable - half));
+    if let Some(offset) = input[tail_from..].find('\n') {
+        tail_from += offset + 1;
+    }
+
+    if tail_from <= head_end || tail_from >= input.len() {
+        // Degenerate: the budget is too small to split, or the tail window
+        // landed past the end. Keep the head and say so.
+        let cut = floor_char_boundary(input, usable);
+        let dropped = input.len() - cut;
+        return format!("{}\n{MARKER}{dropped} bytes dropped", &input[..cut]);
+    }
+
+    let dropped = tail_from - head_end;
+    format!(
+        "{}\n{MARKER}{dropped} bytes dropped …\n{}",
+        &input[..head_end],
+        &input[tail_from..]
+    )
 }
 
 /// Best-effort SIGKILL for a whole process group. Uses the shell builtin so
@@ -1476,11 +1978,11 @@ mod tests {
         let sandbox = Sandbox::new(cfg);
 
         let unknown = ToolCall::new("1", "rm_file", "{}");
-        let err = sandbox.execute_tool(&unknown).await.unwrap_err();
+        let err = sandbox.execute_tool(&unknown, None).await.unwrap_err();
         assert!(err.to_string().contains("unknown tool"));
 
         let bash = ToolCall::new("2", "bash", r#"{"command":"echo hi"}"#);
-        let err = sandbox.execute_tool(&bash).await.unwrap_err();
+        let err = sandbox.execute_tool(&bash, None).await.unwrap_err();
         assert!(err.to_string().contains("permission denied"));
     }
 
@@ -1489,11 +1991,11 @@ mod tests {
         let dir = unique_root("dispatch-ok");
         let sandbox = Sandbox::with_root(dir);
         let write = ToolCall::new("1", "write_file", r#"{"path":"a.txt","content":"hello"}"#);
-        sandbox.execute_tool(&write).await.unwrap();
+        sandbox.execute_tool(&write, None).await.unwrap();
         let read = ToolCall::new("2", "read_file", r#"{"path":"a.txt"}"#);
-        assert_eq!(sandbox.execute_tool(&read).await.unwrap(), "hello");
+        assert_eq!(sandbox.execute_tool(&read, None).await.unwrap(), "hello");
         let list = ToolCall::new("3", "list_files", "{}");
-        assert!(sandbox.execute_tool(&list).await.unwrap().contains("a.txt"));
+        assert!(sandbox.execute_tool(&list, None).await.unwrap().contains("a.txt"));
     }
 
     #[tokio::test]
@@ -1502,7 +2004,7 @@ mod tests {
         let sandbox = Sandbox::with_root(dir);
         // Unterminated JSON — what a stream cut mid-arguments leaves behind.
         let call = ToolCall::new("1", "read_file", r#"{"path": "#);
-        let err = sandbox.execute_tool(&call).await.unwrap_err();
+        let err = sandbox.execute_tool(&call, None).await.unwrap_err();
         assert!(err.to_string().contains("truncated"), "unexpected: {err}");
     }
 
@@ -1559,6 +2061,55 @@ mod tests {
         assert_eq!(out, "edited a.txt (+2 -1)");
     }
 
+    #[tokio::test]
+    async fn apply_patch_writes_several_files_at_once() {
+        let dir = unique_root("patch-multi");
+        fs::write(dir.join("a.txt"), "alpha\n").await.unwrap();
+        let sandbox = Sandbox::with_root(dir.clone());
+
+        let out = sandbox
+            .apply_patch(
+                "*** Begin Patch\n\
+                 *** Add File: nested/b.txt\n+beta\n\
+                 *** Update File: a.txt\n-alpha\n+alpha2\n\
+                 *** End Patch",
+            )
+            .await
+            .unwrap();
+        assert!(out.contains("added nested/b.txt (+1 -0)"), "{out}");
+        assert!(out.contains("updated a.txt (+1 -1)"), "{out}");
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).await.unwrap(), "alpha2\n");
+        assert_eq!(
+            fs::read_to_string(dir.join("nested/b.txt")).await.unwrap(),
+            "beta\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_patch_refuses_to_escape_the_workspace() {
+        let dir = unique_root("patch-escape");
+        let sandbox = Sandbox::with_root(dir);
+        let error = sandbox
+            .apply_patch("*** Begin Patch\n*** Add File: ../outside.txt\n+x\n*** End Patch")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("escapes workspace"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn apply_patch_in_read_only_mode_is_denied() {
+        let dir = unique_root("patch-readonly");
+        let mut cfg = SandboxConfig::default();
+        cfg.workspace_root = dir.canonicalize().unwrap();
+        cfg.permission_mode = PermissionMode::ReadOnly;
+        let sandbox = Sandbox::new(cfg);
+        let error = sandbox
+            .apply_patch("*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("permission denied"), "{error}");
+    }
+
     #[test]
     fn output_truncation_never_panics_on_multibyte_boundaries() {
         let mut stdout = Vec::new();
@@ -1567,7 +2118,40 @@ mod tests {
             stdout.extend_from_slice("é".as_bytes());
         }
         let truncated = format_shell_parts(&stdout, &[], "0");
-        assert!(truncated.len() <= MAX_TOOL_OUTPUT_BYTES + "\n... truncated".len());
-        assert!(truncated.ends_with("... truncated"));
+        assert!(
+            truncated.len() <= MAX_TOOL_OUTPUT_BYTES + 64,
+            "grew past the budget: {}",
+            truncated.len()
+        );
+        assert!(truncated.contains("output truncated"));
+    }
+
+    #[test]
+    fn output_truncation_keeps_the_end_where_the_failure_is() {
+        // A build log: the reason it failed is the last line, which is
+        // exactly what head-only truncation deletes.
+        let mut body = String::from("first line of the log\n");
+        while body.len() < MAX_TOOL_OUTPUT_BYTES * 2 {
+            body.push_str("compiling something\n");
+        }
+        body.push_str("error[E0308]: mismatched types — the actual failure\n");
+
+        let truncated = format_shell_parts(body.as_bytes(), &[], "0");
+        assert!(truncated.starts_with("first line of the log"), "head lost");
+        assert!(
+            truncated.contains("the actual failure"),
+            "the failure at the end was truncated away"
+        );
+        assert!(truncated.contains("output truncated"), "marker missing");
+        assert!(
+            truncated.len() <= MAX_TOOL_OUTPUT_BYTES + 64,
+            "grew past the budget: {}",
+            truncated.len()
+        );
+    }
+
+    #[test]
+    fn short_output_is_never_marked_truncated() {
+        assert_eq!(format_shell_parts(b"all good\n", &[], "0"), "all good\n");
     }
 }

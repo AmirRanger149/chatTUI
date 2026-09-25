@@ -104,6 +104,26 @@ pub struct CustomProvider {
     pub model: Option<String>,
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn default_context_window_tokens() -> u64 {
+    128_000
+}
+
+fn is_default_context_window_tokens(value: &u64) -> bool {
+    *value == default_context_window_tokens()
+}
+
+fn default_compact_at_percent() -> u8 {
+    80
+}
+
+fn is_default_compact_at_percent(value: &u8) -> bool {
+    *value == default_compact_at_percent()
+}
+
 fn default_temperature() -> f32 {
     0.7
 }
@@ -192,6 +212,40 @@ pub struct Config {
     pub temperature: f32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
+    /// How a model's reasoning is treated on replay: `"strip"` (default)
+    /// removes it before sending history back, `"opaque"` sends it back
+    /// untouched, `"auto"` picks per provider. See `ReasoningReplay`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_replay: Option<String>,
+    /// Context window size in tokens, used to decide when to compact. Only a
+    /// fallback estimate is possible without it, so it is worth setting to
+    /// your model's real number.
+    #[serde(
+        default = "default_context_window_tokens",
+        skip_serializing_if = "is_default_context_window_tokens"
+    )]
+    pub context_window_tokens: u64,
+    /// Compact the history once it passes this percentage of
+    /// `context_window_tokens`.
+    #[serde(
+        default = "default_compact_at_percent",
+        skip_serializing_if = "is_default_compact_at_percent"
+    )]
+    pub compact_at_percent: u8,
+    /// Token budget for extended thinking, where the provider supports it
+    /// (Anthropic). Unset means do not request it — and then there is no
+    /// thinking block to round-trip either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget_tokens: Option<u32>,
+    /// Cap on how many tokens the model may emit in ONE response. `0` (the
+    /// default) sends no cap at all, so the provider applies its own default
+    /// — and provider defaults are commonly only a few thousand tokens. That
+    /// is the usual reason a large `write_file` call arrives with its
+    /// arguments cut off mid-JSON: the response hit its output cap before the
+    /// model finished writing the tool call. Set this to your model's real
+    /// maximum output when large writes or long answers get truncated.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_output_tokens: u64,
     /// How long establishing an API connection may take, in seconds, before
     /// the attempt is abandoned (clamped to at least 1s at use).
     #[serde(
@@ -208,6 +262,17 @@ pub struct Config {
         skip_serializing_if = "is_default_idle_timeout_secs"
     )]
     pub idle_timeout_secs: u64,
+    /// How long to wait for a model's **first** output before treating the
+    /// connection as dead, in seconds. Deliberately much longer than
+    /// `idle_timeout_secs`: reasoning models can think for many minutes and
+    /// some gateways buffer the whole chain of thought before sending a
+    /// byte, so a short window here would kill a healthy request. Lower it
+    /// if your provider fails fast and you would rather not wait.
+    #[serde(
+        default = "default_first_token_timeout_secs",
+        skip_serializing_if = "is_default_first_token_timeout_secs"
+    )]
+    pub first_token_timeout_secs: u64,
     #[serde(default, skip_serializing_if = "is_default_sandbox")]
     pub sandbox: SandboxConfigFile,
     #[serde(default, skip_serializing_if = "is_default_agent")]
@@ -268,6 +333,14 @@ fn is_default_idle_timeout_secs(value: &u64) -> bool {
     *value == default_idle_timeout_secs()
 }
 
+fn default_first_token_timeout_secs() -> u64 {
+    1800
+}
+
+fn is_default_first_token_timeout_secs(value: &u64) -> bool {
+    *value == default_first_token_timeout_secs()
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut config = Self {
@@ -282,6 +355,12 @@ impl Default for Config {
             provider: String::new(),
             connect_timeout_secs: default_connect_timeout_secs(),
             idle_timeout_secs: default_idle_timeout_secs(),
+            first_token_timeout_secs: default_first_token_timeout_secs(),
+            reasoning_replay: None,
+            thinking_budget_tokens: None,
+            max_output_tokens: 0,
+            context_window_tokens: default_context_window_tokens(),
+            compact_at_percent: default_compact_at_percent(),
             sandbox: SandboxConfigFile::default(),
             agent: AgentConfigFile::default(),
         };
@@ -384,11 +463,14 @@ impl Config {
         let timeouts = HttpTimeouts {
             connect: Duration::from_secs(self.connect_timeout_secs.max(1)),
             idle: Duration::from_secs(self.idle_timeout_secs.max(1)),
+            first_token: Duration::from_secs(self.first_token_timeout_secs.max(1)),
         };
         ApiClient::new(kind.build(
             self.api_key.clone().unwrap_or_default(),
             self.base_url.clone(),
             timeouts,
+            self.thinking_budget_tokens,
+            self.max_output_tokens,
         ))
     }
 

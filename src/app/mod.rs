@@ -23,7 +23,7 @@ pub use commands::SLASH_COMMANDS;
 pub use models::ModelCatalog;
 pub use overlay::Overlay;
 
-use crate::api::types::{StreamEvent, ToolCall};
+use crate::api::types::{Question, ReasoningReplay, StreamEvent, ToolCall, Usage};
 use crate::config::Config;
 use crate::sandbox::os_isolation::OsIsolation;
 use crate::sandbox::permissions::PermissionMode;
@@ -134,9 +134,88 @@ pub struct App {
     /// mid-arguments). They get an explicit truncation error instead of a
     /// misleading "missing field", and are persisted with clean JSON.
     pub truncated_tool_calls: HashSet<String>,
+    /// True when the current turn's stream stopped on the provider's output
+    /// cap (`finish_reason: length` / `max_tokens`) rather than on a dropped
+    /// connection. A tool call truncated by the cap needs different recovery
+    /// advice from one cut off by a dead connection, so the verdict is kept
+    /// here rather than guessed at when the error is written.
+    pub output_limit_hit: bool,
     /// Live retry state for the animated status row; `None` outside a
     /// same-model retry backoff.
     pub retry_state: Option<RetryView>,
+    /// Set when a tool result landed since the last frame. The main loop
+    /// re-asserts the terminal state before drawing — a command the agent
+    /// ran must never be able to leave the user's terminal in a state
+    /// chatTUI did not choose.
+    pub terminal_dirty: bool,
+    /// Handle for the in-flight tool-execution task. Tools run off this
+    /// thread so a long command cannot freeze the UI; the handle is what
+    /// lets `interrupt()` stop the round instead of leaving it running.
+    tool_task: Option<JoinHandle<()>>,
+    /// The tool calls of the round currently executing. Needed to backfill
+    /// an "interrupted" result for any call that never reported back: an
+    /// assistant message with tool calls must be followed by exactly one
+    /// result per call, or the next request is rejected.
+    active_round_calls: Vec<ToolCall>,
+    /// Ids in [`Self::active_round_calls`] that have already reported.
+    answered_tool_ids: HashSet<String>,
+    /// A tool call parked until the user says yes or no. While this is set
+    /// the round is not running and the status row shows the prompt.
+    pub awaiting_approval: Option<PendingApproval>,
+    /// The model called `ask_user` and is waiting for answers.
+    pub awaiting_questions: Option<PendingQuestions>,
+    /// The signature the provider sent for the reasoning currently being
+    /// streamed. Attached to the assistant message when it is stored.
+    pending_reasoning_signature: Option<String>,
+    /// Token counts from the most recent request, when the provider reported
+    /// them. The only trustworthy basis for a compaction decision.
+    pub last_usage: Option<Usage>,
+}
+
+/// A set of questions from `ask_user`, and the answers collected so far.
+///
+/// They are answered one at a time — five questions on one line is a wall of
+/// text — so `current` walks forward and `answers` fills in behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQuestions {
+    pub call_id: String,
+    pub questions: Vec<Question>,
+    /// Index of the question on screen now.
+    pub current: usize,
+    /// One slot per question; `None` means unanswered so far.
+    pub answers: Vec<Option<String>>,
+}
+
+/// Messages kept verbatim when the history is compacted. Everything older is
+/// a candidate for elision; everything newer is what the model is actually
+/// working from.
+const KEEP_RECENT_MESSAGES: usize = 12;
+
+/// A tool call the permission layer will not run without the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApproval {
+    /// Which call of the round this is about.
+    pub call_id: String,
+    /// What the call would do, in one line.
+    pub summary: String,
+    /// Why it needs permission.
+    pub reason: String,
+    /// True when the sandbox already refused it and the question is whether
+    /// to run it unconfined instead.
+    pub escalated: bool,
+    /// For an escalated call: what the sandboxed attempt produced.
+    pub output: Option<String>,
+}
+
+/// The user's answer to an approval prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    /// Run this call only.
+    Once,
+    /// Run it, and remember the decision for the rest of the session.
+    Always,
+    /// Do not run it.
+    Deny,
 }
 
 impl App {
@@ -231,7 +310,16 @@ impl App {
             agent_repeat_failures: 0,
             agent_consecutive_failures: 0,
             truncated_tool_calls: HashSet::new(),
+            output_limit_hit: false,
             retry_state: None,
+            terminal_dirty: false,
+            tool_task: None,
+            active_round_calls: Vec::new(),
+            answered_tool_ids: HashSet::new(),
+            awaiting_approval: None,
+            awaiting_questions: None,
+            pending_reasoning_signature: None,
+            last_usage: None,
         };
         app.rebuild_cells();
         if let Some(error) = target_error {
@@ -278,7 +366,10 @@ impl App {
                     self.cells.push(Cell::ToolResult {
                         id,
                         content: message.content.clone(),
-                        is_error: false,
+                        // Sessions saved before statuses were recorded have
+                        // no verdict; treat those as successes rather than
+                        // marking old history as broken.
+                        is_error: message.is_error.unwrap_or(false),
                     });
                 }
                 "user" => {
@@ -298,6 +389,19 @@ impl App {
         if self.overlay.take().is_some() {
             return;
         }
+        // At an approval prompt esc means "no", not "abort everything": the
+        // round survives and the model is told, so it can find another way
+        // instead of losing the work it had already done.
+        if self.awaiting_approval.is_some() {
+            self.resolve_approval(Approval::Deny);
+            return;
+        }
+        // Same reasoning for questions: dismissing them is an answer the
+        // model can act on, losing the round is not.
+        if self.awaiting_questions.is_some() {
+            self.skip_questions();
+            return;
+        }
         if self.streaming {
             self.interrupt();
             return;
@@ -315,12 +419,20 @@ impl App {
         if let Some(task) = self.stream_task.take() {
             task.abort();
         }
+        // A command already running is not killed by this — it is bounded by
+        // the shell timeout and its own process group. What stops here is the
+        // round: no further tool starts, and no result restarts the loop.
+        if let Some(task) = self.tool_task.take() {
+            task.abort();
+        }
         self.tokens = None;
         self.streaming = false;
         self.stream_started = None;
         self.pending_tool_calls.clear();
+        self.backfill_interrupted_tools();
         self.reset_agent_health();
         self.truncated_tool_calls.clear();
+        self.output_limit_hit = false;
         self.retry_state = None;
         self.finish_partial();
     }
@@ -333,6 +445,35 @@ impl App {
         self.agent_last_round_key = None;
         self.agent_repeat_failures = 0;
         self.agent_consecutive_failures = 0;
+        self.active_round_calls.clear();
+        self.answered_tool_ids.clear();
+        // A prompt nobody can answer any more is worse than no prompt.
+        self.awaiting_approval = None;
+        self.awaiting_questions = None;
+    }
+
+    /// Record an explicit "interrupted" result for every tool call of the
+    /// in-flight round that never reported back.
+    ///
+    /// Without this the saved history holds an assistant message whose tool
+    /// calls have no results, and the next request to the provider is
+    /// rejected for the whole conversation.
+    fn backfill_interrupted_tools(&mut self) {
+        if self.active_round_calls.is_empty() {
+            return;
+        }
+        let calls = std::mem::take(&mut self.active_round_calls);
+        for call in calls {
+            let id = call.id.clone();
+            if self.answered_tool_ids.contains(&id) {
+                continue;
+            }
+            let content = "interrupted by the user before this tool could finish".to_string();
+            self.sessions
+                .add_tool_result(id.clone(), content.clone(), true);
+            self.push_tool_result(id, content, true);
+        }
+        self.answered_tool_ids.clear();
     }
 
     /// `ctrl+r`: expand / collapse completed reasoning blocks.
@@ -373,6 +514,75 @@ impl App {
     // -- transcript cells ---------------------------------------------------------
 
     /// Commit an in-flight assistant response (used on completion and interrupt).
+    /// How full the context window is, in tokens.
+    ///
+    /// Prefers what the provider actually counted for the last request, and
+    /// adds an estimate for whatever has been added since — a tool result can
+    /// be 20 kB, and waiting for the next request to find that out is exactly
+    /// the overflow this is meant to prevent.
+    pub fn context_tokens(&self) -> u64 {
+        let chars: usize = self
+            .sessions
+            .current()
+            .messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum();
+        let estimated = (chars / 4) as u64;
+        match self.last_usage {
+            // The provider counted the history as it was then; the estimate
+            // covers the whole thing now, so the larger of the two is the
+            // honest number.
+            Some(usage) => usage.input_tokens.max(estimated),
+            None => estimated,
+        }
+    }
+
+    /// Compact the history before it overflows the window.
+    ///
+    /// Called before every request. Doing it here rather than after a failure
+    /// is the point: an overflowed request is rejected outright, and by then
+    /// the work in flight is already lost.
+    fn maybe_compact(&mut self) {
+        let window = self.config.context_window_tokens.max(1_000);
+        let percent = self.config.compact_at_percent.clamp(10, 99) as u64;
+        let target = window * percent / 100;
+        if self.context_tokens() < target {
+            return;
+        }
+        // Keep enough recent context to stay coherent: the last dozen messages
+        // plus anything the current round still needs.
+        let report = self
+            .sessions
+            .compact(KEEP_RECENT_MESSAGES, target as usize);
+        // One real number is worth more than the estimate from here on.
+        self.last_usage = None;
+        if let Some(report) = report {
+            self.push_notice(report);
+        }
+    }
+
+    /// How this provider's reasoning is treated on replay.
+    ///
+    /// Anthropic signs its thinking blocks and validates the signature on the
+    /// next turn, so its reasoning has to survive; OpenAI-compatible endpoints
+    /// have no such contract and resent reasoning is mostly wasted tokens.
+    pub(crate) fn reasoning_replay(&self) -> ReasoningReplay {
+        ReasoningReplay::resolve(
+            self.config.reasoning_replay.as_deref(),
+            self.config.provider == "anthropic",
+        )
+    }
+
+    /// Attach the signature that arrived with this turn's reasoning to the
+    /// assistant message that was just stored.
+    fn attach_reasoning_signature(&mut self) {
+        if let Some(signature) = self.pending_reasoning_signature.take() {
+            self.sessions
+                .set_last_assistant_reasoning_signature(signature);
+        }
+    }
+
     pub(crate) fn finish_partial(&mut self) {
         if !self.response.is_empty() {
             let mut text = std::mem::take(&mut self.response);
@@ -392,6 +602,7 @@ impl App {
             }
             self.cells.push(Cell::Assistant(text.clone()));
             self.sessions.add_message("assistant", text);
+            self.attach_reasoning_signature();
         }
     }
 
@@ -413,13 +624,13 @@ impl App {
 
     pub(crate) fn push_tool_result(&mut self, id: String, content: String, is_error: bool) {
         self.cells.push(Cell::ToolResult { id, content, is_error });
+        self.terminal_dirty = true;
     }
 
     /// The context summary shown on the right-hand side of the footer.
     pub fn context_summary(&self) -> String {
         let session = self.sessions.current();
         let messages = session.messages.len();
-        let chars: usize = session.messages.iter().map(|m| m.content.len()).sum();
         let sandbox_status = if !self.config.sandbox.enabled {
             " · sandbox:off"
         } else if self.sandbox.has_target() {
@@ -427,9 +638,20 @@ impl App {
         } else {
             " · sandbox:no-target"
         };
+        let tokens = self.context_tokens();
+        let window = self.config.context_window_tokens.max(1_000);
+        // A counted number and an estimate are not the same claim, so they do
+        // not get the same formatting: "~" means chatTUI guessed.
+        let counted = match self.last_usage {
+            Some(usage) if usage.input_tokens > 0 => {
+                crate::ui::theme::human_tokens(tokens as usize)
+            }
+            _ => format!("~{}", crate::ui::theme::human_tokens(tokens as usize)),
+        };
         format!(
-            "{messages} msgs · ~{} tok{sandbox_status}",
-            crate::ui::theme::human_tokens(chars / 4)
+            "{messages} msgs · {counted}/{} tok ({}%){sandbox_status}",
+            crate::ui::theme::human_tokens(window as usize),
+            (tokens * 100 / window).min(999)
         )
     }
 }

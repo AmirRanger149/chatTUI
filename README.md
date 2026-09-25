@@ -26,6 +26,9 @@ The app uses `ratatui` for the interface, `crossterm` for terminal input,
 - Copy any code block from a response to the clipboard (`ctrl+g` or `/code`)
 - Animated reasoning view for thinking models
   (see [Reasoning Models](#reasoning-models))
+- Agent tools that never block the interface — commands run in the
+  background and their results appear as they land
+  (see [Project Instructions](#project-instructions-agentsmd))
 - A single native Rust binary with no Python or OpenAI SDK dependency
 
 ## Before You Start
@@ -211,9 +214,64 @@ marked `· custom`) or directly with `/provider openai|anthropic|gemini|<custom-
 | `model` | Optional model name override for the active provider | Provider default |
 | `base_url` | Optional endpoint override for the active provider | Provider default |
 | `connect_timeout_secs` | Max seconds to wait while establishing an API connection | `15` |
-| `idle_timeout_secs` | Max seconds a stream may stay quiet between chunks before the connection counts as dead — this is *not* a cap on total generation time | `90` |
+| `idle_timeout_secs` | Max seconds a stream may stay quiet between chunks **after output has started** before the connection counts as dead — this is *not* a cap on total generation time | `90` |
+| `first_token_timeout_secs` | Max seconds to wait for a model's **first** output. Deliberately long: reasoning models can think for many minutes and some gateways buffer the whole chain of thought before sending a byte | `1800` |
 | `agent.max_rounds` | Backstop ceiling for agent tool rounds. A safety net only — healthy runs keep going as long as they make progress; broken loops are stopped earlier by the stagnation and consecutive-failure guards | `50` |
+| `context_window_tokens` | Size of the model's context window, used to decide when to compact history. Worth setting to your model's real number | `128000` |
+| `compact_at_percent` | Compact the history once it passes this percentage of the window | `80` |
+| `reasoning_replay` | What happens to a model's reasoning when history is sent back: `auto` (per provider), `strip`, or `opaque` | `auto` |
+| `thinking_budget_tokens` | Ask for extended thinking with this token budget (Anthropic). Unset means don't ask — and then there is nothing to replay either | *unset* |
+| `max_output_tokens` | Cap on tokens per **single response**, sent as `max_tokens` (Gemini: `maxOutputTokens`). `0` sends no cap, so the provider's own default applies — often only a few thousand tokens, which is the usual reason a big `write_file` arrives with its arguments cut off mid-JSON, or an answer just stops. Set it to your model's real maximum output | `0` (provider default) |
 
+### Large writes arriving truncated
+
+A `write_file` call carries the entire file as one string in the tool call's
+arguments. If the provider's output cap is reached before that string is
+finished, the JSON never closes and chatTUI reports:
+
+```
+tool call arguments arrived truncated: the response hit its output token
+limit before the tool call's JSON was complete
+```
+
+That is a *cap*, not a broken connection — raising `max_output_tokens` to your
+model's real maximum output fixes it. If your model genuinely cannot emit the
+whole file in one response, tell the model to build the file in pieces; the
+tool description already asks it to, and `apply_patch` keeps each request
+small.
+
+> **The context window is managed, not hoped for.** chatTUI reads the token
+> counts the provider reports (all three protocols send them) and compacts the
+> history *before* the request that would overflow, not after it is rejected.
+> Compaction is deterministic and needs no extra API call: old tool output is
+> replaced by a one-line placeholder first — a 20 kB build log from ten rounds
+> ago is the biggest and least useful thing in the history — and only if that
+> is not enough are whole messages dropped, always in groups so a tool call
+> never loses its results. The last 12 messages are always kept verbatim, and
+> the transcript says what was removed. The status bar shows the real count
+> when the provider gave one (`~` when chatTUI estimated).
+>> **Reasoning is not silently thrown away.** Most endpoints have no
+> contract about reasoning on input, so by default it is stripped before
+> history is resent — resending it would double the token bill for text the
+> model will not use. Anthropic is the exception: its thinking blocks carry a
+> signature the next turn is validated against, so `auto` keeps them and sends
+> them back with the message they came from. Dropping them mid-tool-loop is
+> what quietly degrades an answer. Force either behaviour with
+> `reasoning_replay: "strip"` or `"opaque"`.
+>> **Incomplete answers are reported, not hidden.** A response is only
+> treated as finished when the provider sent its end-of-stream marker or a
+> finish reason. If the connection closed mid-answer, if the model hit its
+> output limit (`length` / `max_tokens`), or if the provider's content filter
+> cut it short, chatTUI says so in the transcript instead of showing a
+> truncated reply that looks complete.
+>
+> **Long thinking is not a dead connection.** Until a model produces its
+> first output the quiet-connection limit is `first_token_timeout_secs`
+> (30 minutes by default), not `idle_timeout_secs`; after output starts, the
+> short limit applies between chunks. When a long wait does end in a timeout
+> it is reported rather than retried, because a retry would throw the
+> thinking away and restart the same wait.
+>
 > **Retries & timeouts.** Transient failures (network errors, timeouts,
 > HTTP 408/429/5xx) retry the *same* model up to three times with
 > exponential backoff — announced in the transcript and shown as an animated
@@ -282,6 +340,9 @@ The composer is always focused — just start typing and press `Enter` to send.
 | `/code` | Browse and copy code blocks |
 | `/model` | Pick a model from the API's live list (`/model <id>` sets one directly) |
 | `/provider` | Select API provider (`/provider <name>` sets one directly) |
+| `/agent` | Toggle agent mode (gives the model file tools and a shell) |
+| `/sandbox` | Show or set the directory the agent works in (`/sandbox <dir>`) |
+| `/approve` | Toggle auto-approve, or make tools ask first (`/approve auto\|manual\|reset`) |
 | `/quit` | Exit chatTUI |
 
 Type `/` to open the command palette, then `Tab` to complete.
@@ -407,17 +468,40 @@ failures are reported immediately, since a different model cannot fix those.
 Agent mode (`/sandbox <dir>` or `--sandbox <dir>`) gives the model file tools
 and a shell. What is actually enforced — and what is not:
 
-- **File tools (`read_file`, `write_file`, `edit_file`, `list_files`) are
-  workspace-restricted.** Paths must resolve inside the target directory,
+- **File tools (`read_file`, `write_file`, `edit_file`, `apply_patch`,
+  `list_files`) are workspace-restricted.** Paths must resolve inside the target directory,
   including through symlinks; `..` traversal and absolute escapes are
   refused. Sensitive files are refused for reading and writing: dotenv files
   (`.env`, `*.env`), key material (`*.pem`, `*.key`, `*.p12`, `*.pfx`,
   `*.jks`, SSH private keys), `.git/config`, and every write under `.git/`.
   Add names via `sandbox.extra_sensitive_names` in `config.json`.
+- **A command never gets your terminal.** `stdin` is `/dev/null`,
+  `stdout`/`stderr` are pipes, and the command runs in its own **session**
+  (`setsid`), so it has no controlling terminal and cannot open `/dev/tty`.
+  Without that, one `cargo run` of a TUI — or `vim`, `htop`, `ssh`, `sudo` —
+  would switch your real terminal to the alternate screen, hide the cursor
+  and put it into raw mode, and being killed at the timeout would leave it
+  that way. Interactive programs therefore fail instead of taking the session
+  over. Captured output is additionally stripped of terminal control
+  sequences before it reaches the transcript, so escape bytes cannot be
+  replayed at your terminal either (the cost: no colour in build output).
+  As a last line of defence chatTUI re-asserts its own terminal state after
+  every tool call.
+- **Long and non-exiting commands are supported, without weakening the
+  sandbox.** `bash` takes a per-call `timeout_secs` (1-1800) for a build you
+  know is slow, and `session: true` for anything that does not exit on its
+  own — a dev server, a watch loop, a REPL. A session returns whatever it has
+  printed plus a `session_id`; `write_stdin` sends it input and reads more,
+  `kill_session` kills its whole process tree. Sessions are spawned through
+  the same path as a one-shot command, so they get the same filtered
+  environment, the same `setsid` (still no controlling terminal — a TUI still
+  cannot run) and the same kernel isolation. They are capped at 8 alive and
+  30 minutes each, and every one is killed when chatTUI exits, because a
+  session is its own process session and would otherwise outlive it.
 - **The `bash` tool has a hard timeout** (default 30s,
-  `sandbox.shell_timeout_secs`; the command's process group is killed when
-  it expires) and a **reduced environment** — credential-like variables such
-  as API keys are not passed to shell commands.
+  `sandbox.shell_timeout_secs`; the command's whole process tree is killed
+  when it expires) and a **reduced environment** — credential-like variables
+  such as API keys are not passed to shell commands.
 - **Kernel-level isolation for shell commands** (Linux, on by default via
   `sandbox.os_isolation: "auto"`): before a command runs, the kernel is
   told to confine it — Landlock rules allow reads everywhere but restrict
@@ -440,12 +524,62 @@ and a shell. What is actually enforced — and what is not:
 - **Permissions:** `sandbox.permission_mode` selects `read-only`,
   `workspace-write`, `ask-before-write`, `ask-before-shell` or `full-auto`.
   When unset, the legacy `auto_approve` / `allow_shell` flags decide.
-  `ask-*` modes currently deny the gated action (interactive approval is
-  not implemented yet) instead of allowing it silently.
+  The `ask-*` modes really do ask: before a gated call runs, the spinner
+  turns into `⚠ Approve? <what it would do> (y allow • a always • n deny)`.
+  `y` allows that one call, `a` allows it and everything like it for the
+  rest of the session, `n` (or `Esc`) refuses it and tells the model to ask
+  you instead of retrying. "Like it" means the same tool, or for shell the
+  same first two words — approving one `git push` covers the next, and does
+  not cover `rm`. The prompt pauses the round; nothing else runs while it is
+  up, and answering resumes exactly where it stopped. `/approve` toggles
+  between auto and manual without editing `config.json`; `/approve reset`
+  forgets what you have allowed, and switching modes forgets it too.
 - **Context-aware file tools:** `read_file` serves numbered windows of at
   most 1,000 lines (250 by default), so large files are paged through
   instead of flooding the conversation; `write_file` / `edit_file` report
   their change as `+added -removed` line counts.
+- **The agent can ask you.** `ask_user` lets the model stop and ask up to 5
+  questions — with options you can pick by number, or free text — instead of
+  guessing at a decision only you can make. The round pauses until you answer;
+  `Esc` dismisses the rest and the model is told you did, so it picks the
+  conservative option rather than waiting forever.
+- **A command the sandbox blocks becomes a question, not a dead end.** When
+  the kernel refuses a command, chatTUI asks whether to run that one call
+  unconfined (`y`) or leave it blocked (`n`) instead of handing the model an
+  error it will retry three times. Unconfined means Landlock/seccomp off for
+  that call only — the workspace restriction and the sensitive-file policy
+  still apply.
+- **`apply_patch` edits by context, not by exact string.** The model sends
+  one patch that can touch several files at once:
+
+  ```
+  *** Begin Patch
+  *** Update File: src/main.rs
+  @@ fn main
+       let x = 1;
+  -    let y = 2;
+  +    let y = 3;
+  *** Add File: notes.txt
+  +hello
+  *** End Patch
+  ```
+
+  Lines keep a leading space (context), `+` (add) or `-` (remove); `@@` is an
+  optional hint that narrows where to look. Every path is checked against the
+  workspace rules *before* anything is written, and the whole patch is applied
+  or none of it is — so a five-file change cannot land half-finished. Unlike
+  `edit_file`, it does not need the old text to match byte-for-byte, which is
+  why it survives re-indented files.
+- **Tools never block the interface.** A round of tool calls runs on its own
+  task, so a command that takes the full timeout no longer freezes the
+  terminal: the transcript fills in as each result lands, the status row
+  keeps counting, and `Esc` stops the round. (A command already running is
+  not killed by `Esc` — it is still bounded by the shell timeout and its
+  process group.)
+- **Command output keeps both ends.** Past 20,000 bytes the middle is
+  dropped, not the end: a build or test run reports its failure last, and
+  that is the part worth keeping. The marker says how many bytes were
+  dropped, so an incomplete log is never mistaken for a complete one.
 - **Agent loop:** the agent keeps working for as long as it makes
   progress — there is no fixed step cap. It is stopped by specific guards
   instead: the same failing tool call 3 rounds in a row (stagnation), 4

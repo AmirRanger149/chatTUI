@@ -19,7 +19,7 @@
 
 use super::{ChatBackend, HttpTimeouts};
 use crate::api::error::{classify_failure, error_detail, MAX_CONSECUTIVE_SSE_PARSE_FAILURES};
-use crate::api::sse::SseReader;
+use crate::api::sse::{abnormal_stream_end, first_token_timeout_failure, SseReader};
 use crate::api::types::{CompletionRequest, Failure, Role, StreamEvent, ToolCall};
 use crate::tools;
 use anyhow::{anyhow, Context, Result};
@@ -35,14 +35,27 @@ pub struct GeminiBackend {
     http: Client,
     api_key: String,
     base_url: String,
-    /// How long the stream may stay quiet between chunks before the
-    /// connection counts as dead. There is deliberately no whole-request
-    /// timeout: it would cut long generations off mid-answer.
+    /// How long the stream may stay quiet between chunks *after output has
+    /// started* before the connection counts as dead. There is deliberately
+    /// no whole-request timeout: it would cut long generations off
+    /// mid-answer.
     idle_timeout: Duration,
+    /// How long to wait for the model's first output. Thinking models can
+    /// take many minutes before the first visible token, so this is much
+    /// longer than [`Self::idle_timeout`].
+    first_token_timeout: Duration,
+    /// Cap on tokens per response. `0` sends nothing and leaves Gemini's own
+    /// default in force.
+    max_output_tokens: u64,
 }
 
 impl GeminiBackend {
-    pub fn new(api_key: String, base_url: String, timeouts: HttpTimeouts) -> Self {
+    pub fn new(
+        api_key: String,
+        base_url: String,
+        timeouts: HttpTimeouts,
+        max_output_tokens: u64,
+    ) -> Self {
         Self {
             http: Client::builder()
                 .connect_timeout(timeouts.connect)
@@ -51,6 +64,8 @@ impl GeminiBackend {
             api_key,
             base_url: base_url.trim_end_matches('/').into(),
             idle_timeout: timeouts.idle,
+            first_token_timeout: timeouts.first_token,
+            max_output_tokens,
         }
     }
 
@@ -178,6 +193,9 @@ impl GeminiBackend {
             "contents": contents,
             "generationConfig": { "temperature": request.temperature },
         });
+        if self.max_output_tokens > 0 {
+            body["generationConfig"]["maxOutputTokens"] = json!(self.max_output_tokens);
+        }
         if let Some(text) = system {
             body["systemInstruction"] = json!({ "parts": [{ "text": text }] });
         }
@@ -218,23 +236,36 @@ impl GeminiBackend {
         let mut finish_reason = String::new();
         let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
         let mut bad_lines = 0usize;
+        // Whether the provider sent its explicit `[DONE]` sentinel. Gemini
+        // usually ends with a `finishReason` instead, and either one counts
+        // as a clean ending.
+        let mut saw_done = false;
 
         let mut stream_ended = false;
         loop {
-            // Idle-timeout guard: a stream may run as long as it keeps
-            // producing chunks, but a connection that stays quiet past
-            // `idle_timeout` is dead and must not hang the UI forever.
+            // Two idle windows: a generous one until the model produces
+            // anything (thinking models can take many minutes), and a tight
+            // one between chunks once output has started. Neither caps the
+            // total response time — a stream that keeps producing tokens is
+            // never cut off mid-answer.
+            //
             // When the stream closes cleanly, whatever trailing frame the
             // reader still holds (a provider may end without a final
             // newline) is processed too — losing it can truncate tool-call
             // arguments.
-            let payloads = if stream_ended {
+            let output_started = any_text || !pending_tool_calls.is_empty();
+            let quiet_limit = if output_started {
+                self.idle_timeout
+            } else {
+                self.first_token_timeout
+            };
+            let payloads = if stream_ended || saw_done {
                 break;
             } else {
-                match tokio::time::timeout(self.idle_timeout, stream.next()).await {
+                match tokio::time::timeout(quiet_limit, stream.next()).await {
                     Ok(Some(Ok(chunk))) => reader.feed(&chunk),
                     Ok(Some(Err(error))) => {
-                        return Err(if any_text || !pending_tool_calls.is_empty() {
+                        return Err(if output_started {
                             Failure::Fatal(format!(
                                 "stream interrupted after output started: {error}"
                             ))
@@ -248,26 +279,29 @@ impl GeminiBackend {
                         stream_ended = true;
                         reader.flush()
                     }
+                    Err(_elapsed) if output_started => {
+                        return Err(Failure::Fatal(format!(
+                            "the connection went quiet for {}s after output started",
+                            self.idle_timeout.as_secs()
+                        )));
+                    }
                     Err(_elapsed) => {
-                        let secs = self.idle_timeout.as_secs();
-                        return Err(if any_text || !pending_tool_calls.is_empty() {
-                            Failure::Fatal(format!(
-                                "the connection went quiet for {secs}s after output started"
-                            ))
-                        } else {
-                            Failure::Transient(format!(
-                                "the connection went quiet for {secs}s before any output"
-                            ))
-                        });
+                        // No output yet, so the long first-token window
+                        // applied. A long wait means the model was very
+                        // likely still working, and a retry would restart
+                        // the same wait — so past a threshold this is
+                        // reported instead of retried.
+                        return Err(first_token_timeout_failure(self.first_token_timeout));
                     }
                 }
             };
             for data in payloads {
                 if data == "[DONE]" {
-                    for tc in pending_tool_calls.drain(..) {
-                        let _ = tx.send(StreamEvent::ToolCall(tc)).await;
-                    }
-                    return Ok(());
+                    // Explicit end-of-stream marker. Tool calls and the
+                    // ending classification are handled by the single exit
+                    // path below.
+                    saw_done = true;
+                    break;
                 }
                 let value: Value = match serde_json::from_str(&data) {
                     Ok(value) => {
@@ -287,6 +321,10 @@ impl GeminiBackend {
                         continue;
                     }
                 };
+                // usageMetadata rides on the last candidate chunk.
+                if let Some(usage) = crate::api::types::usage_from(&value) {
+                    let _ = tx.send(StreamEvent::Usage(usage)).await;
+                }
                 if let Some(reason) = value["promptFeedback"]["blockReason"].as_str() {
                     return Err(Failure::Fatal(format!(
                         "Gemini blocked the prompt: {reason}"
@@ -367,12 +405,31 @@ impl GeminiBackend {
         }
 
         if !any_text {
+            if !saw_done && finish_reason.is_empty() {
+                // The connection closed with nothing in it: a retry costs
+                // nothing and may work.
+                return Err(Failure::Transient(
+                    "the provider closed the stream before sending anything".into(),
+                ));
+            }
             if !finish_reason.is_empty() && finish_reason != "STOP" && finish_reason != "MAX_TOKENS" {
                 return Err(Failure::Fatal(format!(
                     "Gemini stopped without an answer ({finish_reason})"
                 )));
             }
             return Err(Failure::Fatal("Gemini returned an empty response".into()));
+        }
+        // There is an answer — make sure a truncated one says so instead of
+        // looking finished.
+        let reason = if finish_reason.is_empty() {
+            None
+        } else {
+            Some(finish_reason.as_str())
+        };
+        if let Some(notice) = abnormal_stream_end(saw_done, reason) {
+            let output_limit = crate::api::sse::ended_by_output_limit(reason);
+            let _ = tx.send(StreamEvent::Notice(notice)).await;
+            let _ = tx.send(StreamEvent::EndedEarly { output_limit }).await;
         }
         Ok(())
     }

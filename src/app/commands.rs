@@ -17,7 +17,7 @@ pub const SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd { name: "/provider", desc: "Select API provider" },
     SlashCmd { name: "/agent", desc: "Toggle agent mode (sandbox tools)" },
     SlashCmd { name: "/sandbox", desc: "Show or set agent target dir" },
-    SlashCmd { name: "/target", desc: "Set agent target directory" },
+    SlashCmd { name: "/approve", desc: "Auto-approve tools, or ask first" },
     SlashCmd { name: "/quit", desc: "Exit chatTUI" },
 ];
 
@@ -135,7 +135,7 @@ impl App {
                     );
                 }
             }
-            "/sandbox" | "/target" => {
+            "/sandbox" => {
                 if argument.is_empty() {
                     self.push_sandbox_status();
                 } else if let Err(error) = self.set_sandbox_target(&argument) {
@@ -146,6 +146,47 @@ impl App {
                         self.sandbox.config.workspace_root.display()
                     ));
                 }
+            }
+            "/approve" => {
+                use crate::sandbox::permissions::PermissionMode as Mode;
+                let target = match argument.as_str() {
+                    // No argument toggles between the two ends, which is what
+                    // most people want from it.
+                    "" => {
+                        if self.sandbox.config.permission_mode == Mode::FullAuto {
+                            Mode::AskBeforeWrite
+                        } else {
+                            Mode::FullAuto
+                        }
+                    }
+                    "auto" | "on" | "yes" => Mode::FullAuto,
+                    "manual" | "ask" | "off" | "no" => Mode::AskBeforeWrite,
+                    "reset" | "forget" => {
+                        self.sandbox.clear_allowances();
+                        self.push_notice(
+                            "forgot every approval remembered this session".to_string(),
+                        );
+                        return;
+                    }
+                    other => {
+                        self.push_error(format!(
+                            "unknown /approve argument '{other}' — use auto, manual or reset"
+                        ));
+                        return;
+                    }
+                };
+                self.sandbox.config.permission_mode = target;
+                // Approvals were remembered against the old mode; carrying
+                // them over would let a "manual" setting silently keep
+                // running whatever "auto" had waved through.
+                self.sandbox.clear_allowances();
+                self.config.sandbox.permission_mode = Some(target.as_str().to_string());
+                let blurb = match target {
+                    Mode::FullAuto => "auto — every tool runs without asking",
+                    Mode::AskBeforeWrite => "manual — reads run free, writes and shell ask first",
+                    _ => target.as_str(),
+                };
+                self.push_notice(format!("approvals: {blurb}"));
             }
             "/model" => {
                 if argument.is_empty() {
@@ -218,6 +259,12 @@ impl App {
             self.sandbox.config.os_isolation.as_str(),
             self.sandbox.config.auto_approve
         ));
+        if !self.sandbox.allowances.is_empty() {
+            self.push_notice(format!(
+                "approved for this session: {} — /approve reset forgets them",
+                self.sandbox.allowances.join(", ")
+            ));
+        }
         if !self.sandbox.has_target() {
             self.push_notice(
                 "agent tools will not write until a target is set with /sandbox <dir>".into(),

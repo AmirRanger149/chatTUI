@@ -23,6 +23,17 @@ pub struct Message {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallRecord>>,
+    /// Whether this tool result was an error. Absent on non-tool messages
+    /// and on sessions saved before statuses were recorded — a replayed
+    /// history has to be able to tell a failed tool call from a successful
+    /// one, or every failure renders as a success after a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
+    /// The provider's signature over this assistant message's reasoning, when
+    /// it sent one. Replaying a signed thinking block without its signature
+    /// is rejected, so a reasoning round-trip is impossible without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +164,8 @@ impl SessionManager {
             content: content.into(),
             tool_call_id: None,
             tool_calls: None,
+            is_error: None,
+            reasoning_signature: None,
         };
         let session = self.current_mut();
         if session.title == "New conversation" && message.role == "user" {
@@ -169,15 +182,134 @@ impl SessionManager {
         let _ = self.save();
     }
 
-    pub fn add_tool_result(&mut self, tool_call_id: impl Into<String>, content: impl Into<String>) {
+    /// Record a tool result. `is_error` distinguishes a failure (including a
+    /// permission denial, a timeout or an interrupt) from a success, and is
+    /// what the transcript renders after the session is reloaded.
+    pub fn add_tool_result(
+        &mut self,
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+    ) {
         let message = Message {
             role: "tool".into(),
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
+            is_error: Some(is_error),
+            reasoning_signature: None,
         };
         self.current_mut().messages.push(message);
         let _ = self.save();
+    }
+
+    /// Rough token estimate for the current session, used when the provider
+    /// has not reported real counts yet. `chars / 4` is wrong by up to 2x,
+    /// which is why it is only ever the fallback.
+    pub fn estimate_tokens(&self) -> usize {
+        self.current()
+            .messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum::<usize>()
+            / 4
+    }
+
+    /// Shrink the history so the next request fits in the window.
+    ///
+    /// Two passes, cheapest first. Old tool output is replaced by a one-line
+    /// placeholder: a 20 kB build log from ten rounds ago is the biggest thing
+    /// in the history and the least useful part of it. Only if that is not
+    /// enough are whole messages dropped, and then only in groups — an
+    /// assistant message that made tool calls must keep every one of its
+    /// results, or the provider rejects the whole request.
+    ///
+    /// Returns what was removed, for the transcript, or `None` when there was
+    /// nothing worth doing.
+    pub fn compact(&mut self, keep_recent: usize, target_tokens: usize) -> Option<String> {
+        let total = self.current().messages.len();
+        if total <= keep_recent {
+            return None;
+        }
+        let cut = total - keep_recent;
+
+        // Pass 1: elide old tool output in place. Message count and pairing
+        // are untouched, so this pass cannot break anything.
+        let mut elided = 0usize;
+        {
+            let messages = &mut self.current_mut().messages;
+            for message in messages.iter_mut().take(cut) {
+                if message.role != "tool" || message.content.len() < 400 {
+                    continue;
+                }
+                let was = message.content.len();
+                message.content =
+                    format!("[tool output elided during compaction — was {was} chars]");
+                elided += 1;
+            }
+        }
+
+        // Pass 2: drop whole groups from the front while still over budget.
+        let mut dropped = 0usize;
+        while self.estimate_tokens() > target_tokens {
+            let total = self.current().messages.len();
+            if total <= keep_recent {
+                break;
+            }
+            // Find the end of the first droppable group: an assistant message
+            // with tool calls, plus every result that answers it.
+            let messages = &self.current().messages;
+            let mut end = 1usize;
+            if messages[0].role == "assistant" && messages[0].tool_calls.is_some() {
+                while end < total && messages[end].role == "tool" {
+                    end += 1;
+                }
+            } else if messages[0].role == "tool" {
+                // An orphan result with no call to answer: it can never be
+                // sent, so it goes.
+                while end < total && messages[end].role == "tool" {
+                    end += 1;
+                }
+            }
+            let keep_from = end.min(total.saturating_sub(keep_recent).max(1));
+            drop(messages);
+            let removed: Vec<Message> = self.current_mut().messages.drain(..keep_from).collect();
+            dropped += removed.len();
+            if removed.is_empty() {
+                break;
+            }
+        }
+
+        if elided == 0 && dropped == 0 {
+            return None;
+        }
+        if dropped > 0 {
+            self.current_mut().messages.insert(
+                0,
+                Message {
+                    role: "user".into(),
+                    content: format!(
+                        "[{dropped} earlier messages were removed to fit the context window.                          The recent conversation below is intact; ask again if you need                          something from before.]"
+                    ),
+                    tool_call_id: None,
+                    tool_calls: None,
+                    is_error: None,
+                    reasoning_signature: None,
+                },
+            );
+        }
+        Some(format!(
+            "compacted the history: {elided} old tool outputs elided, {dropped} messages dropped"
+        ))
+    }
+
+    /// Attach a reasoning signature to the assistant message just stored.
+    pub fn set_last_assistant_reasoning_signature(&mut self, signature: String) {
+        if let Some(message) = self.current_mut().messages.last_mut() {
+            if message.role == "assistant" {
+                message.reasoning_signature = Some(signature);
+            }
+        }
     }
 
     pub fn add_assistant_with_tools(&mut self, content: impl Into<String>, tool_calls: Vec<ToolCallRecord>) {
@@ -186,6 +318,8 @@ impl SessionManager {
             content: content.into(),
             tool_call_id: None,
             tool_calls: Some(tool_calls),
+            is_error: None,
+            reasoning_signature: None,
         };
         self.current_mut().messages.push(message);
         let _ = self.save();

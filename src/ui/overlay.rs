@@ -20,9 +20,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, overlay: Overlay) {
 }
 
 fn shortcuts(frame: &mut Frame, area: Rect) {
-    let rows: [(&str, &str); 11] = [
+    let rows: [(&str, &str); 13] = [
         ("enter", "send message"),
-        ("esc", "close popup · interrupt stream"),
+        ("esc", "close popup · interrupt stream · deny at an approval prompt"),
+        ("y / a / n", "approve a tool call: once / always / deny"),
+        ("1 … 9", "answer the agent's question, or type and press enter"),
         ("ctrl+h", "conversation history"),
         ("ctrl+t", "inspect tool activity"),
         ("ctrl+g", "copy code blocks"),

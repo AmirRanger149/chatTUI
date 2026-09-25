@@ -8,7 +8,9 @@
 
 use super::{ChatBackend, HttpTimeouts};
 use crate::api::error::{classify_failure, error_detail, MAX_CONSECUTIVE_SSE_PARSE_FAILURES};
-use crate::api::sse::SseReader;
+use crate::api::sse::{
+    abnormal_stream_end, ended_by_output_limit, first_token_timeout_failure, SseReader,
+};
 use crate::api::types::{CompletionRequest, Failure, Role, StreamEvent, ToolCall};
 use crate::tools;
 use anyhow::{anyhow, Context, Result};
@@ -25,14 +27,30 @@ pub struct OpenAICompatibleBackend {
     http: Client,
     api_key: String,
     base_url: String,
-    /// How long the stream may stay quiet between chunks before the
-    /// connection counts as dead. There is deliberately no whole-request
-    /// timeout: it would cut long generations off mid-answer.
+    /// How long the stream may stay quiet between chunks *after output has
+    /// started* before the connection counts as dead. There is deliberately
+    /// no whole-request timeout: it would cut long generations off
+    /// mid-answer.
     idle_timeout: Duration,
+    /// How long to wait for the model's first output. Reasoning models can
+    /// think for many minutes and some gateways buffer the whole chain of
+    /// thought, so this is much longer than [`Self::idle_timeout`].
+    first_token_timeout: Duration,
+    /// Cap on tokens per response, sent as `max_tokens`. `0` sends nothing,
+    /// which leaves the gateway's own default in force — often only a few
+    /// thousand tokens. That default is what cuts a big `write_file` call off
+    /// mid-JSON: the response ends on `finish_reason: "length"` and the
+    /// accumulated arguments string is an unterminated fragment.
+    max_output_tokens: u64,
 }
 
 impl OpenAICompatibleBackend {
-    pub fn new(api_key: String, base_url: String, timeouts: HttpTimeouts) -> Self {
+    pub fn new(
+        api_key: String,
+        base_url: String,
+        timeouts: HttpTimeouts,
+        max_output_tokens: u64,
+    ) -> Self {
         Self {
             http: Client::builder()
                 .connect_timeout(timeouts.connect)
@@ -41,6 +59,8 @@ impl OpenAICompatibleBackend {
             api_key,
             base_url: base_url.trim_end_matches('/').into(),
             idle_timeout: timeouts.idle,
+            first_token_timeout: timeouts.first_token,
+            max_output_tokens,
         }
     }
 
@@ -133,7 +153,19 @@ impl OpenAICompatibleBackend {
             "messages": openai_messages,
             "temperature": request.temperature,
             "stream": true,
+            // Without this the final chunk carries no usage at all, and the
+            // context accounting falls back to estimating.
+            "stream_options": { "include_usage": true },
         });
+
+        // Only sent when the user configured one. A gateway rejects a
+        // `max_tokens` above what its model allows, so guessing a large
+        // number would turn working requests into HTTP 400s; leaving it out
+        // keeps the provider's own default, and the output-limit notice tells
+        // the user to raise this setting when that default bites.
+        if self.max_output_tokens > 0 {
+            body["max_tokens"] = json!(self.max_output_tokens);
+        }
 
         // Add tools if present
         if !request.tools.is_empty() {
@@ -174,62 +206,82 @@ impl OpenAICompatibleBackend {
         let mut bad_lines = 0usize;
         // Accumulate tool calls by index
         let mut tool_builders: HashMap<usize, ToolCallBuilder> = HashMap::new();
+        // Whether the provider ended the stream the way it intended: either
+        // its `[DONE]` sentinel or a `finish_reason` on the final chunk.
+        // Gateways differ in which they send and some send both, so either
+        // one counts as a clean ending.
+        let mut saw_done = false;
+        let mut finish_reason: Option<String> = None;
+        // Whether any tool call was emitted. `tool_builders` is drained
+        // before the ending is classified, so this has to be remembered.
+        let mut emitted_tool_call = false;
 
         let mut stream_ended = false;
         loop {
-            // Idle-timeout guard: a stream may run as long as it keeps
-            // producing chunks, but a connection that stays quiet past
-            // `idle_timeout` is dead and must not hang the UI forever.
+            if stream_ended || saw_done {
+                break;
+            }
+            // Two idle windows. Until the model produces anything, the wait
+            // is bounded by `first_token_timeout` — reasoning models can
+            // think for many minutes and some gateways buffer the whole
+            // chain of thought before sending a byte, so a short window here
+            // would kill a healthy request. Once output has started, a quiet
+            // connection really is dead, and `idle_timeout` catches it fast.
+            //
+            // Either window may run forever in total: there is deliberately
+            // no whole-request timeout, so a stream that keeps producing
+            // tokens is never cut off mid-answer.
+            //
             // When the stream closes cleanly, whatever trailing frame the
             // reader still holds (a provider may end without a final
             // newline) is processed too — losing it can truncate tool-call
             // arguments.
-            let payloads = if stream_ended {
-                break;
+            let output_started = emitted || emitted_tool_call || !tool_builders.is_empty();
+            let quiet_limit = if output_started {
+                self.idle_timeout
             } else {
-                match tokio::time::timeout(self.idle_timeout, stream.next()).await {
-                    Ok(Some(Ok(chunk))) => reader.feed(&chunk),
-                    Ok(Some(Err(error))) => {
-                        return Err(if emitted || !tool_builders.is_empty() {
-                            Failure::Fatal(format!(
-                                "stream interrupted after output started: {error}"
-                            ))
-                        } else {
-                            Failure::Transient(format!(
-                                "stream interrupted before any output: {error}"
-                            ))
-                        });
-                    }
-                    Ok(None) => {
-                        stream_ended = true;
-                        reader.flush()
-                    }
-                    Err(_elapsed) => {
-                        let secs = self.idle_timeout.as_secs();
-                        return Err(if emitted || !tool_builders.is_empty() {
-                            Failure::Fatal(format!(
-                                "the connection went quiet for {secs}s after output started"
-                            ))
-                        } else {
-                            Failure::Transient(format!(
-                                "the connection went quiet for {secs}s before any output"
-                            ))
-                        });
-                    }
+                self.first_token_timeout
+            };
+            let payloads = match tokio::time::timeout(quiet_limit, stream.next()).await {
+                Ok(Some(Ok(chunk))) => reader.feed(&chunk),
+                Ok(Some(Err(error))) => {
+                    return Err(if output_started {
+                        Failure::Fatal(format!(
+                            "stream interrupted after output started: {error}"
+                        ))
+                    } else {
+                        Failure::Transient(format!(
+                            "stream interrupted before any output: {error}"
+                        ))
+                    });
+                }
+                Ok(None) => {
+                    stream_ended = true;
+                    reader.flush()
+                }
+                Err(_elapsed) => {
+                    return Err(if output_started {
+                        Failure::Fatal(format!(
+                            "the connection went quiet for {}s after output started",
+                            self.idle_timeout.as_secs()
+                        ))
+                    } else {
+                        // A long wait before the first token means the model
+                        // was probably still working, and a retry would
+                        // restart the same wait — so past a threshold this
+                        // is reported rather than retried.
+                        first_token_timeout_failure(self.first_token_timeout)
+                    });
                 }
             };
             for data in payloads {
                 if data == "[DONE]" {
-                    if in_think {
-                        let _ = tx.send(StreamEvent::Delta("</think>".into())).await;
-                    }
-                    // Emit any accumulated tool calls
-                    for (_, builder) in tool_builders.drain() {
-                        if let Some(tc) = builder.build() {
-                            let _ = tx.send(StreamEvent::ToolCall(tc)).await;
-                        }
-                    }
-                    return Ok(());
+                    // The provider's explicit end-of-stream marker. Tool
+                    // calls and the closing think tag are handled by the
+                    // single exit path below, so a truncated ending can be
+                    // classified in exactly one place.
+                    saw_done = true;
+                    break;
                 }
                 let value: Value = match serde_json::from_str(&data) {
                     Ok(value) => {
@@ -258,6 +310,11 @@ impl OpenAICompatibleBackend {
                     return Err(classify_failure(0, message));
                 }
 
+                // Token counts, on the final chunk when the endpoint honours
+                // stream_options. Gateways that ignore it simply never send one.
+                if let Some(usage) = crate::api::types::usage_from(&value) {
+                    let _ = tx.send(StreamEvent::Usage(usage)).await;
+                }
                 // Content / reasoning deltas (content + reasoning_content variants)
                 let (reasoning, content) = extract_delta_text(&value);
                 if !reasoning.is_empty() {
@@ -330,6 +387,7 @@ impl OpenAICompatibleBackend {
                         let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
                         let args = tc["function"]["arguments"].as_str().unwrap_or("{}").to_string();
                         if !name.is_empty() {
+                            emitted_tool_call = true;
                             let _ = tx
                                 .send(StreamEvent::ToolCall(ToolCall::new(id, name, args)))
                                 .await;
@@ -337,15 +395,11 @@ impl OpenAICompatibleBackend {
                     }
                 }
 
-                // Handle finish_reason to emit tool calls
+                // Record how the provider says the response ended. Tool
+                // calls are emitted by the single exit path below, so the
+                // ending is classified in exactly one place.
                 if let Some(finish) = value["choices"][0]["finish_reason"].as_str() {
-                    if finish == "tool_calls" {
-                        for (_, builder) in tool_builders.drain() {
-                            if let Some(tc) = builder.build() {
-                                let _ = tx.send(StreamEvent::ToolCall(tc)).await;
-                            }
-                        }
-                    }
+                    finish_reason = Some(finish.to_string());
                 }
             }
         }
@@ -353,11 +407,31 @@ impl OpenAICompatibleBackend {
         if in_think {
             let _ = tx.send(StreamEvent::Delta("</think>".into())).await;
         }
-        // Stream ended without [DONE] - emit any remaining tool calls
+        // One exit path for tool calls: the stream is over and the app
+        // processes them after the sender drops, so emitting them here
+        // rather than at the `finish_reason` chunk changes nothing
+        // downstream.
         for (_, builder) in tool_builders.drain() {
             if let Some(tc) = builder.build() {
+                emitted_tool_call = true;
                 let _ = tx.send(StreamEvent::ToolCall(tc)).await;
             }
+        }
+
+        // Classify the ending. A response that stops because the provider
+        // hung up, hit its output cap, or was filtered must never be passed
+        // off as a finished answer — otherwise a truncated reply is
+        // indistinguishable from a complete one.
+        if !saw_done && finish_reason.is_none() && !emitted && !emitted_tool_call {
+            // Nothing arrived at all, so a retry costs nothing and may work.
+            return Err(Failure::Transient(
+                "the provider closed the stream before sending anything".into(),
+            ));
+        }
+        if let Some(notice) = abnormal_stream_end(saw_done, finish_reason.as_deref()) {
+            let output_limit = ended_by_output_limit(finish_reason.as_deref());
+            let _ = tx.send(StreamEvent::Notice(notice)).await;
+            let _ = tx.send(StreamEvent::EndedEarly { output_limit }).await;
         }
 
         Ok(())

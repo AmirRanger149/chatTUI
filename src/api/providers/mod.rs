@@ -26,16 +26,23 @@ use tokio::sync::mpsc::Sender;
 ///
 /// Deliberately no blanket whole-request timeout: it would include reading
 /// the streamed body and cut long generations off mid-answer. Streams are
-/// instead guarded by an *idle* timeout on each chunk (see the backends'
-/// read loops), so a response that keeps producing tokens may run as long
-/// as it needs while a dead connection is still detected.
+/// instead guarded by *two* idle timeouts (see the backends' read loops):
+/// a generous one until the model produces its first output, and a tight one
+/// between chunks after that.
 #[derive(Debug, Clone, Copy)]
 pub struct HttpTimeouts {
     /// How long establishing the connection may take before giving up.
     pub connect: Duration,
-    /// How long the stream may stay quiet between chunks before the
-    /// connection is treated as dead.
+    /// How long the stream may stay quiet between chunks *after output has
+    /// started* before the connection is treated as dead.
     pub idle: Duration,
+    /// How long to wait for the model's **first** output before treating the
+    /// connection as dead. Much longer than [`Self::idle`] on purpose:
+    /// reasoning models can think for many minutes, and some gateways buffer
+    /// the entire chain of thought before sending a single byte. Keeping this
+    /// separate means a long think is not mistaken for a dead connection,
+    /// while a stream that dies mid-answer is still caught quickly.
+    pub first_token: Duration,
 }
 
 impl Default for HttpTimeouts {
@@ -43,6 +50,7 @@ impl Default for HttpTimeouts {
         Self {
             connect: Duration::from_secs(15),
             idle: Duration::from_secs(90),
+            first_token: Duration::from_secs(1800),
         }
     }
 }
@@ -66,13 +74,35 @@ impl ProviderKind {
         api_key: String,
         base_url: String,
         timeouts: HttpTimeouts,
+        // Extended-thinking budget, for the providers that have one. Only
+        // Anthropic reads it today; the others ignore it.
+        thinking_budget: Option<u32>,
+        // Cap on tokens per response. `0` means "send no cap", which leaves
+        // the provider's own default in force — often only a few thousand
+        // tokens, and the usual cause of a tool call whose arguments arrive
+        // cut off mid-JSON.
+        max_output_tokens: u64,
     ) -> Box<dyn ChatBackend> {
         match self {
-            Self::OpenAICompatible => {
-                Box::new(OpenAICompatibleBackend::new(api_key, base_url, timeouts))
-            }
-            Self::Anthropic => Box::new(AnthropicBackend::new(api_key, base_url, timeouts)),
-            Self::Gemini => Box::new(GeminiBackend::new(api_key, base_url, timeouts)),
+            Self::OpenAICompatible => Box::new(OpenAICompatibleBackend::new(
+                api_key,
+                base_url,
+                timeouts,
+                max_output_tokens,
+            )),
+            Self::Anthropic => Box::new(AnthropicBackend::new(
+                api_key,
+                base_url,
+                timeouts,
+                thinking_budget,
+                max_output_tokens,
+            )),
+            Self::Gemini => Box::new(GeminiBackend::new(
+                api_key,
+                base_url,
+                timeouts,
+                max_output_tokens,
+            )),
         }
     }
 }
