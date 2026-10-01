@@ -177,15 +177,6 @@ pub fn fmt_elapsed(secs: u64) -> String {
     format!("{}h {:02}m {:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
 }
 
-/// `980` → `980`, `12500` → `12.5k`.
-pub fn human_tokens(value: usize) -> String {
-    if value >= 1000 {
-        format!("{:.1}k", value as f64 / 1000.0)
-    } else {
-        value.to_string()
-    }
-}
-
 /// Abbreviate `$HOME` to `~` and center-truncate long paths.
 pub fn display_path(path: &str, max_width: usize) -> String {
     let home = std::env::var("HOME").unwrap_or_default();

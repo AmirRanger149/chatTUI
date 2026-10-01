@@ -7,7 +7,8 @@
 //!
 //! - [`composer`]: text editing, cursor movement, paste and history recall
 //! - [`commands`]: slash commands and the slash popup
-//! - [`streaming`]: running a chat request and consuming its tokens
+//! - [`streaming`]: running a chat request, consuming its tokens, and the
+//!   agent's tool rounds (which pause for the user's OK in manual approval)
 //! - [`models`]: the `/model` picker and availability-based default models
 //! - [`providers`]: the `/provider` picker and switching
 //! - [`overlay`]: the full-screen popups (shortcuts, history, code, models)
@@ -85,6 +86,21 @@ pub struct RetryView {
     pub reason: String,
 }
 
+/// A tool round paused on an approval prompt. A round's calls run in order;
+/// when one needs the user's OK the round is parked in `App::tool_round` and
+/// the UI keeps running, so the prompt can be drawn and answered. It resumes
+/// from `receive_token` once `answer` is set. A round only lives in `App`
+/// while it is paused: one that needs no answers runs to the end in one go.
+struct ToolRound {
+    calls: Vec<ToolCall>,
+    /// Index of the call that runs next — while parked, the one being asked about.
+    next: usize,
+    /// How many of the calls that already ran failed (feeds the health guards).
+    failures: usize,
+    /// The user's answer for `calls[next]`; `None` while the prompt is up.
+    answer: Option<bool>,
+}
+
 pub struct App {
     pub config: Config,
     pub sessions: SessionManager,
@@ -121,6 +137,12 @@ pub struct App {
     /// Tool rounds completed in the current agent run (display + ceiling).
     pub agent_iterations: usize,
     pub agent_mode: bool,
+    /// `/approve`: `false` = auto (tools run on their own), `true` = manual
+    /// (the agent pauses for the user's OK before it writes, edits or runs
+    /// shell commands). Always starts in auto.
+    pub manual_approval: bool,
+    /// The tool round parked on an approval prompt, if any.
+    tool_round: Option<ToolRound>,
     /// Configured backstop ceiling for tool rounds (`agent.max_rounds`).
     pub agent_max_rounds: usize,
     /// Fingerprint (sorted name+arguments) of the previous tool round —
@@ -226,6 +248,8 @@ impl App {
             pending_tool_calls: Vec::new(),
             agent_iterations: 0,
             agent_mode: true, // Agent mode enabled by default when sandbox enabled
+            manual_approval: false,
+            tool_round: None,
             agent_max_rounds,
             agent_last_round_key: None,
             agent_repeat_failures: 0,
@@ -319,6 +343,16 @@ impl App {
         self.streaming = false;
         self.stream_started = None;
         self.pending_tool_calls.clear();
+        // A round paused on an approval prompt never ran its remaining
+        // calls: answer each one so the saved history keeps its
+        // assistant/tool pairing and can be replayed.
+        if let Some(round) = self.tool_round.take() {
+            for call in round.calls.iter().skip(round.next) {
+                let note = "interrupted by the user before this tool could run".to_string();
+                self.push_tool_result(call.id.clone(), note.clone(), true);
+                self.sessions.add_tool_result(call.id.clone(), note);
+            }
+        }
         self.reset_agent_health();
         self.truncated_tool_calls.clear();
         self.retry_state = None;
@@ -419,18 +453,8 @@ impl App {
     pub fn context_summary(&self) -> String {
         let session = self.sessions.current();
         let messages = session.messages.len();
-        let chars: usize = session.messages.iter().map(|m| m.content.len()).sum();
-        let sandbox_status = if !self.config.sandbox.enabled {
-            " · sandbox:off"
-        } else if self.sandbox.has_target() {
-            " · sandbox:on"
-        } else {
-            " · sandbox:no-target"
-        };
-        format!(
-            "{messages} msgs · ~{} tok{sandbox_status}",
-            crate::ui::theme::human_tokens(chars / 4)
-        )
+        let approval = if self.manual_approval { " · approve:manual" } else { "" };
+        format!("{messages} msgs{approval}")
     }
 }
 

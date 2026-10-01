@@ -16,6 +16,7 @@ pub const SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd { name: "/model", desc: "Pick a model from the API's list" },
     SlashCmd { name: "/provider", desc: "Select API provider" },
     SlashCmd { name: "/agent", desc: "Toggle agent mode (sandbox tools)" },
+    SlashCmd { name: "/approve", desc: "Toggle tool approval: auto / manual" },
     SlashCmd { name: "/sandbox", desc: "Show or set agent target dir" },
     SlashCmd { name: "/quit", desc: "Exit chatTUI" },
 ];
@@ -134,6 +135,28 @@ impl App {
                     );
                 }
             }
+            "/approve" => {
+                // No argument toggles; naming the mode sets it, so a typed
+                // `/approve manual` can never flip the wrong way.
+                let manual = match argument.to_ascii_lowercase().as_str() {
+                    "" => !self.manual_approval,
+                    "manual" => true,
+                    "auto" => false,
+                    other => {
+                        self.push_error(format!(
+                            "unknown approval mode: '{other}' — use /approve, /approve auto or /approve manual"
+                        ));
+                        return;
+                    }
+                };
+                self.manual_approval = manual;
+                let notice = if manual {
+                    "approval: manual — you will be asked before the agent writes or edits files or runs shell commands (y approve, n deny)"
+                } else {
+                    "approval: auto — the agent runs its tools without asking"
+                };
+                self.push_notice(notice.into());
+            }
             "/sandbox" => {
                 if argument.is_empty() {
                     self.push_sandbox_status();
@@ -209,8 +232,9 @@ impl App {
         };
         let status = if self.sandbox.config.enabled { "enabled" } else { "disabled" };
         let agent = if self.agent_mode { "on" } else { "off" };
+        let approval = if self.manual_approval { "manual" } else { "auto" };
         self.push_notice(format!(
-            "sandbox: {status} | agent: {agent} | root: {root} | mode: {} | shell: {} | shell-timeout: {}s | os-isolation: {} | auto-approve: {}",
+            "sandbox: {status} | agent: {agent} | root: {root} | mode: {} | shell: {} | shell-timeout: {}s | os-isolation: {} | auto-approve: {} | approval: {approval}",
             self.sandbox.config.permission_mode.as_str(),
             self.sandbox.config.allow_shell,
             self.sandbox.config.effective_shell_timeout().as_secs(),
@@ -332,6 +356,45 @@ mod tests {
         app.submit();
         assert_ne!(app.agent_mode, initial);
         assert!(matches!(app.cells.last(), Some(Cell::Notice(_))));
+    }
+
+    #[test]
+    fn approve_toggles_between_auto_and_manual() {
+        let mut app = test_app();
+        assert!(!app.manual_approval, "tools start in auto");
+        app.composer = "/approve".into();
+        app.submit();
+        assert!(app.manual_approval);
+        assert!(matches!(
+            app.cells.last(),
+            Some(Cell::Notice(text)) if text.contains("manual")
+        ));
+        app.composer = "/approve".into();
+        app.submit();
+        assert!(!app.manual_approval);
+        assert!(matches!(
+            app.cells.last(),
+            Some(Cell::Notice(text)) if text.contains("auto")
+        ));
+    }
+
+    #[test]
+    fn approve_with_a_mode_sets_it_instead_of_toggling() {
+        let mut app = test_app();
+        for _ in 0..2 {
+            app.composer = "/approve manual".into();
+            app.submit();
+            assert!(app.manual_approval, "naming manual twice must stay manual");
+        }
+        app.composer = "/approve AUTO".into();
+        app.submit();
+        assert!(!app.manual_approval);
+
+        // Anything else is reported and changes nothing.
+        app.composer = "/approve sometimes".into();
+        app.submit();
+        assert!(!app.manual_approval);
+        assert!(matches!(app.cells.last(), Some(Cell::Error(_))));
     }
 
     #[test]

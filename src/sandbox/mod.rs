@@ -604,6 +604,17 @@ impl Sandbox {
             other => Err(anyhow!("unknown tool: {}", other)),
         }
     }
+
+    /// Execute a tool call the user has approved: whatever the permission
+    /// mode asks about (`ask-*`) is granted for this call. Everything else
+    /// still applies unchanged — kinds the mode denies outright,
+    /// `allow_shell`, workspace paths, the sensitive-file policy and shell
+    /// isolation — so an approval can never widen what the config permits.
+    pub async fn execute_approved_tool(&self, tool_call: &ToolCall) -> Result<String> {
+        let mut approved = self.clone();
+        approved.config.permission_mode = approved.config.permission_mode.approved();
+        approved.execute_tool(tool_call).await
+    }
 }
 
 /// Which direction an access check is for.
@@ -1448,7 +1459,8 @@ mod tests {
         let err = sandbox.bash("echo hi").await.unwrap_err();
         assert!(err.to_string().contains("permission denied"));
 
-        // ask-before-write denies until interactive approval exists.
+        // ask-before-write denies a write that was not approved (the app asks
+        // first and runs approved calls via `execute_approved_tool`).
         let mut cfg = SandboxConfig::default();
         cfg.workspace_root = dir.canonicalize().unwrap();
         cfg.permission_mode = PermissionMode::AskBeforeWrite;

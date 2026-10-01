@@ -1,6 +1,7 @@
 //! The `• Working (12s • esc to interrupt)` row drawn above the composer
 //! while a response is streaming — plus the shimmering `Retrying` countdown
-//! shown while the client waits out a same-model retry backoff.
+//! shown while the client waits out a same-model retry backoff, and the
+//! `Waiting for your approval` row while a tool call needs a `y` / `n`.
 
 use crate::app::{App, RetryView};
 use crate::ui::theme::{self, SPINNER};
@@ -10,6 +11,10 @@ use ratatui::widgets::Paragraph;
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
+        return;
+    }
+    if app.awaiting_approval() {
+        render_approval(frame, area, app);
         return;
     }
     if let Some(retry) = &app.retry_state {
@@ -41,6 +46,25 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             format!("({} • ", theme::fmt_elapsed(app.elapsed_secs())),
             theme::dim(),
         ),
+        Span::raw("esc"),
+        Span::styled(" to interrupt)", theme::dim()),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// The `✻ Waiting for your approval (y approve • n deny • esc to interrupt)`
+/// row: the agent is paused on a tool call until the user answers (`/approve`).
+fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
+    let glyph = SPINNER[(app.elapsed_ms() / 120) as usize % SPINNER.len()];
+    let line = Line::from(vec![
+        Span::styled(glyph, Style::new().fg(Color::Yellow).bold()),
+        Span::raw(" "),
+        Span::styled("Waiting for your approval", Style::new().bold()),
+        Span::styled(" (", theme::dim()),
+        Span::raw("y"),
+        Span::styled(" approve • ", theme::dim()),
+        Span::raw("n"),
+        Span::styled(" deny • ", theme::dim()),
         Span::raw("esc"),
         Span::styled(" to interrupt)", theme::dim()),
     ]);

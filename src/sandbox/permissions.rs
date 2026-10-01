@@ -1,10 +1,10 @@
 //! Minimal permission layer for agent tool execution.
 //!
 //! This is an *application-level policy*, not an OS security boundary: it
-//! decides which classes of tools may run at all. It is deliberately small
-//! so a future phase can add interactive approval without changing its
-//! shape: the `Ask*` modes mark requests that should one day prompt the
-//! user instead of being allowed silently.
+//! decides which classes of tools may run at all. The `Ask*` modes mark the
+//! requests that need the user's approval first: the app asks (the same
+//! prompt `/approve` uses) and runs the call only on a yes — see
+//! [`PermissionMode::approved`].
 
 use anyhow::Result;
 
@@ -47,18 +47,18 @@ impl ToolKind {
 /// Application-level permission mode.
 ///
 /// Enabling agent mode never widens permissions by itself: the mode comes
-/// from configuration only. `Ask*` modes model "ask before doing X"; the
-/// interactive approval prompt is not implemented yet, so those requests
-/// are **denied** with an explanatory error rather than silently allowed.
+/// from configuration only. `Ask*` modes model "ask before doing X": the app
+/// asks the user first, and a call that was not approved is **denied** with
+/// an explanatory error rather than silently allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionMode {
     /// Only read-class tools.
     ReadOnly,
     /// Read + write/edit inside the workspace; no shell.
     WorkspaceWrite,
-    /// Read; writes would ask first (currently denied).
+    /// Read; writes ask first (shell is not allowed).
     AskBeforeWrite,
-    /// Read + write; shell would ask first (currently denied).
+    /// Read + write; shell asks first.
     AskBeforeShell,
     /// Everything the master switches (`allow_shell`, target set) permit.
     FullAuto,
@@ -97,6 +97,18 @@ impl PermissionMode {
         }
     }
 
+    /// The mode once the user has said yes to what this mode asks about: the
+    /// `ask-*` modes become the mode that simply allows those kinds. Every
+    /// other mode is unchanged, so approving never grants anything a mode
+    /// forbids outright.
+    pub fn approved(self) -> PermissionMode {
+        match self {
+            PermissionMode::AskBeforeWrite => PermissionMode::WorkspaceWrite,
+            PermissionMode::AskBeforeShell => PermissionMode::FullAuto,
+            other => other,
+        }
+    }
+
     /// Whether `kind` is allowed outright by this mode.
     pub fn allows(self, kind: ToolKind) -> bool {
         match self {
@@ -108,9 +120,8 @@ impl PermissionMode {
         }
     }
 
-    /// True when this mode would want to ask the user before running
-    /// `kind` (interactive approval is not implemented yet, so `authorize`
-    /// turns these into denials).
+    /// True when this mode asks the user before running `kind`. Without an
+    /// approval, `authorize` turns these into denials.
     pub fn asks(self, kind: ToolKind) -> bool {
         !self.allows(kind)
             && match (self, kind) {
@@ -131,7 +142,7 @@ impl PermissionMode {
                 "shell additionally needs 'full-auto' (and sandbox.allow_shell = true)"
             }
             PermissionMode::AskBeforeWrite | PermissionMode::AskBeforeShell => {
-                "interactive approval is not implemented yet — set 'workspace-write' (file tools) or 'full-auto' (file tools + shell) explicitly in config.json"
+                "set 'workspace-write' (file tools) or 'full-auto' (file tools + shell) explicitly in config.json"
             }
             PermissionMode::FullAuto => "check sandbox.allow_shell in config.json",
         }
@@ -146,7 +157,7 @@ pub(crate) fn authorize(mode: PermissionMode, kind: ToolKind) -> Result<()> {
     }
     if mode.asks(kind) {
         return Err(anyhow::anyhow!(
-            "permission denied: '{}' requires interactive approval (mode '{}'), which is not implemented yet — the request was denied. {}",
+            "permission denied: '{}' requires the user's approval (mode '{}') and was not approved. {}",
             kind.as_str(),
             mode.as_str(),
             mode.remedy()
@@ -196,6 +207,22 @@ mod tests {
         assert!(!PermissionMode::WorkspaceWrite.asks(ToolKind::Shell));
 
         assert!(PermissionMode::FullAuto.allows(ToolKind::Shell));
+    }
+
+    #[test]
+    fn approval_grants_exactly_what_the_ask_modes_ask_about() {
+        let write = PermissionMode::AskBeforeWrite.approved();
+        assert!(write.allows(ToolKind::Write) && write.allows(ToolKind::Edit));
+        assert!(!write.allows(ToolKind::Shell), "shell was never asked about");
+        assert!(PermissionMode::AskBeforeShell.approved().allows(ToolKind::Shell));
+        // Modes that do not ask are untouched: approving can't widen them.
+        for mode in [
+            PermissionMode::ReadOnly,
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::FullAuto,
+        ] {
+            assert_eq!(mode.approved(), mode);
+        }
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! Full-screen overlays: the keyboard-shortcuts popup (`?` / `/help`) and the
 //! conversation-history picker (`ctrl+h` / `/history`). Both are dim rounded
-//! cards centered over the interface.
+//! cards centered over the interface — as is the tool-approval prompt.
 
+use crate::api::types::ToolCall;
 use crate::app::{App, Overlay};
 use crate::ui::theme;
 use ratatui::prelude::*;
@@ -62,6 +63,81 @@ fn shortcuts(frame: &mut Frame, area: Rect) {
         ]));
     }
     render_card(frame, area, lines);
+}
+
+/// The most wrapped rows of a shell command the approval card shows.
+const APPROVAL_COMMAND_ROWS: usize = 16;
+
+/// The tool-approval prompt: what the agent wants to do, so the user can
+/// answer `y` / `n`. Shown while the agent is paused in manual approval (see
+/// `/approve`); `ctrl+t` opens the diff or command in the inspector.
+pub fn approval(frame: &mut Frame, area: Rect, call: &ToolCall) {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Approve this tool call?", Style::new().bold()),
+            Span::styled(
+                "   y approve · n deny · ctrl+t details · esc interrupt",
+                theme::dim(),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    // The border takes four columns. Vertically the card spends six rows on
+    // everything but the command (border, title, heading, "more rows" note),
+    // so a command that does not fit is cut with a note instead of being
+    // silently clipped by the screen edge.
+    let width = (area.width as usize).saturating_sub(4).clamp(20, 100);
+    let rows = (area.height as usize)
+        .saturating_sub(6)
+        .clamp(1, APPROVAL_COMMAND_ROWS);
+    lines.extend(approval_lines(call, width, rows));
+    render_card(frame, area, lines);
+}
+
+/// The body of the approval card. A shell command is shown wrapped, up to
+/// `max_rows` rows and with a note when more follow, because it is exactly
+/// what the user is being asked to allow; file changes show the path and size
+/// (the diff is behind `ctrl+t`).
+fn approval_lines(call: &ToolCall, width: usize, max_rows: usize) -> Vec<Line<'static>> {
+    let args = serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap_or_default();
+    let text = |key: &str| args[key].as_str().unwrap_or("?").to_string();
+    let count = |key: &str| args[key].as_str().map(|s| s.lines().count()).unwrap_or(0);
+    let header_style = Style::new().fg(Color::Yellow).bold();
+    let header = |title: String| Line::from(Span::styled(format!("🔧 {title}"), header_style));
+    match call.name.as_str() {
+        "bash" => {
+            // Wrap row by row: the wrapper itself would flatten line breaks.
+            let mut rows: Vec<Line<'static>> = Vec::new();
+            for row in text("command").lines() {
+                rows.extend(theme::wrap_styled(
+                    vec![Span::raw(row.to_string())],
+                    width,
+                    Span::styled("$ ", Style::new().fg(theme::ACCENT).bold()),
+                    Span::raw("  "),
+                ));
+            }
+            if rows.len() > max_rows {
+                let hidden = rows.len() - max_rows;
+                rows.truncate(max_rows);
+                rows.push(Line::styled(format!("… {hidden} more rows not shown"), theme::dim()));
+            }
+            let mut lines = vec![header("Run shell command".to_string())];
+            lines.extend(rows);
+            lines
+        }
+        "write_file" => vec![header(format!(
+            "Write {} · {} lines",
+            text("path"),
+            count("content")
+        ))],
+        "edit_file" => vec![header(format!(
+            "Edit {} · +{} -{}",
+            text("path"),
+            count("new_string"),
+            count("old_string")
+        ))],
+        other => vec![header(other.to_string())],
+    }
 }
 
 /// The `ctrl+t` tool inspector: what a write/edit/list/bash call actually
@@ -419,6 +495,90 @@ mod tests {
         terminal.draw(|frame| crate::ui::render(frame, &app)).unwrap();
         app.overlay = Some(Overlay::Providers { selected: 1 });
         terminal.draw(|frame| crate::ui::render(frame, &app)).unwrap();
+    }
+
+    /// The text of each row, without styling.
+    fn plain(lines: Vec<Line<'static>>) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn approval_card_shows_the_command_wrapped_with_its_line_breaks() {
+        let call = ToolCall::new(
+            "c1",
+            "bash",
+            r#"{"command":"echo alpha beta gamma delta\nrm -rf build && echo finished"}"#,
+        );
+        let rows = plain(approval_lines(&call, 24, APPROVAL_COMMAND_ROWS));
+        let shown = rows.join("\n");
+        // Every word of the command is on screen: nothing is cut off.
+        for word in ["echo", "alpha", "delta", "rm", "-rf", "build", "finished"] {
+            assert!(shown.contains(word), "{word} missing from:\n{shown}");
+        }
+        // A line break in the command stays a line break.
+        assert!(rows.iter().any(|row| row.starts_with("$ rm")), "{shown}");
+        assert!(rows.iter().all(|row| theme::cell_width(row) <= 24), "{shown}");
+    }
+
+    #[test]
+    fn approval_card_says_so_when_a_long_command_is_cut_short() {
+        let command = (1..=30)
+            .map(|n| format!("echo line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let args = serde_json::json!({ "command": command }).to_string();
+        let call = ToolCall::new("c1", "bash", args);
+
+        let shown = plain(approval_lines(&call, 40, 5)).join("\n");
+        assert!(shown.contains("echo line5"), "{shown}");
+        assert!(!shown.contains("echo line6"), "{shown}");
+        assert!(shown.contains("25 more rows not shown"), "{shown}");
+
+        // Room for everything: no note.
+        let shown = plain(approval_lines(&call, 40, 40)).join("\n");
+        assert!(shown.contains("echo line30") && !shown.contains("more rows"), "{shown}");
+    }
+
+    #[test]
+    fn approval_card_summarizes_file_changes_and_renders_everywhere() {
+        let write = ToolCall::new("c1", "write_file", r#"{"path":"a.txt","content":"x\ny"}"#);
+        let text = plain(approval_lines(&write, 40, 16)).join("\n");
+        assert!(text.contains("Write a.txt") && text.contains("2 lines"), "{text}");
+        let edit = ToolCall::new(
+            "c1",
+            "edit_file",
+            r#"{"path":"a.txt","old_string":"a","new_string":"b\nc"}"#,
+        );
+        let text = plain(approval_lines(&edit, 40, 16)).join("\n");
+        assert!(text.contains("Edit a.txt") && text.contains("+2 -1"), "{text}");
+
+        let draw = |terminal: &mut Terminal<TestBackend>, call: &ToolCall| {
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    approval(frame, area, call);
+                })
+                .unwrap();
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for (name, args) in [
+            ("bash", r#"{"command":"cargo test"}"#),
+            ("write_file", r#"{"path":"a.txt","content":"x\ny"}"#),
+            ("edit_file", r#"{"path":"a.txt","old_string":"a","new_string":"b\nc"}"#),
+            ("mystery", "{}"),
+            ("bash", "not json"),
+        ] {
+            draw(&mut terminal, &ToolCall::new("c1", name, args));
+        }
+        // Tiny terminals must not panic either.
+        let long = serde_json::json!({ "command": "echo hello world ".repeat(40) }).to_string();
+        for (width, height) in [(10, 3), (30, 8), (200, 60)] {
+            let mut tiny = Terminal::new(TestBackend::new(width, height)).unwrap();
+            draw(&mut tiny, &ToolCall::new("c1", "bash", long.clone()));
+        }
     }
 
     #[test]

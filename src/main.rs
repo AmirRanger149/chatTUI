@@ -225,6 +225,26 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         _ => {}
     }
 
+    // A tool call waiting for approval owns the answer keys: `y` runs it,
+    // `n` denies it. Everything else is swallowed so nothing typed while the
+    // prompt is up lands in the composer (esc still interrupts the run, and
+    // pgup/pgdn scrolled above). Only a plain press answers — not a repeat
+    // event (a held key, on backends that report one) and not a ctrl/alt
+    // combination — so a stray key can't approve a call.
+    if app.awaiting_approval() {
+        let deliberate = key.kind == KeyEventKind::Press
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT);
+        if deliberate {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.answer_approval(true),
+                KeyCode::Char('n') | KeyCode::Char('N') => app.answer_approval(false),
+                _ => {}
+            }
+        }
+        return true;
+    }
+
     // Nothing else claimed the key, so it belongs to the composer.
     match key.code {
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {

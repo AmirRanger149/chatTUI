@@ -70,6 +70,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     if let Some(overlay) = app.overlay {
         overlay::render(frame, area, app, overlay);
+    } else if let Some(call) = app.approval_request() {
+        // The agent is paused on a tool call. Overlays (`ctrl+t` to inspect
+        // the call) win while open; the prompt is back as soon as they close.
+        overlay::approval(frame, area, call);
     }
 }
 

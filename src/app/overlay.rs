@@ -56,11 +56,21 @@ impl App {
         }
     }
 
+    /// A tool round paused on an approval prompt belongs to the conversation
+    /// on screen. Before that conversation is left or deleted, end the run
+    /// so its calls are answered in the right history, not the next one.
+    fn stop_paused_round(&mut self) {
+        if self.tool_round.is_some() {
+            self.interrupt();
+        }
+    }
+
     pub fn load_selected_session(&mut self) {
         let Some(Overlay::History { selected }) = self.overlay else {
             return;
         };
         if selected != self.sessions.current_index() {
+            self.stop_paused_round();
             self.sessions.select(selected);
             self.rebuild_cells();
             self.scroll_from_bottom = 0;
@@ -76,6 +86,9 @@ impl App {
             return;
         }
         let was_current = selected == self.sessions.current_index();
+        if was_current {
+            self.stop_paused_round();
+        }
         self.sessions.delete_at(selected);
         let len = self.sessions.len();
         if let Some(Overlay::History { selected }) = &mut self.overlay {
