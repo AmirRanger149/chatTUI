@@ -17,7 +17,6 @@ pub const SLASH_COMMANDS: &[SlashCmd] = &[
     SlashCmd { name: "/provider", desc: "Select API provider" },
     SlashCmd { name: "/agent", desc: "Toggle agent mode (sandbox tools)" },
     SlashCmd { name: "/sandbox", desc: "Show or set agent target dir" },
-    SlashCmd { name: "/target", desc: "Set agent target directory" },
     SlashCmd { name: "/quit", desc: "Exit chatTUI" },
 ];
 
@@ -135,7 +134,7 @@ impl App {
                     );
                 }
             }
-            "/sandbox" | "/target" => {
+            "/sandbox" => {
                 if argument.is_empty() {
                     self.push_sandbox_status();
                 } else if let Err(error) = self.set_sandbox_target(&argument) {
