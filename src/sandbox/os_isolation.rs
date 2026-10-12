@@ -105,6 +105,7 @@ impl Default for OsIsolation {
 }
 
 /// Outcome of trying to confine the current thread.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct IsolationReport {
     /// Filesystem confinement (Landlock) applied.
@@ -117,6 +118,7 @@ pub struct IsolationReport {
 
 /// Cheap check used by tests and error messages: probes both facilities on
 /// a throwaway thread (restrictions die with the thread).
+#[cfg(test)]
 pub fn os_isolation_supported() -> bool {
     let handle = std::thread::Builder::new()
         .name("isolation-probe".into())
@@ -135,7 +137,7 @@ pub fn os_isolation_supported() -> bool {
 /// irreversible for that thread, and everything it spawns afterwards
 /// inherits them. `writable_roots` get full filesystem access; the entries
 /// of `write_only_paths` get write access only.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn restrict_current_thread(
     writable_roots: &[PathBuf],
     write_only_paths: &[&'static str],
@@ -163,7 +165,7 @@ pub(crate) fn restrict_current_thread(
     report
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(test, not(target_os = "linux")))]
 pub(crate) fn restrict_current_thread(
     _writable_roots: &[PathBuf],
     _write_only_paths: &[&'static str],

@@ -111,7 +111,7 @@ fn header_lines(app: &App, max_inner: usize) -> Vec<Line<'static>> {
             Color::Green,
         )
     } else {
-        ("no target — /sandbox <dir>".to_string(), Color::Yellow)
+        ("no target ".to_string(), Color::Yellow)
     };
     let sandbox_line = vec![
         Span::styled(sandbox_label, theme::dim()),
