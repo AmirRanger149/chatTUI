@@ -35,10 +35,7 @@ pub fn render(src: &str, width: usize) -> Vec<Line<'static>> {
 
         // Horizontal rule
         if trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-' || c == '_' || c == '*') {
-            out.push(Line::styled(
-                "─".repeat(24.min(width.max(1))),
-                theme::dim(),
-            ));
+            out.push(Line::styled("─".repeat(24.min(width.max(1))), theme::dim()));
             continue;
         }
 
@@ -64,10 +61,7 @@ pub fn render(src: &str, width: usize) -> Vec<Line<'static>> {
 
         // Blockquote
         if let Some(rest) = trimmed.strip_prefix("> ") {
-            let spans = vec![Span::styled(
-                rest.to_string(),
-                Style::new().dim().italic(),
-            )];
+            let spans = vec![Span::styled(rest.to_string(), Style::new().dim().italic())];
             out.extend(wrap_styled(
                 spans,
                 width,
@@ -78,10 +72,7 @@ pub fn render(src: &str, width: usize) -> Vec<Line<'static>> {
         }
 
         // Unordered list
-        if trimmed.starts_with("- ")
-            || trimmed.starts_with("* ")
-            || trimmed.starts_with("+ ")
-        {
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
             let pad = " ".repeat(indent.min(8));
             let content = trimmed[2..].trim_start();
             let spans = inline(content, Style::new());
@@ -160,10 +151,7 @@ fn code_body(line: &str, width: usize) -> Vec<Line<'static>> {
         .map(|row| {
             let used = theme::line_width(&row);
             let pad = band.saturating_sub(1 + used);
-            let mut spans = vec![
-                Span::styled("│", theme::dim()),
-                Span::styled(" ", shade),
-            ];
+            let mut spans = vec![Span::styled("│", theme::dim()), Span::styled(" ", shade)];
             spans.extend(row.spans);
             spans.push(Span::styled(" ".repeat(pad), shade));
             spans.push(Span::styled("│", theme::dim()));
@@ -328,7 +316,9 @@ mod tests {
         let text = plain(&lines);
         assert!(text[0].starts_with('╭'));
         assert!(text[0].contains("rust"));
-        assert!(text.iter().any(|l| l.contains('│') && l.contains("let x = 1;")));
+        assert!(text
+            .iter()
+            .any(|l| l.contains('│') && l.contains("let x = 1;")));
         assert!(text.last().unwrap().starts_with('╰'));
     }
 
@@ -346,8 +336,9 @@ mod tests {
     fn inline_styles_are_applied() {
         let spans = inline("**bold** and `code`", Style::new());
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert!(spans.iter().any(|s| s.content == "code"
-            && s.style.fg == Some(theme::ACCENT)));
+        assert!(spans
+            .iter()
+            .any(|s| s.content == "code" && s.style.fg == Some(theme::ACCENT)));
     }
 
     #[test]

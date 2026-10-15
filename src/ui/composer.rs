@@ -131,10 +131,7 @@ pub fn render_prompt(frame: &mut Frame, area: Rect, app: &App) -> Option<Positio
                 theme::user_prefix(),
                 Span::styled(crate::app::PLACEHOLDER.to_string(), theme::dim()),
             ])),
-            Rect {
-                height: 1,
-                ..area
-            },
+            Rect { height: 1, ..area },
         );
         return Some(Position::new(area.x + PREFIX_W as u16, area.y));
     }
@@ -171,9 +168,7 @@ pub fn render_prompt(frame: &mut Frame, area: Rect, app: &App) -> Option<Positio
     }
 
     let row_in_window = layout.cursor_row.saturating_sub(start) as u16;
-    let col = layout
-        .cursor_col
-        .min(area.width.saturating_sub(1) as usize) as u16;
+    let col = layout.cursor_col.min(area.width.saturating_sub(1) as usize) as u16;
     Some(Position::new(area.x + col, area.y + row_in_window))
 }
 
@@ -232,7 +227,11 @@ pub fn slash_popup_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let end = (start + max_rows).min(items.len());
     let shown = &items[start..end];
 
-    let name_w = shown.iter().map(|c| theme::cell_width(c.name)).max().unwrap_or(0);
+    let name_w = shown
+        .iter()
+        .map(|c| theme::cell_width(c.name))
+        .max()
+        .unwrap_or(0);
     let desc_limit = width.saturating_sub(name_w + 6).max(8);
 
     let mut rows: Vec<(String, bool)> = shown

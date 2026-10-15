@@ -65,6 +65,31 @@ Or run directly while developing:
 cargo run
 ```
 
+The optimized binary lands at `target/release/chat-tui`.
+
+## Command-Line Flags
+
+```text
+chat-tui [--sandbox <dir>] [--help]
+```
+
+| Flag | Action |
+| --- | --- |
+| `--sandbox <dir>` | Set the agent target directory — the root the file tools are confined to. Required before the agent can read or write anything |
+| `--target <dir>` | Alias for `--sandbox` |
+| `--workspace <dir>` | Alias for `--sandbox` |
+| `--help`, `-h` | Print the flag list and exit |
+
+The directory must already exist. An unknown flag is an error, not a silent
+no-op. This is the same setting as `sandbox.workspace_root` in `config.json`,
+and you can show or change it at any time from inside the app with
+`/sandbox <dir>`.
+
+```bash
+# Run the agent against a specific project
+./target/release/chat-tui --sandbox ~/code/my-project
+```
+
 ## Configuration (`config.json`)
 
 `chatTUI` looks for `config.json` in the application directory or the current working directory.
@@ -213,6 +238,14 @@ marked `· custom`) or directly with `/provider openai|anthropic|gemini|<custom-
 | `connect_timeout_secs` | Max seconds to wait while establishing an API connection | `15` |
 | `idle_timeout_secs` | Max seconds a stream may stay quiet between chunks before the connection counts as dead — this is *not* a cap on total generation time | `90` |
 | `agent.max_rounds` | Backstop ceiling for agent tool rounds. A safety net only — healthy runs keep going as long as they make progress; broken loops are stopped earlier by the stagnation and consecutive-failure guards | `50` |
+| `sandbox.enabled` | Master switch for agent tool execution | `true` |
+| `sandbox.workspace_root` | Agent target directory. Empty means unset — it never defaults to the current directory or the crate. Same as `--sandbox <dir>` | `""` |
+| `sandbox.permission_mode` | `read-only`, `workspace-write`, `ask-before-write`, `ask-before-shell` or `full-auto`. An unknown value fails closed to `read-only` and says so in the transcript | derived from the two legacy flags below |
+| `sandbox.auto_approve` | Legacy flag, consulted only when `permission_mode` is unset | `true` |
+| `sandbox.allow_shell` | Master switch for the `bash` tool (also a legacy flag when `permission_mode` is unset) | `true` |
+| `sandbox.shell_timeout_secs` | Hard timeout for `bash`; the command's process group is killed when it expires. Clamped to at least 1s, so it can never mean "no timeout" | `30` |
+| `sandbox.os_isolation` | `auto` (confine when the Linux kernel supports it, warn honestly otherwise), `require` (refuse to run `bash` when unavailable) or `off` | `auto` |
+| `sandbox.extra_sensitive_names` | Extra file names appended to the built-in sensitive-file policy. An entry starting with `.` matches any name ending with it; anything else must equal the name (case-insensitively) | `[]` |
 
 > **Retries & timeouts.** Transient failures (network errors, timeouts,
 > HTTP 408/429/5xx) retry the *same* model up to three times with
@@ -258,18 +291,24 @@ The composer is always focused — just start typing and press `Enter` to send.
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Send the message |
-| `Shift+Enter` | Newline in the composer |
+| `Enter` | Send the message (inside a popup: open / apply the highlighted entry) |
+| `Shift+Enter` / `Alt+Enter` | Newline in the composer |
 | `Esc` | Close a popup, then interrupt a running stream, then clear the composer |
 | `Ctrl+H` | Conversation history |
 | `Ctrl+T` | Inspect tool activity — write/edit diffs, bash command + output |
 | `Ctrl+G` | Browse and copy code blocks |
 | `Ctrl+R` | Show / hide model reasoning |
-| `PgUp` / `PgDn` | Scroll the transcript |
-| `Up` / `Down` | Recall previous prompts |
-| `←` / `→` | Move the cursor (`Ctrl` jumps whole words) |
+| `PgUp` / `PgDn` | Scroll the transcript (inside a popup: page through the list) |
+| `Up` / `Down` | Recall previous prompts (inside a popup or the slash palette: move the selection) |
+| `←` / `→` | Move the cursor one letter |
+| `Ctrl+←` / `Ctrl+→`, `Alt+B` / `Alt+F` | Jump a whole word |
+| `Home` / `End` | Jump to the start / end of the composer |
 | `Ctrl+U` | Clear the composer |
-| `?` | Keyboard shortcuts |
+| `Tab` | Complete the highlighted slash command |
+| `y` / `n` | Approve / decline the tool call the agent is paused on |
+| `d` | Delete the highlighted conversation (history popup) |
+| `r` or `R` | Re-fetch the model list (model picker) |
+| `?` | Keyboard shortcuts (only while the composer is empty) |
 | `Ctrl+C` ×2 | Quit |
 
 ### Slash commands
@@ -282,6 +321,9 @@ The composer is always focused — just start typing and press `Enter` to send.
 | `/code` | Browse and copy code blocks |
 | `/model` | Pick a model from the API's live list (`/model <id>` sets one directly) |
 | `/provider` | Select API provider (`/provider <name>` sets one directly) |
+| `/agent` | Toggle agent mode (the sandbox file + shell tools) |
+| `/approve` | Toggle tool approval — `/approve auto` or `/approve manual` |
+| `/sandbox` | Show the agent target directory and security settings; `/sandbox <path>` sets it |
 | `/quit` | Exit chatTUI |
 
 Type `/` to open the command palette, then `Tab` to complete.
@@ -439,9 +481,17 @@ and a shell. What is actually enforced — and what is not:
   in-process sandbox can close it.
 - **Permissions:** `sandbox.permission_mode` selects `read-only`,
   `workspace-write`, `ask-before-write`, `ask-before-shell` or `full-auto`.
-  When unset, the legacy `auto_approve` / `allow_shell` flags decide.
-  `ask-*` modes currently deny the gated action (interactive approval is
-  not implemented yet) instead of allowing it silently.
+  When unset, the legacy `auto_approve` / `allow_shell` flags decide; an
+  unknown value fails closed to `read-only` and says so in the transcript.
+  `ask-*` modes pause the agent on an approval card showing exactly what is
+  about to run — the full shell command, or the file plus its `+added
+  -removed` line counts, with `ctrl+t` opening the diff or command output.
+  `y` runs the call, `n` declines it and tells the model why so it does not
+  simply repeat it. Approving grants only what that mode asks about, so it
+  can never widen a mode that forbids the action outright. Separately,
+  `/approve manual` asks before *every* mutating call (write, edit, shell)
+  even under an allow mode; `/approve auto` (the default) leaves the decision
+  to the permission mode.
 - **Context-aware file tools:** `read_file` serves numbered windows of at
   most 1,000 lines (250 by default), so large files are paged through
   instead of flooding the conversation; `write_file` / `edit_file` report
@@ -461,11 +511,16 @@ and process access.
 
 ## Saved Data
 
-Conversation history is stored in the platform data directory, normally:
+Conversation history is stored in the platform data directory for the
+application id `chat-tui`. On Linux that is:
 
 ```text
-~/.local/share/chatTUI/chat-tui/sessions.json
+~/.local/share/chat-tui/sessions.json
 ```
+
+macOS and Windows use their equivalent platform data directory for the same
+application id. If no platform data directory can be resolved at all, it
+falls back to `./sessions.json` in the working directory.
 
 The history file contains your saved messages. Back it up if you need to keep
 your conversations, and protect it if they contain private information.

@@ -3,12 +3,12 @@
 //! as Ollama, Groq, Mistral, Together, OpenRouter, Azure OpenAI, …). This
 //! is the workhorse backend: every `custom_providers` entry in `config.json`
 //! uses it.
-//! 
+//!
 //! Now with tool calling support for agent/sandbox mode.
 
 use super::{ChatBackend, HttpTimeouts};
-use crate::api::error::{classify_failure, error_detail, MAX_CONSECUTIVE_SSE_PARSE_FAILURES};
-use crate::api::sse::SseReader;
+use crate::api::error::{classify_failure, error_detail};
+use crate::api::sse::{SseReader, MAX_CONSECUTIVE_SSE_PARSE_FAILURES};
 use crate::api::types::{CompletionRequest, Failure, Role, StreamEvent, ToolCall};
 use crate::tools;
 use anyhow::{anyhow, Context, Result};
@@ -110,7 +110,8 @@ impl OpenAICompatibleBackend {
                             "tool_calls": tc_json
                         }));
                     } else {
-                        openai_messages.push(json!({ "role": "assistant", "content": message.content }));
+                        openai_messages
+                            .push(json!({ "role": "assistant", "content": message.content }));
                     }
                 }
                 Role::User => {
@@ -118,7 +119,10 @@ impl OpenAICompatibleBackend {
                 }
                 Role::Tool => {
                     // Tool result
-                    let tool_call_id = message.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string());
+                    let tool_call_id = message
+                        .tool_call_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
                     openai_messages.push(json!({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
@@ -141,7 +145,9 @@ impl OpenAICompatibleBackend {
             let tool_defs: Vec<crate::tools::ToolDefinition> = request
                 .tools
                 .iter()
-                .map(|t| crate::tools::ToolDefinition::new(&t.name, &t.description, t.parameters.clone()))
+                .map(|t| {
+                    crate::tools::ToolDefinition::new(&t.name, &t.description, t.parameters.clone())
+                })
                 .collect();
             body["tools"] = tools::to_openai_tools(&tool_defs);
             body["tool_choice"] = json!(request.tool_choice.unwrap_or_else(|| "auto".to_string()));
@@ -160,7 +166,9 @@ impl OpenAICompatibleBackend {
         if !status.is_success() {
             let body_text = response.text().await.unwrap_or_default();
             // If tools not supported, try to detect and give better error
-            if body_text.to_ascii_lowercase().contains("tool") || body_text.to_ascii_lowercase().contains("function") {
+            if body_text.to_ascii_lowercase().contains("tool")
+                || body_text.to_ascii_lowercase().contains("function")
+            {
                 // Check if it's a tools-not-supported error - we treat as retryable without tools? For now, classify normally
                 // The client will fallback to other models; but we also want to inform user
             }
@@ -306,7 +314,9 @@ impl OpenAICompatibleBackend {
                 if let Some(tool_calls) = value["choices"][0]["delta"]["tool_calls"].as_array() {
                     for tc in tool_calls {
                         let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                        let builder = tool_builders.entry(index).or_insert_with(|| ToolCallBuilder::new(index));
+                        let builder = tool_builders
+                            .entry(index)
+                            .or_insert_with(|| ToolCallBuilder::new(index));
                         if let Some(id) = tc["id"].as_str() {
                             if !id.is_empty() {
                                 builder.id = id.to_string();
@@ -328,7 +338,10 @@ impl OpenAICompatibleBackend {
                     for tc in tool_calls {
                         let id = tc["id"].as_str().unwrap_or("").to_string();
                         let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                        let args = tc["function"]["arguments"].as_str().unwrap_or("{}").to_string();
+                        let args = tc["function"]["arguments"]
+                            .as_str()
+                            .unwrap_or("{}")
+                            .to_string();
                         if !name.is_empty() {
                             let _ = tx
                                 .send(StreamEvent::ToolCall(ToolCall::new(id, name, args)))

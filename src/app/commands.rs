@@ -9,16 +9,46 @@ pub struct SlashCmd {
 }
 
 pub const SLASH_COMMANDS: &[SlashCmd] = &[
-    SlashCmd { name: "/help", desc: "Show keyboard shortcuts" },
-    SlashCmd { name: "/new", desc: "Start a new conversation" },
-    SlashCmd { name: "/history", desc: "Browse saved conversations" },
-    SlashCmd { name: "/code", desc: "Browse & copy code blocks" },
-    SlashCmd { name: "/model", desc: "Pick a model from the API's list" },
-    SlashCmd { name: "/provider", desc: "Select API provider" },
-    SlashCmd { name: "/agent", desc: "Toggle agent mode (sandbox tools)" },
-    SlashCmd { name: "/approve", desc: "Toggle tool approval: auto / manual" },
-    SlashCmd { name: "/sandbox", desc: "Show or set agent target dir" },
-    SlashCmd { name: "/quit", desc: "Exit chatTUI" },
+    SlashCmd {
+        name: "/help",
+        desc: "Show keyboard shortcuts",
+    },
+    SlashCmd {
+        name: "/new",
+        desc: "Start a new conversation",
+    },
+    SlashCmd {
+        name: "/history",
+        desc: "Browse saved conversations",
+    },
+    SlashCmd {
+        name: "/code",
+        desc: "Browse & copy code blocks",
+    },
+    SlashCmd {
+        name: "/model",
+        desc: "Pick a model from the API's list",
+    },
+    SlashCmd {
+        name: "/provider",
+        desc: "Select API provider",
+    },
+    SlashCmd {
+        name: "/agent",
+        desc: "Toggle agent mode (sandbox tools)",
+    },
+    SlashCmd {
+        name: "/approve",
+        desc: "Toggle tool approval: auto / manual",
+    },
+    SlashCmd {
+        name: "/sandbox",
+        desc: "Show or set agent target dir",
+    },
+    SlashCmd {
+        name: "/quit",
+        desc: "Exit chatTUI",
+    },
 ];
 
 impl App {
@@ -125,13 +155,20 @@ impl App {
             "/code" => self.open_code(),
             "/agent" => {
                 self.agent_mode = !self.agent_mode;
-                let status = if self.agent_mode { "enabled" } else { "disabled" };
+                let status = if self.agent_mode {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
                 self.push_notice(format!("agent mode {}", status));
                 if self.agent_mode && !self.config.sandbox.enabled {
-                    self.push_notice("sandbox is disabled in config.json - tools will not work".into());
+                    self.push_notice(
+                        "sandbox is disabled in config.json - tools will not work".into(),
+                    );
                 } else if self.agent_mode && !self.sandbox.has_target() {
                     self.push_notice(
-                        "no target directory — set one with /sandbox <path> before agent writes".into(),
+                        "no target directory — set one with /sandbox <path> before agent writes"
+                            .into(),
                     );
                 }
             }
@@ -178,8 +215,7 @@ impl App {
                     // anything else is set exactly as typed.
                     let model = self.lookup_model(&argument);
                     self.config.model = model.clone();
-                    if !self.models.ids.is_empty()
-                        && !self.models.ids.iter().any(|id| *id == model)
+                    if !self.models.ids.is_empty() && !self.models.ids.iter().any(|id| *id == model)
                     {
                         self.push_notice(format!(
                             "model set to {model} — not in the API's model list"
@@ -230,9 +266,17 @@ impl App {
         } else {
             "(unset — /sandbox <path>)".to_string()
         };
-        let status = if self.sandbox.config.enabled { "enabled" } else { "disabled" };
+        let status = if self.sandbox.config.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        };
         let agent = if self.agent_mode { "on" } else { "off" };
-        let approval = if self.manual_approval { "manual" } else { "auto" };
+        let approval = if self.manual_approval {
+            "manual"
+        } else {
+            "auto"
+        };
         self.push_notice(format!(
             "sandbox: {status} | agent: {agent} | root: {root} | mode: {} | shell: {} | shell-timeout: {}s | os-isolation: {} | auto-approve: {} | approval: {approval}",
             self.sandbox.config.permission_mode.as_str(),
@@ -324,13 +368,15 @@ mod tests {
     fn submit_routes_provider_slash_command() {
         let mut app = test_app();
         // Gateways are declared as custom providers.
-        app.config.custom_providers.push(crate::config::CustomProvider {
-            id: "acme".into(),
-            name: Some("Acme".into()),
-            base_url: "https://api.acme.example/v1".into(),
-            api_key: None,
-            model: Some("acme-model-9".into()),
-        });
+        app.config
+            .custom_providers
+            .push(crate::config::CustomProvider {
+                id: "acme".into(),
+                name: Some("Acme".into()),
+                base_url: "https://api.acme.example/v1".into(),
+                api_key: None,
+                model: Some("acme-model-9".into()),
+            });
         app.composer = "/provider acme".into();
         app.submit();
         assert_eq!(app.config.provider, "acme");

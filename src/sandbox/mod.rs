@@ -143,15 +143,6 @@ impl Sandbox {
         Self { config }
     }
 
-    #[allow(dead_code)] // test helper; not used by the app itself
-    pub fn with_root(root: PathBuf) -> Self {
-        let mut cfg = SandboxConfig::default();
-        // Canonicalize so the stored root is the true workspace prefix
-        // (symlinks resolved); fall back to the raw path if that fails.
-        cfg.workspace_root = root.canonicalize().unwrap_or(root);
-        Self::new(cfg)
-    }
-
     pub fn has_target(&self) -> bool {
         !self.config.workspace_root.as_os_str().is_empty()
     }
@@ -161,7 +152,10 @@ impl Sandbox {
     pub fn set_target(&mut self, raw: &str) -> Result<PathBuf> {
         let path = expand_user_path(raw)?;
         if !path.exists() {
-            return Err(anyhow!("target directory does not exist: {}", path.display()));
+            return Err(anyhow!(
+                "target directory does not exist: {}",
+                path.display()
+            ));
         }
         if !path.is_dir() {
             return Err(anyhow!("target is not a directory: {}", path.display()));
@@ -199,8 +193,9 @@ impl Sandbox {
             return Err(anyhow!("path contains NUL byte"));
         }
 
-        // `set_target` / `with_root` store an already-canonical root, so
-        // this is the true workspace prefix, not a stale look-alike.
+        // `set_target` (and the test-only `with_root`) store an
+        // already-canonical root, so this is the true workspace prefix,
+        // not a stale look-alike.
         let root = self.config.workspace_root.clone();
         let requested = Path::new(user_path);
         let joined = if requested.is_absolute() {
@@ -253,7 +248,9 @@ impl Sandbox {
                         ));
                     }
                     Access::Read if name == "config" || name == "credentials" => {
-                        return Err(anyhow!("access to sensitive file denied: {name} (inside .git)"));
+                        return Err(anyhow!(
+                            "access to sensitive file denied: {name} (inside .git)"
+                        ));
                     }
                     _ => {}
                 }
@@ -301,7 +298,10 @@ impl Sandbox {
         let mut out = format!("{path}: lines {}-{} of {total}\n", offset, end);
         for (index, line) in lines[start..end].iter().enumerate() {
             let display: String = if line.chars().count() > MAX_LINE_DISPLAY_CHARS {
-                line.chars().take(MAX_LINE_DISPLAY_CHARS).collect::<String>() + " …"
+                line.chars()
+                    .take(MAX_LINE_DISPLAY_CHARS)
+                    .collect::<String>()
+                    + " …"
             } else {
                 (*line).to_string()
             };
@@ -322,7 +322,9 @@ impl Sandbox {
         let full = self.resolve_path(path)?;
         self.check_access(&full, Access::Write)?;
         if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent).await.context("creating parent dirs")?;
+            fs::create_dir_all(parent)
+                .await
+                .context("creating parent dirs")?;
             // Re-validate after creating the parents: create_dir_all follows
             // symlinks, so make sure the directory we are about to write
             // into still resolves inside the workspace. (A symlink swapped
@@ -347,11 +349,18 @@ impl Sandbox {
         }
     }
 
-    pub async fn edit_file(&self, path: &str, old_string: &str, new_string: &str) -> Result<String> {
+    pub async fn edit_file(
+        &self,
+        path: &str,
+        old_string: &str,
+        new_string: &str,
+    ) -> Result<String> {
         self.authorize(ToolKind::Edit)?;
         let full = self.resolve_path(path)?;
         self.check_access(&full, Access::Write)?;
-        let current = fs::read_to_string(&full).await.context("reading file for edit")?;
+        let current = fs::read_to_string(&full)
+            .await
+            .context("reading file for edit")?;
         if !current.contains(old_string) {
             return Err(anyhow!("old_string not found in file"));
         }
@@ -366,7 +375,9 @@ impl Sandbox {
         let new_content = current.replacen(old_string, new_string, 1);
         let removed = old_string.lines().count();
         let added = new_string.lines().count();
-        fs::write(&full, &new_content).await.context("writing edited file")?;
+        fs::write(&full, &new_content)
+            .await
+            .context("writing edited file")?;
         Ok(format!("edited {path} (+{added} -{removed})"))
     }
 
@@ -438,18 +449,15 @@ impl Sandbox {
             let worker = std::thread::Builder::new()
                 .name("sandboxed-shell".into())
                 .spawn(move || {
-                    let outcome = run_shell_process(
-                        &cmd_owned,
-                        &workspace,
-                        &pid_for_thread,
-                        mode,
-                        &roots,
-                    );
+                    let outcome =
+                        run_shell_process(&cmd_owned, &workspace, &pid_for_thread, mode, &roots);
                     let _ = otx.send(outcome);
                 });
 
             if let Err(error) = worker {
-                return Err(anyhow!("could not start the sandboxed shell worker: {error}"));
+                return Err(anyhow!(
+                    "could not start the sandboxed shell worker: {error}"
+                ));
             }
 
             let outcome = match tokio::time::timeout(timeout, orx).await {
@@ -469,7 +477,11 @@ impl Sandbox {
             };
 
             let outcome = outcome.map_err(|error| anyhow!("{error}"))?;
-            Ok(format_shell_parts(&outcome.stdout, &outcome.stderr, &outcome.status_text))
+            Ok(format_shell_parts(
+                &outcome.stdout,
+                &outcome.stderr,
+                &outcome.status_text,
+            ))
         }
 
         #[cfg(not(unix))]
@@ -574,7 +586,9 @@ impl Sandbox {
         };
         match tool_call.name.as_str() {
             "read_file" => {
-                let path = args["path"].as_str().ok_or_else(|| anyhow!("missing path"))?;
+                let path = args["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing path"))?;
                 let offset = args["offset"].as_u64().map(|v| v as usize).unwrap_or(1);
                 let limit = args["limit"]
                     .as_u64()
@@ -583,14 +597,24 @@ impl Sandbox {
                 self.read_file(path, offset, limit).await
             }
             "write_file" => {
-                let path = args["path"].as_str().ok_or_else(|| anyhow!("missing path"))?;
-                let content = args["content"].as_str().ok_or_else(|| anyhow!("missing content"))?;
+                let path = args["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing path"))?;
+                let content = args["content"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing content"))?;
                 self.write_file(path, content).await
             }
             "edit_file" => {
-                let path = args["path"].as_str().ok_or_else(|| anyhow!("missing path"))?;
-                let old = args["old_string"].as_str().ok_or_else(|| anyhow!("missing old_string"))?;
-                let new = args["new_string"].as_str().ok_or_else(|| anyhow!("missing new_string"))?;
+                let path = args["path"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing path"))?;
+                let old = args["old_string"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing old_string"))?;
+                let new = args["new_string"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing new_string"))?;
                 self.edit_file(path, old, new).await
             }
             "list_files" => {
@@ -598,7 +622,9 @@ impl Sandbox {
                 self.list_files(path).await
             }
             "bash" => {
-                let cmd = args["command"].as_str().ok_or_else(|| anyhow!("missing command"))?;
+                let cmd = args["command"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("missing command"))?;
                 self.bash(cmd).await
             }
             other => Err(anyhow!("unknown tool: {}", other)),
@@ -614,6 +640,22 @@ impl Sandbox {
         let mut approved = self.clone();
         approved.config.permission_mode = approved.config.permission_mode.approved();
         approved.execute_tool(tool_call).await
+    }
+}
+
+#[cfg(test)]
+impl Sandbox {
+    /// Test helper: a sandbox rooted at `root` with every other setting at
+    /// its default. Never used by the app itself — the real target comes
+    /// from `set_target` (config.json or `--sandbox`), which refuses to
+    /// default to anything implicit.
+    pub fn with_root(root: PathBuf) -> Self {
+        Self::new(SandboxConfig {
+            // Canonicalize so the stored root is the true workspace prefix
+            // (symlinks resolved); fall back to the raw path if that fails.
+            workspace_root: root.canonicalize().unwrap_or(root),
+            ..SandboxConfig::default()
+        })
     }
 }
 
@@ -861,8 +903,14 @@ fn run_shell_process(
 
     // Drain both pipes concurrently so a chatty child can never fill them
     // and deadlock while `wait()` runs.
-    let mut stdout_pipe = child.stdout.take().ok_or_else(|| "stdout unavailable".to_string())?;
-    let mut stderr_pipe = child.stderr.take().ok_or_else(|| "stderr unavailable".to_string())?;
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "stdout unavailable".to_string())?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "stderr unavailable".to_string())?;
     let stdout_reader = std::thread::spawn(move || {
         let mut buffer = Vec::new();
         let _ = stdout_pipe.read_to_end(&mut buffer);
@@ -874,10 +922,16 @@ fn run_shell_process(
         buffer
     });
 
-    let status = child.wait().map_err(|error| format!("waiting on sh: {error}"))?;
+    let status = child
+        .wait()
+        .map_err(|error| format!("waiting on sh: {error}"))?;
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
-    Ok(ShellOutcome { stdout, stderr, status_text: status.to_string() })
+    Ok(ShellOutcome {
+        stdout,
+        stderr,
+        status_text: status.to_string(),
+    })
 }
 
 fn format_shell_parts(stdout: &[u8], stderr: &[u8], status_text: &str) -> String {
@@ -1079,10 +1133,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            sandbox
-                .read_file("does/new/file.txt")
-                .await
-                .unwrap(),
+            sandbox.read_file("does/new/file.txt").await.unwrap(),
             "created"
         );
     }
@@ -1103,7 +1154,10 @@ mod tests {
         assert!(sandbox.read_file("id_ed25519").await.is_err());
         // git internals: reads of config/credentials, all writes
         assert!(sandbox.read_file(".git/config").await.is_err());
-        assert!(sandbox.write_file(".git/hooks/pre-commit", "#!/bin/sh").await.is_err());
+        assert!(sandbox
+            .write_file(".git/hooks/pre-commit", "#!/bin/sh")
+            .await
+            .is_err());
         // non-sensitive git internals stay readable
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main").unwrap();
@@ -1177,10 +1231,7 @@ mod tests {
         let target = unique_root("dst");
         let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let sandbox = Sandbox::with_root(target.clone());
-        sandbox
-            .write_file("hello_agent.txt", "hi")
-            .await
-            .unwrap();
+        sandbox.write_file("hello_agent.txt", "hi").await.unwrap();
         let written = target.join("hello_agent.txt");
         assert!(written.exists());
         assert!(written.starts_with(&target));
@@ -1201,7 +1252,10 @@ mod tests {
     fn shell_timeout_is_clamped_away_from_zero() {
         let mut cfg = SandboxConfig::default();
         cfg.shell_timeout = Duration::ZERO;
-        assert_eq!(cfg.effective_shell_timeout(), Duration::from_secs(MIN_SHELL_TIMEOUT_SECS));
+        assert_eq!(
+            cfg.effective_shell_timeout(),
+            Duration::from_secs(MIN_SHELL_TIMEOUT_SECS)
+        );
         cfg.shell_timeout = Duration::from_secs(45);
         assert_eq!(cfg.effective_shell_timeout(), Duration::from_secs(45));
     }
@@ -1531,7 +1585,10 @@ mod tests {
         assert!(out.contains("1│line 1"));
         assert!(out.contains("250│line 250"));
         assert!(!out.contains("line 251"));
-        assert!(out.contains("offset 251"), "footer must point onward: {out}");
+        assert!(
+            out.contains("offset 251"),
+            "footer must point onward: {out}"
+        );
 
         // A later window; the tail carries no onward pointer.
         let out = sandbox.read_file("big.txt", 551, 250).await.unwrap();

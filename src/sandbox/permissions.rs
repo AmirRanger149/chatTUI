@@ -186,7 +186,10 @@ mod tests {
         ] {
             assert_eq!(PermissionMode::parse(name).unwrap().as_str(), name);
         }
-        assert_eq!(PermissionMode::parse("FULL-AUTO"), Some(PermissionMode::FullAuto));
+        assert_eq!(
+            PermissionMode::parse("FULL-AUTO"),
+            Some(PermissionMode::FullAuto)
+        );
         assert_eq!(PermissionMode::parse("yolo"), None);
         assert_eq!(PermissionMode::parse(""), None);
     }
@@ -213,8 +216,13 @@ mod tests {
     fn approval_grants_exactly_what_the_ask_modes_ask_about() {
         let write = PermissionMode::AskBeforeWrite.approved();
         assert!(write.allows(ToolKind::Write) && write.allows(ToolKind::Edit));
-        assert!(!write.allows(ToolKind::Shell), "shell was never asked about");
-        assert!(PermissionMode::AskBeforeShell.approved().allows(ToolKind::Shell));
+        assert!(
+            !write.allows(ToolKind::Shell),
+            "shell was never asked about"
+        );
+        assert!(PermissionMode::AskBeforeShell
+            .approved()
+            .allows(ToolKind::Shell));
         // Modes that do not ask are untouched: approving can't widen them.
         for mode in [
             PermissionMode::ReadOnly,
@@ -257,7 +265,10 @@ mod tests {
         }
         assert_eq!(ToolKind::from_tool_name("read_file"), Some(ToolKind::Read));
         assert_eq!(ToolKind::from_tool_name("list_files"), Some(ToolKind::Read));
-        assert_eq!(ToolKind::from_tool_name("write_file"), Some(ToolKind::Write));
+        assert_eq!(
+            ToolKind::from_tool_name("write_file"),
+            Some(ToolKind::Write)
+        );
         assert_eq!(ToolKind::from_tool_name("edit_file"), Some(ToolKind::Edit));
         assert_eq!(ToolKind::from_tool_name("bash"), Some(ToolKind::Shell));
         assert_eq!(ToolKind::from_tool_name("nope"), None);

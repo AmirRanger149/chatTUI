@@ -1,11 +1,11 @@
-mod sandbox;
-mod tools;
 mod api;
+mod app;
 mod clipboard;
 mod code;
 mod config;
+mod sandbox;
 mod session;
-mod app;
+mod tools;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -186,29 +186,29 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
             return true;
         }
-            Some(app::Overlay::Providers { .. }) => {
-                match key.code {
-                    KeyCode::Up => app.move_provider_selection(-1),
-                    KeyCode::Down => app.move_provider_selection(1),
-                    KeyCode::PageUp => app.move_provider_selection(-(app::OVERLAY_ROWS as i32)),
-                    KeyCode::PageDown => app.move_provider_selection(app::OVERLAY_ROWS as i32),
-                    KeyCode::Enter => app.apply_selected_provider(),
-                    _ => {}
-                }
-                return true;
+        Some(app::Overlay::Providers { .. }) => {
+            match key.code {
+                KeyCode::Up => app.move_provider_selection(-1),
+                KeyCode::Down => app.move_provider_selection(1),
+                KeyCode::PageUp => app.move_provider_selection(-(app::OVERLAY_ROWS as i32)),
+                KeyCode::PageDown => app.move_provider_selection(app::OVERLAY_ROWS as i32),
+                KeyCode::Enter => app.apply_selected_provider(),
+                _ => {}
             }
-            Some(app::Overlay::ToolDetail { .. }) => {
-                match key.code {
-                    KeyCode::Up => app.move_tool_detail_selection(-1),
-                    KeyCode::Down => app.move_tool_detail_selection(1),
-                    KeyCode::PageUp => app.move_tool_detail_selection(-(app::OVERLAY_ROWS as i32)),
-                    KeyCode::PageDown => app.move_tool_detail_selection(app::OVERLAY_ROWS as i32),
-                    KeyCode::Enter => app.overlay = None,
-                    _ => {}
-                }
-                return true;
+            return true;
+        }
+        Some(app::Overlay::ToolDetail { .. }) => {
+            match key.code {
+                KeyCode::Up => app.move_tool_detail_selection(-1),
+                KeyCode::Down => app.move_tool_detail_selection(1),
+                KeyCode::PageUp => app.move_tool_detail_selection(-(app::OVERLAY_ROWS as i32)),
+                KeyCode::PageDown => app.move_tool_detail_selection(app::OVERLAY_ROWS as i32),
+                KeyCode::Enter => app.overlay = None,
+                _ => {}
             }
-            None => {}
+            return true;
+        }
+        None => {}
     }
 
     // Transcript scrolling (only when no overlay is open): pgup moves the
@@ -299,7 +299,11 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, event::DisableBracketedPaste)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        event::DisableBracketedPaste
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -321,7 +325,10 @@ mod tests {
             KeyCode::Enter,
             KeyCode::Char('c'),
         ] {
-            assert!(should_handle(&key(code, KeyEventKind::Press)), "{code:?} press");
+            assert!(
+                should_handle(&key(code, KeyEventKind::Press)),
+                "{code:?} press"
+            );
             assert!(
                 !should_handle(&key(code, KeyEventKind::Release)),
                 "{code:?} release must never reach handle_key"
@@ -337,7 +344,11 @@ mod tests {
             key(KeyCode::Char('/'), KeyEventKind::Release),
         ];
         let forwarded: Vec<KeyEvent> = keystroke.into_iter().filter(should_handle).collect();
-        assert_eq!(forwarded.len(), 1, "a keystroke must be handled exactly once");
+        assert_eq!(
+            forwarded.len(),
+            1,
+            "a keystroke must be handled exactly once"
+        );
         assert_eq!(forwarded[0].kind, KeyEventKind::Press);
     }
 
@@ -350,7 +361,10 @@ mod tests {
 
     #[test]
     fn repeat_is_allowed_so_held_keys_still_auto_repeat() {
-        assert!(should_handle(&key(KeyCode::Char('a'), KeyEventKind::Repeat)));
+        assert!(should_handle(&key(
+            KeyCode::Char('a'),
+            KeyEventKind::Repeat
+        )));
         assert!(should_handle(&key(KeyCode::Down, KeyEventKind::Repeat)));
     }
 }

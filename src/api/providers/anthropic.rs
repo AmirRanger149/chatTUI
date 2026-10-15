@@ -10,8 +10,8 @@
 //! - Tool calling uses `tools` + `tool_use` blocks and `tool_result` in user messages.
 
 use super::{ChatBackend, HttpTimeouts};
-use crate::api::error::{classify_failure, error_detail, MAX_CONSECUTIVE_SSE_PARSE_FAILURES};
-use crate::api::sse::SseReader;
+use crate::api::error::{classify_failure, error_detail};
+use crate::api::sse::{SseReader, MAX_CONSECUTIVE_SSE_PARSE_FAILURES};
 use crate::api::types::{CompletionRequest, Failure, Role, StreamEvent, ToolCall};
 use crate::tools;
 use anyhow::{anyhow, Context, Result};
@@ -149,7 +149,8 @@ impl AnthropicBackend {
                             content_blocks.push(json!({ "type": "text", "text": message.content }));
                         }
                         for tc in tool_calls {
-                            let input: Value = serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
+                            let input: Value =
+                                serde_json::from_str(&tc.arguments).unwrap_or(json!({}));
                             content_blocks.push(json!({
                                 "type": "tool_use",
                                 "id": tc.id,
@@ -176,7 +177,10 @@ impl AnthropicBackend {
                 }
                 Role::Tool => {
                     // Tool result -> user message with tool_result block
-                    let tool_use_id = message.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string());
+                    let tool_use_id = message
+                        .tool_call_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
                     messages.push(json!({
                         "role": "user",
                         "content": [{
@@ -204,7 +208,9 @@ impl AnthropicBackend {
             let tool_defs: Vec<crate::tools::ToolDefinition> = request
                 .tools
                 .iter()
-                .map(|t| crate::tools::ToolDefinition::new(&t.name, &t.description, t.parameters.clone()))
+                .map(|t| {
+                    crate::tools::ToolDefinition::new(&t.name, &t.description, t.parameters.clone())
+                })
                 .collect();
             body["tools"] = tools::to_anthropic_tools(&tool_defs);
         }
@@ -297,8 +303,14 @@ impl AnthropicBackend {
                         let index = value["index"].as_u64().unwrap_or(0) as usize;
                         if let Some(block_type) = value["content_block"]["type"].as_str() {
                             if block_type == "tool_use" {
-                                let id = value["content_block"]["id"].as_str().unwrap_or("").to_string();
-                                let name = value["content_block"]["name"].as_str().unwrap_or("").to_string();
+                                let id = value["content_block"]["id"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string();
+                                let name = value["content_block"]["name"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string();
                                 tool_builders.insert(
                                     index,
                                     AnthropicToolBuilder {
@@ -328,7 +340,8 @@ impl AnthropicBackend {
                         let index = value["index"].as_u64().unwrap_or(0) as usize;
                         if let Some(builder) = tool_builders.remove(&index) {
                             if !builder.name.is_empty() {
-                                let tc = ToolCall::new(builder.id, builder.name, builder.input_json);
+                                let tc =
+                                    ToolCall::new(builder.id, builder.name, builder.input_json);
                                 let _ = tx.send(StreamEvent::ToolCall(tc)).await;
                             }
                         }
@@ -336,7 +349,9 @@ impl AnthropicBackend {
                     Some("error") => {
                         if let Some(message) = value["error"]["message"].as_str() {
                             if emitted {
-                                return Err(Failure::Fatal(format!("API error mid-stream: {message}")));
+                                return Err(Failure::Fatal(format!(
+                                    "API error mid-stream: {message}"
+                                )));
                             }
                             return Err(classify_failure(0, message));
                         }

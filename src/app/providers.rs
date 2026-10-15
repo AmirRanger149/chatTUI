@@ -101,14 +101,10 @@ mod tests {
         let mut app = test_app();
         let start = app.current_provider_index();
         app.open_providers();
-        assert!(
-            matches!(app.overlay, Some(Overlay::Providers { selected }) if selected == start)
-        );
+        assert!(matches!(app.overlay, Some(Overlay::Providers { selected }) if selected == start));
         app.move_provider_selection(1);
         let next = (start + 1) % app.config.providers().len();
-        assert!(
-            matches!(app.overlay, Some(Overlay::Providers { selected }) if selected == next)
-        );
+        assert!(matches!(app.overlay, Some(Overlay::Providers { selected }) if selected == next));
         app.apply_selected_provider();
         assert_eq!(app.config.provider, app.config.providers()[next].id);
         assert!(app.overlay.is_none());

@@ -119,7 +119,10 @@ fn approval_lines(call: &ToolCall, width: usize, max_rows: usize) -> Vec<Line<'s
             if rows.len() > max_rows {
                 let hidden = rows.len() - max_rows;
                 rows.truncate(max_rows);
-                rows.push(Line::styled(format!("… {hidden} more rows not shown"), theme::dim()));
+                rows.push(Line::styled(
+                    format!("… {hidden} more rows not shown"),
+                    theme::dim(),
+                ));
             }
             let mut lines = vec![header("Run shell command".to_string())];
             lines.extend(rows);
@@ -149,26 +152,23 @@ fn tool_detail(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Tool activity", Style::new().bold()),
-            Span::styled(
-                "   ↑↓ switch · ctrl+t / esc close",
-                theme::dim(),
-            ),
+            Span::styled("   ↑↓ switch · ctrl+t / esc close", theme::dim()),
         ]),
         Line::from(""),
     ];
     let index = selected.min(items.len().saturating_sub(1));
     let Some(item) = items.get(index) else {
-        lines.push(Line::styled("no tool activity to inspect yet", theme::dim()));
+        lines.push(Line::styled(
+            "no tool activity to inspect yet",
+            theme::dim(),
+        ));
         render_card(frame, area, lines);
         return;
     };
     lines.push(Line::from(vec![
         Span::styled("🔧 ", Style::new().fg(Color::Yellow).bold()),
         Span::styled(theme::clamp_text(&item.title, 120), Style::new().bold()),
-        Span::styled(
-            format!("   ({}/{})", index + 1, items.len()),
-            theme::dim(),
-        ),
+        Span::styled(format!("   ({}/{})", index + 1, items.len()), theme::dim()),
     ]));
     lines.push(Line::from(""));
     // Bounded view: enough lines to inspect, never enough to overflow.
@@ -348,10 +348,7 @@ fn models(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
 fn providers(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
     let mut lines = vec![Line::from(vec![
         Span::styled("API Providers", Style::new().bold()),
-        Span::styled(
-            "   ↑↓ select · enter switch · esc close",
-            theme::dim(),
-        ),
+        Span::styled("   ↑↓ select · enter switch · esc close", theme::dim()),
     ])];
     lines.push(Line::from(""));
 
@@ -364,7 +361,11 @@ fn providers(frame: &mut Frame, area: Rect, app: &App, selected: usize) {
         let has_key = app.config.api_key_for_provider(&provider.id).is_some();
         let key_status = if has_key { "key configured" } else { "no key" };
 
-        let custom_tag = if provider.is_custom { "  · custom" } else { "" };
+        let custom_tag = if provider.is_custom {
+            "  · custom"
+        } else {
+            ""
+        };
         let label = format!(
             "{marker}{:<13} · {}{}",
             provider.name, provider.base_url, custom_tag
@@ -476,32 +477,47 @@ mod tests {
         // loading
         app.overlay = Some(Overlay::Models { selected: 0 });
         app.models.loading = true;
-        terminal.draw(|frame| crate::ui::render(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
 
         // loaded, with the active model marked
         app.models.loading = false;
         app.models.ids = vec!["a/1".into(), "b/2".into()];
         app.overlay = Some(Overlay::Models { selected: 1 });
-        terminal.draw(|frame| crate::ui::render(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
 
         // error state
         app.models.ids.clear();
         app.models.error = Some("HTTP 401".into());
         app.overlay = Some(Overlay::Models { selected: 0 });
-        terminal.draw(|frame| crate::ui::render(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
 
         // providers overlay
         app.overlay = Some(Overlay::Providers { selected: 0 });
-        terminal.draw(|frame| crate::ui::render(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
         app.overlay = Some(Overlay::Providers { selected: 1 });
-        terminal.draw(|frame| crate::ui::render(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
     }
 
     /// The text of each row, without styling.
     fn plain(lines: Vec<Line<'static>>) -> Vec<String> {
         lines
             .iter()
-            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect::<String>())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
             .collect()
     }
 
@@ -520,7 +536,10 @@ mod tests {
         }
         // A line break in the command stays a line break.
         assert!(rows.iter().any(|row| row.starts_with("$ rm")), "{shown}");
-        assert!(rows.iter().all(|row| theme::cell_width(row) <= 24), "{shown}");
+        assert!(
+            rows.iter().all(|row| theme::cell_width(row) <= 24),
+            "{shown}"
+        );
     }
 
     #[test]
@@ -539,21 +558,30 @@ mod tests {
 
         // Room for everything: no note.
         let shown = plain(approval_lines(&call, 40, 40)).join("\n");
-        assert!(shown.contains("echo line30") && !shown.contains("more rows"), "{shown}");
+        assert!(
+            shown.contains("echo line30") && !shown.contains("more rows"),
+            "{shown}"
+        );
     }
 
     #[test]
     fn approval_card_summarizes_file_changes_and_renders_everywhere() {
         let write = ToolCall::new("c1", "write_file", r#"{"path":"a.txt","content":"x\ny"}"#);
         let text = plain(approval_lines(&write, 40, 16)).join("\n");
-        assert!(text.contains("Write a.txt") && text.contains("2 lines"), "{text}");
+        assert!(
+            text.contains("Write a.txt") && text.contains("2 lines"),
+            "{text}"
+        );
         let edit = ToolCall::new(
             "c1",
             "edit_file",
             r#"{"path":"a.txt","old_string":"a","new_string":"b\nc"}"#,
         );
         let text = plain(approval_lines(&edit, 40, 16)).join("\n");
-        assert!(text.contains("Edit a.txt") && text.contains("+2 -1"), "{text}");
+        assert!(
+            text.contains("Edit a.txt") && text.contains("+2 -1"),
+            "{text}"
+        );
 
         let draw = |terminal: &mut Terminal<TestBackend>, call: &ToolCall| {
             terminal
@@ -567,7 +595,10 @@ mod tests {
         for (name, args) in [
             ("bash", r#"{"command":"cargo test"}"#),
             ("write_file", r#"{"path":"a.txt","content":"x\ny"}"#),
-            ("edit_file", r#"{"path":"a.txt","old_string":"a","new_string":"b\nc"}"#),
+            (
+                "edit_file",
+                r#"{"path":"a.txt","old_string":"a","new_string":"b\nc"}"#,
+            ),
             ("mystery", "{}"),
             ("bash", "not json"),
         ] {
@@ -608,10 +639,15 @@ mod tests {
             .into(),
         ));
         app.open_code();
-        assert!(matches!(app.overlay, Some(crate::app::Overlay::Code { .. })));
+        assert!(matches!(
+            app.overlay,
+            Some(crate::app::Overlay::Code { .. })
+        ));
 
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| crate::ui::render(frame, &app)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
         let buffer = terminal.backend().buffer();
 
         // The overlay card is the only centered (x > 0) bordered box: the

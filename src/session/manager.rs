@@ -180,7 +180,11 @@ impl SessionManager {
         let _ = self.save();
     }
 
-    pub fn add_assistant_with_tools(&mut self, content: impl Into<String>, tool_calls: Vec<ToolCallRecord>) {
+    pub fn add_assistant_with_tools(
+        &mut self,
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCallRecord>,
+    ) {
         let message = Message {
             role: "assistant".into(),
             content: content.into(),

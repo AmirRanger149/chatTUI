@@ -65,8 +65,16 @@ pub enum Cell {
     Assistant(String),
     Error(String),
     Notice(String),
-    ToolCall { name: String, args: String, id: String },
-    ToolResult { id: String, content: String, is_error: bool },
+    ToolCall {
+        name: String,
+        args: String,
+        id: String,
+    },
+    ToolResult {
+        id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
 /// What the status row shows while the API client waits out a retry backoff.
@@ -298,7 +306,10 @@ impl App {
                     }
                 }
                 "tool" => {
-                    let id = message.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string());
+                    let id = message
+                        .tool_call_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
                     self.cells.push(Cell::ToolResult {
                         id,
                         content: message.content.clone(),
@@ -446,14 +457,22 @@ impl App {
     }
 
     pub(crate) fn push_tool_result(&mut self, id: String, content: String, is_error: bool) {
-        self.cells.push(Cell::ToolResult { id, content, is_error });
+        self.cells.push(Cell::ToolResult {
+            id,
+            content,
+            is_error,
+        });
     }
 
     /// The context summary shown on the right-hand side of the footer.
     pub fn context_summary(&self) -> String {
         let session = self.sessions.current();
         let messages = session.messages.len();
-        let approval = if self.manual_approval { " · approve:manual" } else { "" };
+        let approval = if self.manual_approval {
+            " · approve:manual"
+        } else {
+            ""
+        };
         format!("{messages} msgs{approval}")
     }
 }

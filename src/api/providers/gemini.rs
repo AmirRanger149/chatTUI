@@ -18,8 +18,8 @@
 //! - Tool calling uses `functionDeclarations` and `functionCall`/`functionResponse`.
 
 use super::{ChatBackend, HttpTimeouts};
-use crate::api::error::{classify_failure, error_detail, MAX_CONSECUTIVE_SSE_PARSE_FAILURES};
-use crate::api::sse::SseReader;
+use crate::api::error::{classify_failure, error_detail};
+use crate::api::sse::{SseReader, MAX_CONSECUTIVE_SSE_PARSE_FAILURES};
 use crate::api::types::{CompletionRequest, Failure, Role, StreamEvent, ToolCall};
 use crate::tools;
 use anyhow::{anyhow, Context, Result};
@@ -151,7 +151,10 @@ impl GeminiBackend {
                 })),
                 Role::Tool => {
                     // Tool result -> functionResponse
-                    let tool_name = message.tool_call_id.clone().unwrap_or_else(|| "unknown".to_string());
+                    let tool_name = message
+                        .tool_call_id
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string());
                     // tool_call_id actually holds the function name for Gemini? We need to parse.
                     // For Gemini, we store id as name for simplicity, but we need to handle.
                     // We'll use the content as response, and need to know function name.
@@ -161,7 +164,11 @@ impl GeminiBackend {
                     } else {
                         (tool_name.as_str(), "")
                     };
-                    let func_name = if func_name.is_empty() { "unknown" } else { func_name };
+                    let func_name = if func_name.is_empty() {
+                        "unknown"
+                    } else {
+                        func_name
+                    };
                     contents.push(json!({
                         "role": "user",
                         "parts": [{
@@ -187,7 +194,9 @@ impl GeminiBackend {
             let tool_defs: Vec<crate::tools::ToolDefinition> = request
                 .tools
                 .iter()
-                .map(|t| crate::tools::ToolDefinition::new(&t.name, &t.description, t.parameters.clone()))
+                .map(|t| {
+                    crate::tools::ToolDefinition::new(&t.name, &t.description, t.parameters.clone())
+                })
                 .collect();
             body["tools"] = tools::to_gemini_tools(&tool_defs);
         }
@@ -309,7 +318,8 @@ impl GeminiBackend {
                             if let Some(name) = func_call["name"].as_str() {
                                 let args = func_call["args"].clone();
                                 let args_str = if args.is_object() {
-                                    serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string())
+                                    serde_json::to_string(&args)
+                                        .unwrap_or_else(|_| "{}".to_string())
                                 } else {
                                     "{}".to_string()
                                 };
@@ -367,7 +377,8 @@ impl GeminiBackend {
         }
 
         if !any_text {
-            if !finish_reason.is_empty() && finish_reason != "STOP" && finish_reason != "MAX_TOKENS" {
+            if !finish_reason.is_empty() && finish_reason != "STOP" && finish_reason != "MAX_TOKENS"
+            {
                 return Err(Failure::Fatal(format!(
                     "Gemini stopped without an answer ({finish_reason})"
                 )));
@@ -439,8 +450,7 @@ mod tests {
 
     #[test]
     fn function_call_part_echoes_the_thought_signature() {
-        let signed =
-            ToolCall::new("list_files:0", "list_files", "{}").with_signature("sig-bytes");
+        let signed = ToolCall::new("list_files:0", "list_files", "{}").with_signature("sig-bytes");
         let part = function_call_part(&signed);
         assert_eq!(part["thoughtSignature"], json!("sig-bytes"));
         assert_eq!(part["functionCall"]["name"], json!("list_files"));
@@ -463,7 +473,10 @@ mod tests {
     #[test]
     fn text_delta_streams_cumulative_suffixes() {
         assert_eq!(text_delta("", "Hello").as_deref(), Some("Hello"));
-        assert_eq!(text_delta("Hello", "Hello world").as_deref(), Some(" world"));
+        assert_eq!(
+            text_delta("Hello", "Hello world").as_deref(),
+            Some(" world")
+        );
         // Duplicate frame — nothing new.
         assert_eq!(text_delta("Hello world", "Hello world"), None);
         // Thought-only frame — no visible text at all.

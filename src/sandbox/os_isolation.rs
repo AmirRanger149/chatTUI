@@ -153,7 +153,11 @@ pub(crate) fn restrict_current_thread(
         };
     }
 
-    let mut report = IsolationReport { fs: true, syscall: true, notes: Vec::new() };
+    let mut report = IsolationReport {
+        fs: true,
+        syscall: true,
+        notes: Vec::new(),
+    };
     if let Err(note) = seccomp::apply() {
         report.syscall = false;
         report.notes.push(note);
@@ -224,7 +228,9 @@ pub(crate) fn confine_in_child(
     } else if !syscall_ok {
         write_stderr(b"(os-level syscall isolation unavailable - network and process restrictions were not applied)\n");
     } else {
-        write_stderr(b"(os-level filesystem isolation unavailable - write restrictions were not applied)\n");
+        write_stderr(
+            b"(os-level filesystem isolation unavailable - write restrictions were not applied)\n",
+        );
     }
     Ok(())
 }
@@ -246,7 +252,10 @@ pub(crate) fn confine_in_child(
 }
 
 /// Best-effort write to stderr without touching std (pre-exec context).
-#[cfg(target_os = "linux")]
+/// One definition covers every unix target: the body only needs `libc::write`,
+/// and Linux is a subset of `unix`, so the non-unix stub below is the only
+/// other case that exists.
+#[cfg(unix)]
 fn write_stderr(message: &[u8]) {
     let mut written = 0usize;
     while written < message.len() {
@@ -264,25 +273,7 @@ fn write_stderr(message: &[u8]) {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn write_stderr(message: &[u8]) {
-    let mut written = 0usize;
-    while written < message.len() {
-        let n = unsafe {
-            libc::write(
-                2,
-                message[written..].as_ptr().cast::<libc::c_void>(),
-                message.len() - written,
-            )
-        };
-        if n <= 0 {
-            break;
-        }
-        written += n as usize;
-    }
-}
-
-#[cfg(all(not(unix), not(target_os = "linux")))]
+#[cfg(not(unix))]
 fn write_stderr(_message: &[u8]) {}
 
 /// Directories the sandboxed shell may *modify*, on top of the workspace.
@@ -331,9 +322,7 @@ pub(crate) const WRITE_ONLY_DEVICES: &[&str] = &[];
 #[cfg(target_os = "linux")]
 fn set_no_new_privs() -> Result<(), std::io::Error> {
     const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
-    let rc = unsafe {
-        libc::prctl(PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0)
-    };
+    let rc = unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -433,9 +422,7 @@ mod landlock {
         if rc < 0 {
             let error = std::io::Error::last_os_error();
             return Err(match error.raw_os_error() {
-                Some(libc::ENOSYS) => {
-                    "Landlock unsupported: kernel is older than 5.13".to_string()
-                }
+                Some(libc::ENOSYS) => "Landlock unsupported: kernel is older than 5.13".to_string(),
                 Some(libc::EOPNOTSUPP) | Some(libc::EINVAL) => {
                     "Landlock unsupported: not enabled in this kernel".to_string()
                 }
@@ -450,12 +437,20 @@ mod landlock {
             .map_err(|_| format!("path contains NUL: {}", path.display()))?;
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
         if fd < 0 {
-            return Err(format!("{}: {}", path.display(), std::io::Error::last_os_error()));
+            return Err(format!(
+                "{}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(fd)
     }
 
-    fn add_rule(ruleset_fd: libc::c_int, parent_fd: libc::c_int, access: u64) -> Result<(), String> {
+    fn add_rule(
+        ruleset_fd: libc::c_int,
+        parent_fd: libc::c_int,
+        access: u64,
+    ) -> Result<(), String> {
         let attr = PathBeneathAttr {
             allowed_access: access,
             parent_fd,
@@ -471,7 +466,10 @@ mod landlock {
             )
         };
         if rc < 0 {
-            return Err(format!("Landlock add_rule failed: {}", std::io::Error::last_os_error()));
+            return Err(format!(
+                "Landlock add_rule failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(())
     }
@@ -485,7 +483,9 @@ mod landlock {
     ) -> Result<(), String> {
         let abi = detect_abi()?;
         let handled = handled_access_fs(abi);
-        let ruleset_attr = RulesetAttr { handled_access_fs: handled };
+        let ruleset_attr = RulesetAttr {
+            handled_access_fs: handled,
+        };
 
         let ruleset_fd = unsafe {
             libc::syscall(
@@ -529,7 +529,10 @@ mod landlock {
         let restrict_result = result.and_then(|_| unsafe {
             let rc = libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0 as libc::c_ulong);
             if rc < 0 {
-                Err(format!("Landlock restrict failed: {}", std::io::Error::last_os_error()))
+                Err(format!(
+                    "Landlock restrict failed: {}",
+                    std::io::Error::last_os_error()
+                ))
             } else {
                 Ok(())
             }
@@ -695,7 +698,7 @@ mod seccomp {
         425, // io_uring_setup
         426, // io_uring_enter
         427, // io_uring_register (kernel/blob manipulation needs setup+enter,
-             // but deny the whole family so no gap is left open by accident)
+        // but deny the whole family so no gap is left open by accident)
         428, // open_tree
         429, // move_mount
         430, // fsopen
@@ -734,19 +737,44 @@ mod seccomp {
     }
 
     const fn ld_abs(k: u32) -> SockFilter {
-        SockFilter { code: BPF_LD_ABS_W, jt: 0, jf: 0, k }
+        SockFilter {
+            code: BPF_LD_ABS_W,
+            jt: 0,
+            jf: 0,
+            k,
+        }
     }
     const fn jeq(k: u32, jt: u8, jf: u8) -> SockFilter {
-        SockFilter { code: BPF_JEQ, jt, jf, k }
+        SockFilter {
+            code: BPF_JEQ,
+            jt,
+            jf,
+            k,
+        }
     }
     const fn jset(k: u32, jt: u8, jf: u8) -> SockFilter {
-        SockFilter { code: BPF_JSET, jt, jf, k }
+        SockFilter {
+            code: BPF_JSET,
+            jt,
+            jf,
+            k,
+        }
     }
     const fn ret_errno(errno: u32) -> SockFilter {
-        SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO | errno }
+        SockFilter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ERRNO | errno,
+        }
     }
     const fn ret_allow() -> SockFilter {
-        SockFilter { code: BPF_RET_K, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW }
+        SockFilter {
+            code: BPF_RET_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        }
     }
 
     fn build_filter() -> Vec<SockFilter> {
@@ -855,7 +883,7 @@ mod seccomp {
         // The filter's lifetime covers the prctl call; the kernel copies it.
         let rc = unsafe {
             libc::prctl(
-                libc::PR_SET_SECCOMP, // 22
+                libc::PR_SET_SECCOMP,                       // 22
                 libc::SECCOMP_MODE_FILTER as libc::c_ulong, // 2
                 &fprog as *const libc::sock_fprog,
                 0 as libc::c_ulong,
@@ -867,9 +895,7 @@ mod seccomp {
             return Err(match error.raw_os_error() {
                 Some(libc::ENOSYS) => "seccomp unsupported: kernel lacks it".to_string(),
                 Some(libc::EINVAL) => "seccomp filter rejected by kernel".to_string(),
-                Some(libc::EACCES) => {
-                    "seccomp denied: NO_NEW_PRIVS could not be set".to_string()
-                }
+                Some(libc::EACCES) => "seccomp denied: NO_NEW_PRIVS could not be set".to_string(),
                 _ => format!("seccomp apply failed: {error}"),
             });
         }
@@ -884,8 +910,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn unique_root(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("chatTUI_iso_{name}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("chatTUI_iso_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir.canonicalize().unwrap()
@@ -915,7 +940,9 @@ mod tests {
                 tx.send(Ok(())).ok();
             })
             .map_err(|e| e.to_string())?;
-        writer.join().map_err(|_| "confined thread panicked".to_string())?;
+        writer
+            .join()
+            .map_err(|_| "confined thread panicked".to_string())?;
         rx.recv().map_err(|_| "confined thread hung".to_string())
     }
 
@@ -942,7 +969,10 @@ mod tests {
         let ws = unique_root("allow");
         assert_inside_confined_thread(ws.clone(), move || {
             std::fs::write(ws.join("inside.txt"), b"ok").expect("workspace write must work");
-            assert_eq!(std::fs::read_to_string(ws.join("inside.txt")).unwrap(), "ok");
+            assert_eq!(
+                std::fs::read_to_string(ws.join("inside.txt")).unwrap(),
+                "ok"
+            );
             std::fs::read_to_string("/etc/hosts").expect("reads must stay allowed");
         })
         .unwrap();
@@ -955,12 +985,13 @@ mod tests {
         assert_inside_confined_thread(ws.clone(), move || {
             // Only the workspace is granted in this probe, so /tmp —
             // normally writable in real runs — is the ungranted target.
-            let outside = std::env::temp_dir().join(format!(
-                "chattui_iso_escape_{}",
-                std::process::id()
-            ));
+            let outside =
+                std::env::temp_dir().join(format!("chattui_iso_escape_{}", std::process::id()));
             let result = std::fs::write(&outside, b"escape");
-            assert!(result.is_err(), "write outside granted roots must be denied");
+            assert!(
+                result.is_err(),
+                "write outside granted roots must be denied"
+            );
             assert!(!outside.exists());
         })
         .unwrap();
@@ -1101,8 +1132,7 @@ int main(int argc, char **argv) {
 
     #[tokio::test]
     async fn bash_unshare_clone_newuser_is_denied_when_isolation_is_supported() {
-        let Some(out) = run_sandboxed_probe("iso-unshare-user", "unshare_newuser").await
-        else {
+        let Some(out) = run_sandboxed_probe("iso-unshare-user", "unshare_newuser").await else {
             return;
         };
         assert!(
@@ -1113,8 +1143,7 @@ int main(int argc, char **argv) {
 
     #[tokio::test]
     async fn bash_unshare_clone_newnet_is_denied_when_isolation_is_supported() {
-        let Some(out) = run_sandboxed_probe("iso-unshare-net", "unshare_newnet").await
-        else {
+        let Some(out) = run_sandboxed_probe("iso-unshare-net", "unshare_newnet").await else {
             return;
         };
         assert!(
@@ -1125,8 +1154,7 @@ int main(int argc, char **argv) {
 
     #[tokio::test]
     async fn bash_unshare_clone_newns_is_denied_when_isolation_is_supported() {
-        let Some(out) = run_sandboxed_probe("iso-unshare-ns", "unshare_newns").await
-        else {
+        let Some(out) = run_sandboxed_probe("iso-unshare-ns", "unshare_newns").await else {
             return;
         };
         assert!(
@@ -1139,8 +1167,7 @@ int main(int argc, char **argv) {
     async fn bash_clone_with_namespace_flag_is_denied_when_isolation_is_supported() {
         // Guards the flags-argument inspection: `clone` itself must not be
         // blanket-allowed, and `clone3` must keep falling back to it.
-        let Some(out) = run_sandboxed_probe("iso-clone-user", "clone_newuser").await
-        else {
+        let Some(out) = run_sandboxed_probe("iso-clone-user", "clone_newuser").await else {
             return;
         };
         assert!(

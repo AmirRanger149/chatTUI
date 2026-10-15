@@ -32,7 +32,10 @@ impl App {
     }
 
     pub fn toggle_history(&mut self) {
-        if self.overlay.is_some_and(|o| matches!(o, Overlay::History { .. })) {
+        if self
+            .overlay
+            .is_some_and(|o| matches!(o, Overlay::History { .. }))
+        {
             self.overlay = None;
         } else {
             self.open_history();
@@ -127,7 +130,10 @@ impl App {
     }
 
     pub fn toggle_code(&mut self) {
-        if self.overlay.is_some_and(|o| matches!(o, Overlay::Code { .. })) {
+        if self
+            .overlay
+            .is_some_and(|o| matches!(o, Overlay::Code { .. }))
+        {
             self.overlay = None;
         } else {
             self.open_code();
@@ -196,8 +202,7 @@ impl App {
                         .as_ref()
                         .and_then(|v| v["new_string"].as_str())
                         .unwrap_or("");
-                    let mut lines: Vec<String> =
-                        old.lines().map(|l| format!("- {l}")).collect();
+                    let mut lines: Vec<String> = old.lines().map(|l| format!("- {l}")).collect();
                     lines.extend(new.lines().map(|l| format!("+ {l}")));
                     items.push(ToolDetailItem {
                         title: format!("Edit {path}"),
@@ -413,7 +418,8 @@ mod tests {
         app.open_code();
         assert!(app.overlay.is_none());
         assert!(matches!(app.cells.last(), Some(Cell::Error(_))));
-        app.cells.push(Cell::Assistant("```\ncode here\n```".into()));
+        app.cells
+            .push(Cell::Assistant("```\ncode here\n```".into()));
         app.open_code();
         assert!(matches!(app.overlay, Some(Overlay::Code { selected: 0 })));
         app.move_code_selection(3); // wraps around with a single block

@@ -43,10 +43,7 @@ impl App {
         let mut repaired_args = 0usize;
         for m in &self.sessions.current().messages {
             let role = Role::from(m.role.as_str());
-            let mut msg = Message::new(
-                role,
-                crate::ui::thinking::strip(&m.content),
-            );
+            let mut msg = Message::new(role, crate::ui::thinking::strip(&m.content));
             if let Some(id) = &m.tool_call_id {
                 msg = msg.with_tool_call_id(id.clone());
             }
@@ -58,12 +55,13 @@ impl App {
                 let tool_calls: Vec<crate::api::types::ToolCall> = tcs
                     .iter()
                     .map(|tc| {
-                        let arguments = if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_ok() {
-                            tc.arguments.clone()
-                        } else {
-                            repaired_args += 1;
-                            "{}".to_string()
-                        };
+                        let arguments =
+                            if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_ok() {
+                                tc.arguments.clone()
+                            } else {
+                                repaired_args += 1;
+                                "{}".to_string()
+                            };
                         let mut call = crate::api::types::ToolCall::new(
                             tc.id.clone(),
                             tc.name.clone(),
@@ -110,7 +108,10 @@ impl App {
             };
             paired.push(message);
             for id in missing {
-                paired.push(Message::tool_result(id, "interrupted before this tool could run"));
+                paired.push(Message::tool_result(
+                    id,
+                    "interrupted before this tool could run",
+                ));
                 backfilled += 1;
             }
         }
@@ -127,7 +128,8 @@ impl App {
         }
 
         // Inject system prompt for agent mode if enabled
-        let want_tools = self.agent_mode && self.config.sandbox.enabled && self.sandbox.config.enabled;
+        let want_tools =
+            self.agent_mode && self.config.sandbox.enabled && self.sandbox.config.enabled;
         let tools_enabled = want_tools && self.sandbox.has_target();
         if want_tools && !self.sandbox.has_target() {
             self.push_notice(
@@ -284,7 +286,8 @@ impl App {
             for tc in &pending {
                 self.push_tool_call(tc);
             }
-            self.sessions.add_assistant_with_tools(response_text, tool_records);
+            self.sessions
+                .add_assistant_with_tools(response_text, tool_records);
 
             // Run the round's tools. A call that needs the user's OK parks
             // the round (see `run_tool_round`); it resumes from the top of
@@ -426,25 +429,24 @@ impl App {
             self.agent_consecutive_failures = 0;
         }
 
-        let stop_reason: Option<String> =
-            if self.agent_repeat_failures >= AGENT_STAGNATION_LIMIT {
-                Some(format!(
+        let stop_reason: Option<String> = if self.agent_repeat_failures >= AGENT_STAGNATION_LIMIT {
+            Some(format!(
                     "agent stopped: the same tool call failed {AGENT_STAGNATION_LIMIT} rounds in a row — it is not making progress"
                 ))
-            } else if self.agent_consecutive_failures >= AGENT_CONSECUTIVE_FAILURE_LIMIT {
-                Some(format!(
+        } else if self.agent_consecutive_failures >= AGENT_CONSECUTIVE_FAILURE_LIMIT {
+            Some(format!(
                     "agent stopped: {AGENT_CONSECUTIVE_FAILURE_LIMIT} consecutive rounds failed — check the workspace and try again"
                 ))
-            } else if self.agent_iterations >= self.agent_max_rounds {
-                // Safety net only — healthy runs are stopped by the
-                // guards above, not by this ceiling.
-                Some(format!(
+        } else if self.agent_iterations >= self.agent_max_rounds {
+            // Safety net only — healthy runs are stopped by the
+            // guards above, not by this ceiling.
+            Some(format!(
                     "agent stopped after {} rounds — raise agent.max_rounds in config.json if this task needs more",
                     self.agent_max_rounds
                 ))
-            } else {
-                None
-            };
+        } else {
+            None
+        };
 
         if let Some(reason) = stop_reason {
             self.push_notice(reason);
@@ -548,7 +550,10 @@ mod tests {
         // The tool actually ran.
         assert!(app.cells.iter().any(|c| matches!(
             c,
-            Cell::ToolResult { is_error: false, .. }
+            Cell::ToolResult {
+                is_error: false,
+                ..
+            }
         )));
         // The loop tried to continue, the restart failed (no API key), and
         // the agent stopped with a reported error instead of looping.
@@ -590,8 +595,7 @@ mod tests {
         )
         .unwrap();
         let mut app = App::new(config, SessionManager::for_tests());
-        let dir =
-            std::env::temp_dir().join(format!("chatTUI_loop_many_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("chatTUI_loop_many_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         app.sandbox.set_target(dir.to_str().unwrap()).unwrap();
@@ -635,7 +639,11 @@ mod tests {
             assert!(app.agent_iterations < app.agent_max_rounds);
             feed(
                 &mut app,
-                vec![tool_call_event(&format!("c{round}"), "write_file", r#"{"path":"x","content":"y"}"#)],
+                vec![tool_call_event(
+                    &format!("c{round}"),
+                    "write_file",
+                    r#"{"path":"x","content":"y"}"#,
+                )],
             );
             app.receive_token().await;
             assert!(!app.streaming);
@@ -730,8 +738,7 @@ mod tests {
         )
         .unwrap();
         let mut app = App::new(config, SessionManager::for_tests());
-        let dir =
-            std::env::temp_dir().join(format!("chatTUI_guard_{name}_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("chatTUI_guard_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         app.sandbox.set_target(dir.to_str().unwrap()).unwrap();
@@ -850,7 +857,10 @@ mod tests {
         );
         assert!(app.streaming);
         assert!(!file.exists());
-        assert!(!app.cells.iter().any(|c| matches!(c, Cell::ToolResult { .. })));
+        assert!(!app
+            .cells
+            .iter()
+            .any(|c| matches!(c, Cell::ToolResult { .. })));
 
         // The user sees the card and why the agent is idle.
         let shown = screen(&app);
@@ -871,10 +881,13 @@ mod tests {
         assert!(!file.exists());
         app.receive_token().await;
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hi");
-        assert!(app
-            .cells
-            .iter()
-            .any(|c| matches!(c, Cell::ToolResult { is_error: false, .. })));
+        assert!(app.cells.iter().any(|c| matches!(
+            c,
+            Cell::ToolResult {
+                is_error: false,
+                ..
+            }
+        )));
         assert!(!app.streaming);
         // Both prompts are gone from the screen.
         let shown = screen(&app);
@@ -915,10 +928,13 @@ mod tests {
         feed(&mut app, vec![tool_call_event("c1", "list_files", "{}")]);
         app.receive_token().await;
         assert!(!app.awaiting_approval());
-        assert!(app
-            .cells
-            .iter()
-            .any(|c| matches!(c, Cell::ToolResult { is_error: false, .. })));
+        assert!(app.cells.iter().any(|c| matches!(
+            c,
+            Cell::ToolResult {
+                is_error: false,
+                ..
+            }
+        )));
 
         // Neither does a call the permission mode forbids outright: it fails
         // with its permission error instead of asking about the impossible.

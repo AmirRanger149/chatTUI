@@ -188,7 +188,10 @@ pub struct Config {
     pub base_url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
-    #[serde(default = "default_temperature", skip_serializing_if = "is_default_temperature")]
+    #[serde(
+        default = "default_temperature",
+        skip_serializing_if = "is_default_temperature"
+    )]
     pub temperature: f32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
@@ -361,8 +364,8 @@ impl Config {
         }
         let mut starts: Vec<&Provider> = Vec::new();
         for p in &providers {
-            let is_match = p.id.starts_with(&lower)
-                || p.name.to_ascii_lowercase().starts_with(&lower);
+            let is_match =
+                p.id.starts_with(&lower) || p.name.to_ascii_lowercase().starts_with(&lower);
             if is_match && !starts.iter().any(|m| m.id == p.id) {
                 starts.push(p);
             }
@@ -458,8 +461,7 @@ impl Config {
             if !path.exists() {
                 continue;
             }
-            let bytes =
-                fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+            let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
             let mut config: Self = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parsing {}", path.display()))?;
 
@@ -504,9 +506,8 @@ impl Config {
             config.provider = provider.id.clone();
 
             if config.base_url.is_empty() {
-                config.base_url =
-                    env::var(format!("{}_BASE_URL", provider.id.to_uppercase()))
-                        .unwrap_or_else(|_| provider.base_url.clone());
+                config.base_url = env::var(format!("{}_BASE_URL", provider.id.to_uppercase()))
+                    .unwrap_or_else(|_| provider.base_url.clone());
             }
 
             if config.model.is_empty() {
@@ -671,10 +672,9 @@ mod tests {
 
     #[test]
     fn set_provider_adopts_the_stored_key() {
-        let mut config: Config = serde_json::from_str(
-            "{\"gemini_api_key\": \"AIza\", \"provider\": \"gemini\"}",
-        )
-        .unwrap();
+        let mut config: Config =
+            serde_json::from_str("{\"gemini_api_key\": \"AIza\", \"provider\": \"gemini\"}")
+                .unwrap();
         config.set_provider("gemini").unwrap();
         assert_eq!(config.api_key.as_deref(), Some("AIza"));
         assert_eq!(
@@ -726,7 +726,10 @@ mod tests {
     #[test]
     fn agent_max_rounds_defaults_and_parses() {
         let config: Config = serde_json::from_str("{}").unwrap();
-        assert_eq!(config.agent.max_rounds, crate::app::DEFAULT_AGENT_MAX_ROUNDS);
+        assert_eq!(
+            config.agent.max_rounds,
+            crate::app::DEFAULT_AGENT_MAX_ROUNDS
+        );
         let config: Config = serde_json::from_str(r#"{"agent": {"max_rounds": 120}}"#).unwrap();
         assert_eq!(config.agent.max_rounds, 120);
     }

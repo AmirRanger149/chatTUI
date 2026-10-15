@@ -2,6 +2,12 @@
 //! Gemini all stream their tokens as `data:` lines over SSE, so the
 //! incremental line reader lives here instead of in each backend.
 
+/// How many consecutive unparseable SSE `data:` lines a backend tolerates
+/// before declaring the stream broken. Gateways occasionally emit junk or
+/// keep-alive lines; a single bad line must not kill an otherwise healthy
+/// stream.
+pub(crate) const MAX_CONSECUTIVE_SSE_PARSE_FAILURES: usize = 5;
+
 /// Extract the payload of an SSE `data:` line. Returns `None` for blank
 /// lines, `event:` lines, or anything that isn't valid UTF-8.
 pub(crate) fn sse_data(line: &[u8]) -> Option<&str> {

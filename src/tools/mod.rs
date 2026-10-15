@@ -205,18 +205,36 @@ mod tests {
         let bash = find("bash");
         let desc = bash.description.to_ascii_lowercase();
         assert!(desc.contains("timeout"), "bash must document its timeout");
-        assert!(desc.contains("killed"), "bash must document that the command is killed on timeout");
-        assert!(desc.contains("allowlist"), "bash must document the environment filtering");
-        assert!(desc.contains("full-auto"), "bash must document its permission requirement");
+        assert!(
+            desc.contains("killed"),
+            "bash must document that the command is killed on timeout"
+        );
+        assert!(
+            desc.contains("allowlist"),
+            "bash must document the environment filtering"
+        );
+        assert!(
+            desc.contains("full-auto"),
+            "bash must document its permission requirement"
+        );
         // Isolation claims must be conditional and honest: enforced where
         // supported, explicitly unrestricted (with a warning) elsewhere.
-        assert!(desc.contains("os-level isolation"), "bash must document the kernel isolation layer");
-        assert!(desc.contains("kernel 5.13"), "bash must state the isolation requirement");
+        assert!(
+            desc.contains("os-level isolation"),
+            "bash must document the kernel isolation layer"
+        );
+        assert!(
+            desc.contains("kernel 5.13"),
+            "bash must state the isolation requirement"
+        );
         assert!(
             desc.contains("full user privileges") && desc.contains("states this explicitly"),
             "bash must describe the honest fallback when isolation is unavailable"
         );
-        assert!(desc.contains("best-effort"), "bash must label the name scan as best-effort");
+        assert!(
+            desc.contains("best-effort"),
+            "bash must label the name scan as best-effort"
+        );
 
         for name in ["read_file", "write_file", "edit_file"] {
             let desc = find(name).description.to_ascii_lowercase();

@@ -181,7 +181,11 @@ fn order_fallbacks(models: Vec<String>, failed: &str) -> Vec<String> {
             continue;
         }
         let same_family = !family.is_empty()
-            && id.split('/').next().unwrap_or("").eq_ignore_ascii_case(&family);
+            && id
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .eq_ignore_ascii_case(&family);
         if same_family {
             kin.push(id);
         } else {

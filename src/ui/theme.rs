@@ -37,7 +37,10 @@ pub fn cell_width(text: &str) -> usize {
 }
 
 pub fn line_width(line: &Line<'_>) -> usize {
-    line.spans.iter().map(|span| cell_width(&span.content)).sum()
+    line.spans
+        .iter()
+        .map(|span| cell_width(&span.content))
+        .sum()
 }
 
 pub fn spans_width(spans: &[Span<'_>]) -> usize {
@@ -174,7 +177,12 @@ pub fn fmt_elapsed(secs: u64) -> String {
     if secs < 3600 {
         return format!("{}m {:02}s", secs / 60, secs % 60);
     }
-    format!("{}h {:02}m {:02}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+    format!(
+        "{}h {:02}m {:02}s",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
 }
 
 /// Abbreviate `$HOME` to `~` and center-truncate long paths.

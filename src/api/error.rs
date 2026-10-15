@@ -4,12 +4,6 @@
 use crate::api::types::Failure;
 use serde_json::Value;
 
-/// How many consecutive unparseable SSE `data:` lines a backend tolerates
-/// before declaring the stream broken. Gateways occasionally emit junk or
-/// keep-alive lines; a single bad line must not kill an otherwise healthy
-/// stream.
-pub(crate) const MAX_CONSECUTIVE_SSE_PARSE_FAILURES: usize = 5;
-
 /// Decide how the orchestrator should react to a failed chat attempt.
 ///
 /// - [`Failure::Transient`] — the same model may answer fine if asked again:
@@ -40,21 +34,33 @@ pub(crate) fn classify_failure(status: u16, body: &str) -> Failure {
         "forbidden",
     ];
     if AUTH.iter().any(|phrase| lower.contains(phrase)) {
-        return Failure::Fatal(compact_failure("the API rejected the credentials", status, body));
+        return Failure::Fatal(compact_failure(
+            "the API rejected the credentials",
+            status,
+            body,
+        ));
     }
 
     // Server-side and transport trouble on a real HTTP status: timeouts,
     // throttling, and upstream outages. The same model may answer fine a few
     // seconds later, so these get same-model retries with backoff first.
     if status == 408 || status == 429 || (500..=599).contains(&status) {
-        return Failure::Transient(compact_failure("the API hit a transient error", status, body));
+        return Failure::Transient(compact_failure(
+            "the API hit a transient error",
+            status,
+            body,
+        ));
     }
 
     // These statuses are the API saying "not this model / not right now":
     // bad requests against the model, missing models, payload problems. A
     // different model may well work.
     if matches!(status, 400 | 404 | 409 | 413 | 422 | 425) {
-        return Failure::Retryable(compact_failure("the model rejected the request", status, body));
+        return Failure::Retryable(compact_failure(
+            "the model rejected the request",
+            status,
+            body,
+        ));
     }
 
     // Any other status can still mean "model busy / gone" if the body says
@@ -87,7 +93,11 @@ pub(crate) fn classify_failure(status: u16, body: &str) -> Failure {
 
     // Project/key valid but this model is not enabled (common on 403).
     if status == 403 && (lower.contains("model") || lower.contains("does not have access")) {
-        return Failure::Retryable(compact_failure("the model rejected the request", status, body));
+        return Failure::Retryable(compact_failure(
+            "the model rejected the request",
+            status,
+            body,
+        ));
     }
 
     Failure::Fatal(compact_failure("the request failed", status, body))
@@ -142,9 +152,18 @@ mod tests {
             classify_failure(503, "The model is currently experiencing high demand"),
             Failure::Transient(_)
         ));
-        assert!(matches!(classify_failure(429, "slow down"), Failure::Transient(_)));
-        assert!(matches!(classify_failure(500, "oops"), Failure::Transient(_)));
-        assert!(matches!(classify_failure(408, "gateway timeout"), Failure::Transient(_)));
+        assert!(matches!(
+            classify_failure(429, "slow down"),
+            Failure::Transient(_)
+        ));
+        assert!(matches!(
+            classify_failure(500, "oops"),
+            Failure::Transient(_)
+        ));
+        assert!(matches!(
+            classify_failure(408, "gateway timeout"),
+            Failure::Transient(_)
+        ));
 
         // Bad request for the model → try another one.
         assert!(matches!(
@@ -161,7 +180,10 @@ mod tests {
             classify_failure(401, "{\"error\":{\"message\":\"invalid x-api-key\"}}"),
             Failure::Fatal(_)
         ));
-        assert!(matches!(classify_failure(405, "method not allowed"), Failure::Fatal(_)));
+        assert!(matches!(
+            classify_failure(405, "method not allowed"),
+            Failure::Fatal(_)
+        ));
         assert!(matches!(
             classify_failure(
                 403,
@@ -176,7 +198,10 @@ mod tests {
             classify_failure(0, "Model is currently getting high demand, try later"),
             Failure::Retryable(_)
         ));
-        assert!(matches!(classify_failure(0, "unknown Explosion"), Failure::Fatal(_)));
+        assert!(matches!(
+            classify_failure(0, "unknown Explosion"),
+            Failure::Fatal(_)
+        ));
     }
 
     #[test]

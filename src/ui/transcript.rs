@@ -12,7 +12,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let width = area.width.max(20) as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    lines.extend(theme::with_border(header_lines(app, width.saturating_sub(4))));
+    lines.extend(theme::with_border(header_lines(
+        app,
+        width.saturating_sub(4),
+    )));
     lines.push(Line::from(""));
 
     // Pair tool results with the call that produced them so results can be
@@ -27,7 +30,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             Cell::ToolCall { name, args, id } => {
                 lines.extend(tool_call_lines(name, args, id, width));
             }
-            Cell::ToolResult { id, content, is_error } => {
+            Cell::ToolResult {
+                id,
+                content,
+                is_error,
+            } => {
                 let call_name = call_names
                     .iter()
                     .rev()
@@ -95,7 +102,7 @@ fn header_lines(app: &App, max_inner: usize) -> Vec<Line<'static>> {
     let dir_label = "directory: ";
     let dir = theme::display_path(&current_dir(), inner.saturating_sub(dir_label.len()));
     let dir_line = vec![Span::styled(dir_label, theme::dim()), Span::raw(dir)];
-    
+
     let sandbox_label = "sandbox: ";
     let (sandbox_status, sandbox_color) = if !app.config.sandbox.enabled {
         ("off".to_string(), Color::DarkGray)
@@ -117,7 +124,7 @@ fn header_lines(app: &App, max_inner: usize) -> Vec<Line<'static>> {
         Span::styled(sandbox_label, theme::dim()),
         Span::styled(sandbox_status, Style::new().fg(sandbox_color)),
     ];
-    
+
     vec![
         Line::from(title),
         Line::from(""),
@@ -153,7 +160,10 @@ fn assistant_lines(text: &str, width: usize, app: &App) -> Vec<Line<'static>> {
             ));
             lines.push(Line::from(""));
         } else if !segment.text.trim().is_empty() {
-            lines.extend(markdown::render(segment.text.trim_start_matches('\n'), width));
+            lines.extend(markdown::render(
+                segment.text.trim_start_matches('\n'),
+                width,
+            ));
         }
     }
     lines
@@ -294,10 +304,7 @@ fn cell_lines(cell: &Cell, width: usize, app: &App) -> Vec<Line<'static>> {
         Cell::Error(text) => {
             let style = Style::new().fg(theme::ERROR_COLOR);
             theme::wrap_styled(
-                vec![Span::styled(
-                    theme::clamp_text(text, 600),
-                    style,
-                )],
+                vec![Span::styled(theme::clamp_text(text, 600), style)],
                 width,
                 Span::styled("⚠ ", style),
                 Span::styled("  ", style),
@@ -310,8 +317,10 @@ fn cell_lines(cell: &Cell, width: usize, app: &App) -> Vec<Line<'static>> {
             Span::raw("  "),
         ),
         Cell::ToolCall { name, args, id } => tool_call_lines(name, args, id, width),
-        Cell::ToolResult { id, content, is_error } => {
-            tool_result_lines(id, content, *is_error, width, None)
-        }
+        Cell::ToolResult {
+            id,
+            content,
+            is_error,
+        } => tool_result_lines(id, content, *is_error, width, None),
     }
 }

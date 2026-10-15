@@ -48,7 +48,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 
     if popup_h > 0 {
         let lines = composer::slash_popup_lines(app, width as usize);
-        frame.render_widget(Paragraph::new(lines), row(y, popup_h.min(bottom.bottom() - y)));
+        frame.render_widget(
+            Paragraph::new(lines),
+            row(y, popup_h.min(bottom.bottom() - y)),
+        );
         y += popup_h;
     }
     if working_h > 0 && y < bottom.bottom() {

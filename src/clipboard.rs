@@ -33,7 +33,9 @@ pub struct CopyOutcome {
 /// Copy `text` to the clipboard.
 pub fn copy(text: &str) -> Result<CopyOutcome> {
     let env = Env::gather();
-    let system = platform_commands(&env).iter().find_map(|argv| try_command(argv, text));
+    let system = platform_commands(&env)
+        .iter()
+        .find_map(|argv| try_command(argv, text));
 
     if env.ssh {
         // Over SSH a remote clipboard utility copies to the *remote* machine,
@@ -52,7 +54,11 @@ pub fn copy(text: &str) -> Result<CopyOutcome> {
     }
 
     match system {
-        Some(method) => Ok(CopyOutcome { method, verified: true, hint: None }),
+        Some(method) => Ok(CopyOutcome {
+            method,
+            verified: true,
+            hint: None,
+        }),
         None => {
             write_osc52(text, &env)?;
             Ok(osc52_outcome(&env))
@@ -209,7 +215,9 @@ fn try_command(argv: &[String], text: &str) -> Option<String> {
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return status.success().then(|| format!("system clipboard ({program})"));
+                return status
+                    .success()
+                    .then(|| format!("system clipboard ({program})"));
             }
             Ok(None) => {
                 if started.elapsed() >= COMMAND_TIMEOUT {
@@ -251,8 +259,7 @@ fn osc52_sequence(payload: &str, env: &Env) -> Vec<u8> {
 
 /// Minimal standard base64 encoder, so we do not need another dependency.
 fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     for chunk in bytes.chunks(3) {
         let n = ((chunk[0] as u32) << 16)
@@ -296,14 +303,20 @@ mod tests {
 
     #[test]
     fn osc52_wraps_for_tmux_passthrough() {
-        let env = Env { tmux: true, ..Env::default() };
+        let env = Env {
+            tmux: true,
+            ..Env::default()
+        };
         let sequence = osc52_sequence("Zm9v", &env);
         assert_eq!(sequence, b"\x1bPtmux;\x1b\x1b]52;c;Zm9v\x07\x1b\\");
     }
 
     #[test]
     fn osc52_wraps_for_screen_passthrough() {
-        let env = Env { screen: true, ..Env::default() };
+        let env = Env {
+            screen: true,
+            ..Env::default()
+        };
         let sequence = osc52_sequence("Zm9v", &env);
         assert_eq!(sequence, b"\x1bP\x1b]52;c;Zm9v\x07\x1b\\");
     }
@@ -320,12 +333,18 @@ mod tests {
         use super::*;
 
         fn programs(env: &Env) -> Vec<String> {
-            platform_commands(env).iter().map(|argv| argv[0].clone()).collect()
+            platform_commands(env)
+                .iter()
+                .map(|argv| argv[0].clone())
+                .collect()
         }
 
         #[test]
         fn wayland_prefers_wl_copy() {
-            let env = Env { wayland: true, ..Env::default() };
+            let env = Env {
+                wayland: true,
+                ..Env::default()
+            };
             let order = programs(&env);
             assert_eq!(order[0], "wl-copy");
             // X11 tools are still retried blind in case the session is mixed.
@@ -334,7 +353,10 @@ mod tests {
 
         #[test]
         fn x11_prefers_xclip_then_xsel() {
-            let env = Env { x11: true, ..Env::default() };
+            let env = Env {
+                x11: true,
+                ..Env::default()
+            };
             let order = programs(&env);
             assert_eq!(order[0], "xclip");
             assert_eq!(order[1], "xsel");
@@ -342,7 +364,10 @@ mod tests {
 
         #[test]
         fn wsl_falls_back_to_clip_exe() {
-            let env = Env { wsl: true, ..Env::default() };
+            let env = Env {
+                wsl: true,
+                ..Env::default()
+            };
             assert!(programs(&env).contains(&"clip.exe".to_string()));
         }
 
@@ -360,7 +385,10 @@ mod tests {
         use super::*;
 
         fn argv(program: &str, args: &[&str]) -> Vec<String> {
-            std::iter::once(program).chain(args.iter().copied()).map(str::to_string).collect()
+            std::iter::once(program)
+                .chain(args.iter().copied())
+                .map(str::to_string)
+                .collect()
         }
 
         #[test]
@@ -378,7 +406,10 @@ mod tests {
 
         #[test]
         fn missing_tool_falls_through() {
-            assert_eq!(try_command(&argv("chat-tui-no-such-tool", &[]), "hello"), None);
+            assert_eq!(
+                try_command(&argv("chat-tui-no-such-tool", &[]), "hello"),
+                None
+            );
         }
 
         #[test]

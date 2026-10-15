@@ -147,7 +147,14 @@ impl App {
         if !provider.availability_based_model() {
             return;
         }
-        if self.config.api_key.as_deref().unwrap_or("").trim().is_empty() {
+        if self
+            .config
+            .api_key
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
             return;
         }
         // Don't override an explicit user choice: a model set through

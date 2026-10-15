@@ -16,7 +16,11 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
-    pub fn new(id: impl Into<String>, name: impl Into<String>, arguments: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
@@ -113,18 +117,6 @@ impl From<&str> for Role {
     }
 }
 
-impl Role {
-    #[allow(dead_code)]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Role::System => "system",
-            Role::Assistant => "assistant",
-            Role::User => "user",
-            Role::Tool => "tool",
-        }
-    }
-}
-
 /// One message in a conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Message {
@@ -154,25 +146,14 @@ impl Message {
         self
     }
 
-    /// Helper for tool result messages.
-    #[allow(dead_code)]
+    /// Helper for tool result messages — used to backfill a missing result so
+    /// a replayed history keeps its assistant/tool pairing.
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: Role::Tool,
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: None,
-        }
-    }
-
-    /// Helper for assistant message that contains tool calls.
-    #[allow(dead_code)]
-    pub fn assistant_with_tools(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
-        Self {
-            role: Role::Assistant,
-            content: content.into(),
-            tool_call_id: None,
-            tool_calls: Some(calls),
         }
     }
 }

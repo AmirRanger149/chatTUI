@@ -26,7 +26,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
     let glyph = SPINNER[(app.elapsed_ms() / 120) as usize % SPINNER.len()];
-    
+
     let working_text = if app.agent_iterations > 0 {
         // Rounds completed so far — progress information, not a finish line:
         // healthy runs keep going until the health guards say otherwise.
@@ -36,7 +36,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "Working".to_string()
     };
-    
+
     let line = Line::from(vec![
         Span::styled(glyph, Style::new().fg(theme::ACCENT).bold()),
         Span::raw(" "),
@@ -75,13 +75,15 @@ fn render_approval(frame: &mut Frame, area: Rect, app: &App) {
 /// a dim preview of the thought currently being written.
 fn render_thinking(frame: &mut Frame, area: Rect, app: &App) {
     let tick = app.elapsed_ms();
-    let mut spans = vec![
-        Span::styled(
-            format!("{} ", thinking::glyph(tick)),
-            Style::new().fg(theme::ACCENT).bold(),
-        ),
-    ];
-    spans.extend(thinking::shimmer("Thinking", tick / 90, Style::new().italic()));
+    let mut spans = vec![Span::styled(
+        format!("{} ", thinking::glyph(tick)),
+        Style::new().fg(theme::ACCENT).bold(),
+    )];
+    spans.extend(thinking::shimmer(
+        "Thinking",
+        tick / 90,
+        Style::new().italic(),
+    ));
     spans.push(Span::styled(
         format!(" ({} • ", theme::fmt_elapsed(app.elapsed_secs())),
         theme::dim(),
@@ -115,7 +117,11 @@ fn render_retry(frame: &mut Frame, area: Rect, app: &App, retry: &RetryView) {
         format!("{} ", thinking::glyph(tick)),
         Style::new().fg(Color::Yellow).bold(),
     )];
-    spans.extend(thinking::shimmer("Retrying", tick / 90, Style::new().italic()));
+    spans.extend(thinking::shimmer(
+        "Retrying",
+        tick / 90,
+        Style::new().italic(),
+    ));
     spans.push(Span::styled(
         format!(" in {:.1}s ", remaining.as_secs_f64()),
         Style::new().bold(),
@@ -128,7 +134,10 @@ fn render_retry(frame: &mut Frame, area: Rect, app: &App, retry: &RetryView) {
     let tail = " • esc to interrupt)";
     let room = (area.width as usize).saturating_sub(used + theme::cell_width(tail) + 2);
     if room > 8 {
-        spans.push(Span::styled(theme::clamp_text(&retry.reason, room), theme::dim()));
+        spans.push(Span::styled(
+            theme::clamp_text(&retry.reason, room),
+            theme::dim(),
+        ));
     }
     spans.push(Span::styled(" • ", theme::dim()));
     spans.push(Span::raw("esc"));
