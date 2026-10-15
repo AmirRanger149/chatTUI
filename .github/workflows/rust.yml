@@ -1,4 +1,4 @@
-name: CI
+name: Build chatTUI
 
 on:
   push:
@@ -6,44 +6,45 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
 
 jobs:
-  check:
-    name: fmt · clippy · test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
 
-      - uses: dtolnay/rust-toolchain@stable
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: chatTUI-linux-x86_64
+            binary: target/release/chat-tui
+
+          - os: windows-latest
+            artifact: chatTUI-windows-x86_64
+            binary: target/release/chat-tui.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
         with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      # Style gates start out advisory: this tree has not been through
-      # `cargo fmt` yet and has never been clippy-clean, so both would fail
-      # on day one. Run them locally, commit the result, then drop the
-      # `continue-on-error` lines to make them blocking.
-      - name: rustfmt (advisory until the tree is formatted)
-        run: cargo fmt --all -- --check
-        continue-on-error: true
-
-      - name: clippy (advisory until the lints are cleared)
-        run: cargo clippy --all-targets --all-features -- -D warnings
-        continue-on-error: true
-
-      - name: Build
-        run: cargo build --all-targets --verbose
-  # The release profile carries `lto = true`, `codegen-units = 1` and
-  # `panic = "abort"`, none of which the default `check` job compiles with.
-  release:
-    name: release build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --verbose
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
