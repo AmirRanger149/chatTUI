@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Style gates start out advisory: this tree has not been through
+      # `cargo fmt` yet and has never been clippy-clean, so both would fail
+      # on day one. Run them locally, commit the result, then drop the
+      # `continue-on-error` lines to make them blocking.
+      - name: rustfmt (advisory until the tree is formatted)
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: clippy (advisory until the lints are cleared)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        continue-on-error: true
+
+      - name: Build
+        run: cargo build --all-targets --verbose
+
+      - name: Test
+        run: cargo test --all-targets --verbose
+
+  # The release profile carries `lto = true`, `codegen-units = 1` and
+  # `panic = "abort"`, none of which the default `check` job compiles with.
+  release:
+    name: release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --verbose
