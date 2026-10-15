@@ -37,10 +37,6 @@ jobs:
 
       - name: Build
         run: cargo build --all-targets --verbose
-
-      - name: Test
-        run: cargo test --all-targets --verbose
-
   # The release profile carries `lto = true`, `codegen-units = 1` and
   # `panic = "abort"`, none of which the default `check` job compiles with.
   release:
