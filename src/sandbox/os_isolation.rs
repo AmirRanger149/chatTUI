@@ -42,7 +42,9 @@
 //! sibling regression tests pin the real enforced behavior through the
 //! actual `bash` tool path, so a drifted table (wrong number for the
 //! running architecture silently no-ops a rule) fails CI instead of
-//! passing silently.
+//! passing silently. The syscall filter has tables for x86_64, little-endian
+//! AArch64, and little-endian ARM EABI; other Linux architectures report the
+//! filter unavailable rather than using an unverified table.
 //!
 //! Enforcement happens inside the kernel against the actual syscalls — it
 //! does not depend on inspecting the command string. The remaining limits
@@ -547,7 +549,17 @@ mod landlock {
 // seccomp-bpf: deny the dangerous syscall surface
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+// The filter uses target-specific syscall numbers and seccomp_data layout.
+// ARM32 is supported here only for the little-endian EABI used by Raspberry Pi
+// OS; leave other Linux architectures on the explicit unsupported path below.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(target_arch = "arm", target_endian = "little")
+    )
+))]
 mod seccomp {
     /// Syscall numbers that differ between architectures (classic-BPF
     /// `seccomp_data` offsets: nr @ 0, arch @ 4, args[0] low word @ 16).
@@ -642,6 +654,54 @@ mod seccomp {
         setns: 308,
     };
 
+    #[cfg(target_arch = "arm")]
+    const AUDIT_ARCH: u32 = 0x4000_0028; // ARM EABI, little-endian, 32-bit
+    #[cfg(target_arch = "arm")]
+    // 32-bit ARM EABI has its own syscall table (`arch/arm/tools/syscall.tbl`);
+    // it is not the asm-generic table used by arm64. In particular, ARM's
+    // socket syscalls start at 281 and `unshare` is 337. Keep this table tied
+    // to the ARM EABI numbers so a rule cannot silently target another syscall.
+    const NR: SysNums = SysNums {
+        socket: 281,
+        connect: 283,
+        accept: 285,
+        accept4: 366,
+        sendto: 290,
+        recvfrom: 292,
+        sendmsg: 296,
+        recvmsg: 297,
+        recvmmsg: 365,
+        sendmmsg: 374,
+        shutdown: 293,
+        bind: 282,
+        listen: 284,
+        clone: 120,
+        ptrace: 26,
+        mount: 21,
+        umount2: 52,
+        pivot_root: 218,
+        chroot: 61,
+        swapon: 87,
+        swapoff: 115,
+        reboot: 88,
+        init_module: 128,
+        finit_module: 379,
+        delete_module: 129,
+        kexec_load: 347,
+        kexec_file_load: 401,
+        kill: 37,
+        add_key: 309,
+        request_key: 310,
+        keyctl: 311,
+        perf_event_open: 364,
+        process_vm_readv: 376,
+        process_vm_writev: 377,
+        unshare: 337,
+        setns: 375,
+        bpf: 386,
+        userfaultfd: 388,
+    };
+
     #[cfg(target_arch = "aarch64")]
     const AUDIT_ARCH: u32 = 0xC000_00B7; // arm64, little-endian, 64-bit
     #[cfg(target_arch = "aarch64")]
@@ -692,6 +752,22 @@ mod seccomp {
         sendmmsg: 269,
         setns: 268,
     };
+
+    #[cfg(all(test, target_arch = "arm"))]
+    #[test]
+    fn arm_eabi_syscall_numbers_match_linux_uapi() {
+        assert_eq!(AUDIT_ARCH, 0x4000_0028);
+        assert_eq!(NR.socket, 281);
+        assert_eq!(NR.connect, 283);
+        assert_eq!(NR.bind, 282);
+        assert_eq!(NR.clone, 120);
+        assert_eq!(NR.unshare, 337);
+        assert_eq!(NR.setns, 375);
+        assert_eq!(NR.bpf, 386);
+        assert_eq!(NR.kexec_file_load, 401);
+        assert_eq!(NR.userfaultfd, 388);
+        assert_eq!(CLONE3, 435);
+    }
 
     // Syscalls >= 424 share one table across architectures.
     const UNIFIED_DENY: &[i64] = &[
@@ -903,6 +979,26 @@ mod seccomp {
     }
 }
 
+// Keep Linux builds on other architectures compiling, but never pretend that
+// an unsupported syscall table is enforced. Auto mode can retain Landlock and
+// report seccomp unavailable; Require mode fails closed through its caller.
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(target_arch = "arm", target_endian = "little")
+    ))
+))]
+mod seccomp {
+    pub(super) fn apply() -> Result<(), String> {
+        Err(format!(
+            "seccomp unsupported on Linux target architecture {}",
+            std::env::consts::ARCH
+        ))
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -1003,7 +1099,25 @@ mod tests {
         let ws = unique_root("net");
         assert_inside_confined_thread(ws, move || {
             let result = std::net::TcpStream::connect("1.1.1.1:80");
-            assert!(result.is_err(), "network connect must be denied");
+            assert_eq!(
+                result.unwrap_err().raw_os_error(),
+                Some(libc::EPERM),
+                "seccomp must deny creation of an IPv4 socket"
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn confined_thread_cannot_connect_unix_sockets() {
+        let ws = unique_root("unix-connect");
+        assert_inside_confined_thread(ws, move || {
+            let result = std::os::unix::net::UnixStream::connect("/tmp/chattui-missing.sock");
+            assert_eq!(
+                result.unwrap_err().raw_os_error(),
+                Some(libc::EPERM),
+                "seccomp must deny connect() even for AF_UNIX sockets"
+            );
         })
         .unwrap();
     }

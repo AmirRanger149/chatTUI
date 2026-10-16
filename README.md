@@ -466,11 +466,13 @@ and a shell. What is actually enforced — and what is not:
   *writes* to the workspace plus a small set of scratch roots (`/tmp`,
   `$TMPDIR`, `/dev/shm`, `$CARGO_HOME`, `$CARGO_TARGET_DIR`), and a seccomp
   filter denies network sockets, `ptrace`/process-memory injection,
-  kernel-module loading, and namespace/mount tricks. The restrictions
-  cannot be undone by the command. On kernels older than 5.13 (or with the
-  facilities unavailable), `"auto"` runs the command unrestricted and says
-  so in the tool output; `"require"` refuses to run instead; `"off"`
-  restores the previous, unrestricted behavior.
+  kernel-module loading, and namespace/mount tricks. Seccomp syscall tables
+  cover x86_64, little-endian aarch64, and 32-bit little-endian ARM EABI,
+  including the Raspberry Pi Zero W. On other Linux architectures the syscall
+  filter is reported unavailable. The restrictions cannot be undone by the
+  command. When a facility or architecture is unavailable, `"auto"` warns
+  and keeps any other layer that did apply; `"require"` refuses to run instead;
+  `"off"` restores the previous, unrestricted behavior.
 - **What isolation does not cover, by design:** reads outside the workspace
   stay possible (toolchains must read system files), so secret-*read*
   protection remains the application-level sensitive-file policy described
