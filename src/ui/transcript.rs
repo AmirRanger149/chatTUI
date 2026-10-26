@@ -236,9 +236,21 @@ fn tool_call_lines(name: &str, args: &str, id: &str, width: usize) -> Vec<Line<'
     ])]
 }
 
-/// First 12 characters of a tool-call id (char-safe, unlike a byte slice).
+/// A short view of a tool-call id (char-safe, unlike a byte slice). Servers
+/// put the distinguishing part of the id at the end — vLLM emits
+/// `chatcmpl-tool-<uuid>`, OpenAI emits `call_<random>` — so cutting only the
+/// head made every call of such a provider look identical in the transcript.
+/// Keep the head *and* the tail.
 fn short_id(id: &str) -> String {
-    id.chars().take(12).collect()
+    const HEAD: usize = 8;
+    const TAIL: usize = 6;
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= HEAD + TAIL + 1 {
+        return id.to_string();
+    }
+    let head: String = chars[..HEAD].iter().collect();
+    let tail: String = chars[chars.len() - TAIL..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 /// Compact result row. Successful reads render nothing at all — the call
@@ -322,5 +334,26 @@ fn cell_lines(cell: &Cell, width: usize, app: &App) -> Vec<Line<'static>> {
             content,
             is_error,
         } => tool_result_lines(id, content, *is_error, width, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::short_id;
+
+    #[test]
+    fn short_id_keeps_short_ids_intact() {
+        assert_eq!(short_id("call_1_e7b3e"), "call_1_e7b3e");
+    }
+
+    #[test]
+    fn short_id_distinguishes_long_ids_by_their_tail() {
+        // vLLM-style ids (`chatcmpl-tool-<uuid>`) differ only at the end; a
+        // head-only slice made them all read `chatcmpl-too` in the transcript.
+        let a = short_id("chatcmpl-tool-99557ad68a6e6efc");
+        let b = short_id("chatcmpl-tool-1234abcd5678ef90");
+        assert_ne!(a, b);
+        assert!(a.chars().count() <= 15);
+        assert!(a.contains('…'));
     }
 }

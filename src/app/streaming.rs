@@ -27,6 +27,46 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// A tool-call id no earlier call in this session uses. A provider that
+    /// repeats an id (or sends none at all) gets a deterministic suffix so the
+    /// call and its result still pair up — and so two different calls never
+    /// share a label in the transcript or in replayed history.
+    fn unique_tool_call_id(&self, id: &str) -> String {
+        let base = if id.trim().is_empty() {
+            "call_unknown"
+        } else {
+            id
+        };
+        let mut used: HashSet<String> = self
+            .sessions
+            .current()
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flatten()
+            .map(|tc| tc.id.clone())
+            .collect();
+        used.extend(
+            self.pending_tool_calls
+                .iter()
+                .map(|tc| tc.id.clone()),
+        );
+        if let Some(round) = &self.tool_round {
+            used.extend(round.calls.iter().map(|tc| tc.id.clone()));
+        }
+        if !used.contains(base) {
+            return base.to_string();
+        }
+        let mut suffix = 2usize;
+        loop {
+            let candidate = format!("{base}-{suffix}");
+            if !used.contains(&candidate) {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
     pub(crate) fn start_stream(&mut self) -> Result<()> {
         if self.config.api_key.is_none() {
             let env_key = self
@@ -207,8 +247,14 @@ impl App {
                     self.retry_state = None;
                     self.response.push_str(&token);
                 }
-                Ok(StreamEvent::ToolCall(tc)) => {
+                Ok(StreamEvent::ToolCall(mut tc)) => {
                     self.retry_state = None;
+                    // Providers — mostly OpenAI-compatible gateways — sometimes
+                    // reuse one id for every call of a response (or across
+                    // rounds). Duplicate ids break the assistant/tool pairing
+                    // that replay and the transcript rely on, so give each
+                    // call a distinct one; the result that follows inherits it.
+                    tc.id = self.unique_tool_call_id(&tc.id);
                     // Detect truncated tool calls at ingestion: arguments
                     // that do not parse were cut mid-stream. Record the id
                     // so execution returns an explicit error and the stored
@@ -539,6 +585,43 @@ mod tests {
         assert_eq!(app.cells.len(), 2);
         assert!(matches!(app.cells[0], Cell::Notice(_)));
         assert_eq!(app.cells[1], Cell::Assistant("hel".into()));
+    }
+
+    #[tokio::test]
+    async fn repeated_provider_ids_are_made_unique() {
+        // A gateway that labels every call of a turn `chatcmpl-tool` used to
+        // collapse the transcript and the replayed pairing onto one id.
+        let mut app = agent_app("dup-ids");
+        feed(
+            &mut app,
+            vec![
+                tool_call_event("chatcmpl-tool", "list_files", "{}"),
+                tool_call_event("chatcmpl-tool", "list_files", "{}"),
+            ],
+        );
+        app.receive_token().await;
+
+        let ids: std::collections::HashSet<String> = app
+            .sessions
+            .current()
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flatten()
+            .map(|tc| tc.id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2, "both calls need their own id: {ids:?}");
+        assert!(ids.contains("chatcmpl-tool"));
+
+        // The results pair with those ids, so replay stays valid.
+        let answered: std::collections::HashSet<String> = app
+            .sessions
+            .current()
+            .messages
+            .iter()
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        assert_eq!(answered, ids);
     }
 
     #[tokio::test]

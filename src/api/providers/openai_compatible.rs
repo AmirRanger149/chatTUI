@@ -182,6 +182,10 @@ impl OpenAICompatibleBackend {
         let mut bad_lines = 0usize;
         // Accumulate tool calls by index
         let mut tool_builders: HashMap<usize, ToolCallBuilder> = HashMap::new();
+        // The response id every chunk carries. Some gateways omit per-call
+        // `id`s entirely; this keeps the synthesized fallback unique per
+        // response instead of per process.
+        let mut response_id = String::new();
 
         let mut stream_ended = false;
         loop {
@@ -233,7 +237,7 @@ impl OpenAICompatibleBackend {
                     }
                     // Emit any accumulated tool calls
                     for (_, builder) in tool_builders.drain() {
-                        if let Some(tc) = builder.build() {
+                        if let Some(tc) = builder.build(&response_id) {
                             let _ = tx.send(StreamEvent::ToolCall(tc)).await;
                         }
                     }
@@ -264,6 +268,12 @@ impl OpenAICompatibleBackend {
                         return Err(Failure::Fatal(format!("API error mid-stream: {message}")));
                     }
                     return Err(classify_failure(0, message));
+                }
+
+                if response_id.is_empty() {
+                    if let Some(id) = value["id"].as_str().filter(|id| !id.is_empty()) {
+                        response_id = id.to_string();
+                    }
                 }
 
                 // Content / reasoning deltas (content + reasoning_content variants)
@@ -354,7 +364,7 @@ impl OpenAICompatibleBackend {
                 if let Some(finish) = value["choices"][0]["finish_reason"].as_str() {
                     if finish == "tool_calls" {
                         for (_, builder) in tool_builders.drain() {
-                            if let Some(tc) = builder.build() {
+                            if let Some(tc) = builder.build(&response_id) {
                                 let _ = tx.send(StreamEvent::ToolCall(tc)).await;
                             }
                         }
@@ -368,7 +378,7 @@ impl OpenAICompatibleBackend {
         }
         // Stream ended without [DONE] - emit any remaining tool calls
         for (_, builder) in tool_builders.drain() {
-            if let Some(tc) = builder.build() {
+            if let Some(tc) = builder.build(&response_id) {
                 let _ = tx.send(StreamEvent::ToolCall(tc)).await;
             }
         }
@@ -395,12 +405,21 @@ impl ToolCallBuilder {
         }
     }
 
-    fn build(self) -> Option<ToolCall> {
+    /// Turn the accumulated deltas into a call. `response_id` is the `id` of
+    /// the enclosing completion, used to synthesize a fallback id when the
+    /// gateway never sent one: it must be unique per call, or the transcript
+    /// shows every call under the same label and the assistant/tool pairing
+    /// in replayed history collapses.
+    fn build(self, response_id: &str) -> Option<ToolCall> {
         if self.name.is_empty() {
             return None;
         }
         let id = if self.id.is_empty() {
-            format!("call_{}_{}", self.index, self.name)
+            if response_id.is_empty() {
+                format!("call_{}_{}", self.index, self.name)
+            } else {
+                format!("{response_id}_call_{}", self.index)
+            }
         } else {
             self.id
         };
@@ -483,9 +502,31 @@ mod tests {
         b.name = "read_file".into();
         b.arguments.push_str("{\"path\":");
         b.arguments.push_str(" \"src/main.rs\"}");
-        let tc = b.build().unwrap();
+        let tc = b.build("chatcmpl-1").unwrap();
         assert_eq!(tc.name, "read_file");
+        assert_eq!(tc.id, "call_123");
         assert!(tc.arguments.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn missing_tool_ids_fall_back_to_distinct_ids() {
+        // Gateways that stream tool calls without an `id` per call must not
+        // collapse every call of a response onto one label.
+        let mut ids = Vec::new();
+        for index in 0..2 {
+            let mut b = ToolCallBuilder::new(index);
+            b.name = "read_file".into();
+            b.arguments.push_str("{}");
+            ids.push(b.build("chatcmpl-abc").unwrap().id);
+        }
+        assert_eq!(ids, vec!["chatcmpl-abc_call_0", "chatcmpl-abc_call_1"]);
+
+        // Without a response id either, the id is still per-call and the
+        // name keeps it readable.
+        let mut b = ToolCallBuilder::new(3);
+        b.name = "list_files".into();
+        b.arguments.push_str("{}");
+        assert_eq!(b.build("").unwrap().id, "call_3_list_files");
     }
 
     #[test]
