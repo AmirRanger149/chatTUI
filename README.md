@@ -236,11 +236,11 @@ marked `· custom`) or directly with `/provider openai|anthropic|gemini|<custom-
 | `model` | Optional model name override for the active provider | Provider default |
 | `base_url` | Optional endpoint override for the active provider | Provider default |
 | `connect_timeout_secs` | Max seconds to wait while establishing an API connection | `15` |
-| `idle_timeout_secs` | Max seconds a stream may stay quiet between chunks before the connection counts as dead — this is *not* a cap on total generation time | `90` |
+| `idle_timeout_secs` | Max seconds without meaningful model output (answer text or tool-call data); keep-alive chunks do not reset it. This is *not* a cap on total generation time | `90` |
 | `agent.max_rounds` | Backstop ceiling for agent tool rounds. A safety net only — healthy runs keep going as long as they make progress; broken loops are stopped earlier by the stagnation and consecutive-failure guards | `50` |
 | `sandbox.enabled` | Master switch for agent tool execution | `true` |
 | `sandbox.workspace_root` | Agent target directory. Empty means unset — it never defaults to the current directory or the crate. Same as `--sandbox <dir>` | `""` |
-| `sandbox.permission_mode` | `read-only`, `workspace-write`, `ask-before-write`, `ask-before-shell` or `full-auto`. An unknown value fails closed to `read-only` and says so in the transcript | derived from the two legacy flags below |
+| `sandbox.permission_mode` | `read-only`, `workspace-write`, `ask-before-write`, `ask-before-shell` or `full-auto`. An unknown value fails closed to `read-only` and says so in the transcript. Set `ask-before-shell` explicitly to require shell approval | derived from the two legacy flags below (`true`/`true` defaults to `full-auto`) |
 | `sandbox.auto_approve` | Legacy flag, consulted only when `permission_mode` is unset | `true` |
 | `sandbox.allow_shell` | Master switch for the `bash` tool (also a legacy flag when `permission_mode` is unset) | `true` |
 | `sandbox.shell_timeout_secs` | Hard timeout for `bash`; the command's process group is killed when it expires. Clamped to at least 1s, so it can never mean "no timeout" | `30` |
@@ -251,11 +251,13 @@ marked `· custom`) or directly with `/provider openai|anthropic|gemini|<custom-
 > HTTP 408/429/5xx) retry the *same* model up to three times with
 > exponential backoff — announced in the transcript and shown as an animated
 > `Retrying in …s` countdown above the composer — before falling back to
-> another model as described below. Model-specific failures (missing or
-> overloaded models) skip straight to the model fallback. Streams themselves
-> are only bounded by the idle timeout, so long generations are never cut
-> off as long as tokens keep arriving, and a lone malformed SSE line from a
-> gateway no longer kills the stream.
+> another model as described below. New retry/fallback attempts stop after
+> five minutes without an answer. Model-specific failures (missing or
+> overloaded models) skip straight to model fallback. A stream has no
+> fixed total duration, but must produce answer text or tool-call progress
+> within the configured idle timeout; keep-alives alone do not count. A lone
+> malformed SSE line from a gateway no longer kills the stream. Oversized
+> responses and requests are rejected rather than accumulated without bound.
 
 > **Endpoints & models.** Each provider's endpoint/model can be overridden
 > with `{ID}_BASE_URL` / `{ID}_MODEL` environment variables (e.g.
@@ -309,7 +311,7 @@ The composer is always focused — just start typing and press `Enter` to send.
 | `d` | Delete the highlighted conversation (history popup) |
 | `r` or `R` | Re-fetch the model list (model picker) |
 | `?` | Keyboard shortcuts (only while the composer is empty) |
-| `Ctrl+C` ×2 | Quit |
+| `Ctrl+C` ×2 | Quit (waits for an in-flight tool to stop and record its outcome) |
 
 ### Slash commands
 
@@ -459,7 +461,9 @@ and a shell. What is actually enforced — and what is not:
 - **The `bash` tool has a hard timeout** (default 30s,
   `sandbox.shell_timeout_secs`; the command's process group is killed when
   it expires) and a **reduced environment** — credential-like variables such
-  as API keys are not passed to shell commands.
+  as API keys are not passed to shell commands. A command that intentionally
+  leaves its process group (for example, daemonizes) may evade group cleanup;
+  do not treat the timeout as complete process-tree isolation.
 - **Kernel-level isolation for shell commands** (Linux, on by default via
   `sandbox.os_isolation: "auto"`): before a command runs, the kernel is
   told to confine it — Landlock rules allow reads everywhere but restrict
@@ -483,8 +487,11 @@ and a shell. What is actually enforced — and what is not:
   in-process sandbox can close it.
 - **Permissions:** `sandbox.permission_mode` selects `read-only`,
   `workspace-write`, `ask-before-write`, `ask-before-shell` or `full-auto`.
-  When unset, the legacy `auto_approve` / `allow_shell` flags decide; an
-  unknown value fails closed to `read-only` and says so in the transcript.
+  When unset, the legacy `auto_approve` / `allow_shell` flags decide: the
+  default (`true` / `true`) means `full-auto`, so shell commands run without
+  approval once an agent target is set. Set `sandbox.permission_mode` to
+  `"ask-before-shell"` to require confirmation for each shell command.
+  An unknown value fails closed to `read-only` and says so in the transcript.
   `ask-*` modes pause the agent on an approval card showing exactly what is
   about to run — the full shell command, or the file plus its `+added
   -removed` line counts, with `ctrl+t` opening the diff or command output.
@@ -493,18 +500,24 @@ and a shell. What is actually enforced — and what is not:
   can never widen a mode that forbids the action outright. Separately,
   `/approve manual` asks before *every* mutating call (write, edit, shell)
   even under an allow mode; `/approve auto` (the default) leaves the decision
-  to the permission mode.
+  to the permission mode. On non-Unix platforms the `bash` tool fails closed
+  rather than running without cancellable process-group cleanup.
 - **Context-aware file tools:** `read_file` serves numbered windows of at
   most 1,000 lines (250 by default), so large files are paged through
-  instead of flooding the conversation; `write_file` / `edit_file` report
-  their change as `+added -removed` line counts.
+  instead of flooding the conversation. File reads and writes are capped at
+  1 MiB each; directory listings and shell output are capped.
+  `write_file` / `edit_file` replace files atomically and report changes as
+  `+added -removed` line counts. Concurrent processes can still change a
+  path or symlink between validation and use; do not treat the file tools
+  as a security boundary against an adversarial workspace owner.
 - **Agent loop:** the agent keeps working for as long as it makes
   progress — there is no fixed step cap. It is stopped by specific guards
   instead: the same failing tool call 3 rounds in a row (stagnation), 4
   consecutive rounds where every tool errored, or a generous backstop
   ceiling (`agent.max_rounds` in `config.json`, default 50). Every stop is
-  announced in the transcript with its reason, and `Esc` aborts the
-  in-flight model request.
+  announced in the transcript with its reason. `Esc` aborts a model request,
+  declines queued tool calls and stops an in-flight shell command; the UI
+  keeps the round active until an in-flight file operation has finished.
 
 When kernel isolation is unavailable or disabled, this system is accurately
 described as *workspace-restricted tool execution*, not a sandbox; with
@@ -527,9 +540,12 @@ falls back to `./sessions.json` in the working directory.
 The history file contains your saved messages. Back it up if you need to keep
 your conversations, and protect it if they contain private information.
 Saves are atomic (temp file + rename), so a crash cannot leave a truncated
-history behind; if the file is ever unreadable at startup, chatTUI moves it
-aside as `sessions.json.corrupt-<timestamp>` and starts fresh instead of
-refusing to launch. Corrupted tool calls from an interrupted or truncated
+history behind; write failures are shown in the transcript, and unsaved
+changes remain in memory. History files are limited to 64 MiB. If the file
+contains invalid JSON at startup, chatTUI preserves it under a unique
+`sessions.json.corrupt-*` name and starts fresh. If it cannot preserve the
+file, or cannot read it at all, startup fails rather than overwriting it.
+Corrupted tool calls from an interrupted or truncated
 stream are repaired automatically on replay (truncated arguments become
 `{}`, missing tool results are backfilled), and each repair is announced in
 the transcript.

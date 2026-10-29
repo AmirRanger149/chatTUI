@@ -18,6 +18,13 @@ pub(crate) fn sse_data(line: &[u8]) -> Option<&str> {
         .map(str::trim)
 }
 
+/// Maximum size of one SSE line and of one network chunk to process in a
+/// single call. Oversize frames fail explicitly instead of growing a buffer
+/// for an attacker-controlled endpoint indefinitely.
+const MAX_SSE_LINE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SSE_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SSE_EVENTS_PER_CHUNK: usize = 4096;
+
 /// Incremental SSE reader: feed raw bytes as they arrive and drain every
 /// complete `data:` payload they produced.
 pub(crate) struct SseReader {
@@ -29,16 +36,27 @@ impl SseReader {
         Self { buffer: Vec::new() }
     }
 
-    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Result<Vec<String>, &'static str> {
+        if chunk.len() > MAX_SSE_CHUNK_BYTES {
+            return Err("SSE chunk exceeded the 2 MiB limit");
+        }
         let mut out = Vec::new();
-        self.buffer.extend_from_slice(chunk);
-        while let Some(end) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let line = self.buffer.drain(..=end).collect::<Vec<_>>();
-            if let Some(data) = sse_data(&line) {
-                out.push(data.to_string());
+        for part in chunk.split_inclusive(|byte| *byte == b'\n') {
+            if self.buffer.len().saturating_add(part.len()) > MAX_SSE_LINE_BYTES {
+                return Err("SSE line exceeded the 2 MiB limit");
+            }
+            self.buffer.extend_from_slice(part);
+            if part.ends_with(b"\n") {
+                let line = std::mem::take(&mut self.buffer);
+                if let Some(data) = sse_data(&line) {
+                    out.push(data.to_string());
+                    if out.len() > MAX_SSE_EVENTS_PER_CHUNK {
+                        return Err("too many SSE events in one chunk");
+                    }
+                }
             }
         }
-        out
+        Ok(out)
     }
 
     /// Drain a trailing frame that ended without a final newline. Providers
@@ -77,9 +95,9 @@ mod tests {
     #[test]
     fn reader_drains_data_lines_across_chunks() {
         let mut reader = SseReader::new();
-        let mut out = reader.feed(b"event: message\ndata: {\"a\":1}\n\n");
-        out.extend(reader.feed(b"data: {\"b\":"));
-        out.extend(reader.feed(b"2}\ndata: done\n"));
+        let mut out = reader.feed(b"event: message\ndata: {\"a\":1}\n\n").unwrap();
+        out.extend(reader.feed(b"data: {\"b\":").unwrap());
+        out.extend(reader.feed(b"2}\ndata: done\n").unwrap());
         assert_eq!(
             out,
             vec![
@@ -93,16 +111,22 @@ mod tests {
     #[test]
     fn flush_recovers_a_trailing_frame_without_newline() {
         let mut reader = SseReader::new();
-        assert!(reader.feed(b"data: {\"tail\":1}").is_empty());
+        assert!(reader.feed(b"data: {\"tail\":1}").unwrap().is_empty());
         assert_eq!(reader.flush(), vec!["{\"tail\":1}".to_string()]);
         // Nothing is left behind, and flushing again is harmless.
         assert!(reader.flush().is_empty());
     }
 
     #[test]
+    fn oversized_unterminated_frame_is_rejected() {
+        let mut reader = SseReader::new();
+        assert!(reader.feed(&vec![b'x'; MAX_SSE_LINE_BYTES + 1]).is_err());
+    }
+
+    #[test]
     fn flush_ignores_non_data_trailing_lines() {
         let mut reader = SseReader::new();
-        reader.feed(b"event: ping");
+        reader.feed(b"event: ping").unwrap();
         assert!(reader.flush().is_empty());
     }
 }

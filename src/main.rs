@@ -29,8 +29,24 @@ async fn main() -> Result<()> {
     let sessions = SessionManager::load()?;
     let mut app = App::new(config, sessions);
     let mut terminal = setup_terminal()?;
-    let result = run(&mut terminal, &mut app).await;
-    restore_terminal(&mut terminal)?;
+    // Abort-profile panics do not run Drop. Only a panic on the terminal's
+    // owning thread should restore it; a worker panic may be recoverable.
+    let ui_thread = std::thread::current().id();
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() == ui_thread {
+            let _ = execute!(stdout(), event::DisableBracketedPaste, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+        }
+        previous_hook(info);
+    }));
+    let result = run(&mut terminal.terminal, &mut app).await;
+    let restore = terminal.restore();
+    if result.is_ok() {
+        restore?;
+    } else if let Err(error) = restore {
+        eprintln!("terminal restoration also failed: {error}");
+    }
     result
 }
 
@@ -63,6 +79,7 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
     loop {
         app.receive_token().await;
         app.receive_models();
+        app.receive_clipboard().await;
         terminal.draw(|frame| ui::render(frame, app))?;
 
         if event::poll(Duration::from_millis(50))? {
@@ -84,7 +101,16 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
             }
         }
         if app.should_quit {
-            return Ok(());
+            // A spawned filesystem worker or shell still owns the tool's
+            // outcome. Let cancellation finish and save that outcome before
+            // dropping the runtime and exiting the process.
+            if app.has_inflight_tool() {
+                if !app.is_stopping_tool() {
+                    app.interrupt();
+                }
+            } else {
+                return Ok(());
+            }
         }
     }
 }
@@ -114,7 +140,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     // ctrl+c: press twice within 2s to quit, from any state.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.prime_quit();
-        return !app.should_quit;
+        if app.should_quit && app.streaming && !app.is_stopping_tool() {
+            app.interrupt();
+        }
+        return !app.should_quit || app.has_inflight_tool();
     }
 
     // Global keys.
@@ -291,21 +320,74 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     true
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, event::EnableBracketedPaste)?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout()))?)
+/// Tracks each setup step so early errors and ordinary exits unwind the
+/// terminal. The panic hook above handles abort-profile panics on this thread.
+#[derive(Default)]
+struct TerminalState {
+    raw: bool,
+    alternate: bool,
+    paste: bool,
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        event::DisableBracketedPaste
-    )?;
-    terminal.show_cursor()?;
-    Ok(())
+impl TerminalState {
+    fn restore(&mut self) -> Result<()> {
+        let mut first_error = None;
+        if self.paste {
+            if let Err(error) = execute!(stdout(), event::DisableBracketedPaste) {
+                first_error = Some(error);
+            }
+            self.paste = false;
+        }
+        if self.alternate {
+            if let Err(error) = execute!(stdout(), LeaveAlternateScreen) {
+                if first_error.is_none() { first_error = Some(error); }
+            }
+            self.alternate = false;
+        }
+        if self.raw {
+            if let Err(error) = disable_raw_mode() {
+                if first_error.is_none() { first_error = Some(error); }
+            }
+            self.raw = false;
+        }
+        match first_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for TerminalState {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    state: TerminalState,
+}
+
+impl TerminalGuard {
+    fn restore(&mut self) -> Result<()> {
+        let state = self.state.restore();
+        let cursor = self.terminal.show_cursor();
+        state?;
+        cursor?;
+        Ok(())
+    }
+}
+
+fn setup_terminal() -> Result<TerminalGuard> {
+    let mut state = TerminalState::default();
+    enable_raw_mode()?;
+    state.raw = true;
+    execute!(stdout(), EnterAlternateScreen)?;
+    state.alternate = true;
+    execute!(stdout(), event::EnableBracketedPaste)?;
+    state.paste = true;
+    let terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    Ok(TerminalGuard { terminal, state })
 }
 
 #[cfg(test)]

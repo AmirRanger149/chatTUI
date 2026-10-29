@@ -62,6 +62,9 @@ impl ApiClient {
     ) -> Result<()> {
         let mut tried: Vec<String> = vec![model.to_string()];
         let mut fallbacks: Option<Vec<String>> = None;
+        // Bound retry/fallback setup time, not a healthy stream that keeps
+        // generating. Backends enforce their own meaningful-progress gap.
+        let retry_deadline = std::time::Instant::now() + Duration::from_secs(300);
 
         loop {
             let current = tried.last().cloned().unwrap_or_default();
@@ -72,6 +75,9 @@ impl ApiClient {
             // reaching this loop means no answer was spliced.
             let mut reason = String::new();
             for attempt in 1..=MAX_RETRIES_PER_MODEL {
+                if std::time::Instant::now() >= retry_deadline {
+                    return Err(anyhow!("retry/fallback time budget exhausted before a model could answer"));
+                }
                 let mut request =
                     CompletionRequest::new(messages.to_vec(), current.clone(), temperature);
                 if !tools.is_empty() {
@@ -109,6 +115,9 @@ impl ApiClient {
                             .await;
                         // `why` stays owned until both events have used it.
                         reason = why;
+                        if std::time::Instant::now() + wait >= retry_deadline {
+                            return Err(anyhow!("retry/fallback time budget exhausted: {reason}"));
+                        }
                         tokio::time::sleep(wait).await;
                     }
                 }

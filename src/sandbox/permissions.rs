@@ -87,8 +87,9 @@ impl PermissionMode {
         }
     }
 
-    /// Backward-compatible default for configs that predate
-    /// `permission_mode`: the legacy flags keep their original meaning.
+    /// Backward-compatible default for configs without `permission_mode`:
+    /// auto_approve + allow_shell enables full-auto, as it did originally.
+    /// Callers can select `ask-before-shell` explicitly to require approval.
     pub fn from_legacy_flags(auto_approve: bool, allow_shell: bool) -> PermissionMode {
         match (auto_approve, allow_shell) {
             (false, _) => PermissionMode::AskBeforeWrite,

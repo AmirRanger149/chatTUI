@@ -1223,6 +1223,11 @@ int main(int argc, char **argv) {
         let command = format!("cc -O1 -o probe probe.c && ./probe {mode}");
         let out = match sandbox.bash(&command).await {
             Ok(out) => out,
+            Err(error) if error.to_string().contains("not found") => {
+                let _ = std::fs::remove_dir_all(&ws);
+                eprintln!("skipping: C compiler unavailable: {error}");
+                return None;
+            }
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&ws);
                 panic!("sandboxed probe `{mode}` failed to run: {error}");

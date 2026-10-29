@@ -62,10 +62,17 @@ impl App {
     /// A tool round paused on an approval prompt belongs to the conversation
     /// on screen. Before that conversation is left or deleted, end the run
     /// so its calls are answered in the right history, not the next one.
-    fn stop_paused_round(&mut self) {
-        if self.tool_round.is_some() {
+    fn stop_paused_round(&mut self) -> bool {
+        if self.streaming {
             self.interrupt();
         }
+        // A tool already in flight must report its outcome in the original
+        // session. Never switch or delete that session until it has finished.
+        if self.streaming || self.tool_round.is_some() {
+            self.push_notice("wait for the running tool to stop before changing sessions".into());
+            return false;
+        }
+        true
     }
 
     pub fn load_selected_session(&mut self) {
@@ -73,9 +80,12 @@ impl App {
             return;
         };
         if selected != self.sessions.current_index() {
-            self.stop_paused_round();
-            self.sessions.select(selected);
+            if !self.stop_paused_round() {
+                return;
+            }
+            let saved = self.sessions.select(selected);
             self.rebuild_cells();
+            self.report_save(saved);
             self.scroll_from_bottom = 0;
         }
         self.overlay = None;
@@ -90,9 +100,11 @@ impl App {
         }
         let was_current = selected == self.sessions.current_index();
         if was_current {
-            self.stop_paused_round();
+            if !self.stop_paused_round() {
+                return;
+            }
         }
-        self.sessions.delete_at(selected);
+        let saved = self.sessions.delete_at(selected);
         let len = self.sessions.len();
         if let Some(Overlay::History { selected }) = &mut self.overlay {
             *selected = (*selected).min(len - 1);
@@ -101,6 +113,7 @@ impl App {
             self.rebuild_cells();
             self.scroll_from_bottom = 0;
         }
+        self.report_save(saved);
     }
 
     // -- code blocks -----------------------------------------------------------
@@ -158,17 +171,23 @@ impl App {
     /// cells on demand (like `code_blocks`), so nothing extra is stored.
     pub fn tool_details(&self) -> Vec<ToolDetailItem> {
         let mut items = Vec::new();
-        for cell in &self.cells {
+        for (position, cell) in self.cells.iter().enumerate() {
             let Cell::ToolCall { name, args, id } = cell else {
                 continue;
             };
             let args_v = serde_json::from_str::<serde_json::Value>(args).ok();
-            let result = self.cells.iter().rev().find_map(|c| match c {
-                Cell::ToolResult {
-                    id: rid, content, ..
-                } if rid == id => Some(content.clone()),
-                _ => None,
-            });
+            // Ids can be reused in later turns (especially by Gemini). The
+            // result belongs to this call, not the last result with its id.
+            let result = self.cells[position + 1..].iter()
+                .take_while(|next| match next {
+                    Cell::User(_) | Cell::Assistant(_) => false,
+                    Cell::ToolCall { id: next_id, .. } if next_id == id => false,
+                    _ => true,
+                })
+                .find_map(|next| match next {
+                    Cell::ToolResult { id: rid, content, .. } if rid == id => Some(content.clone()),
+                    _ => None,
+                });
             match name.as_str() {
                 "write_file" => {
                     let path = args_v
@@ -277,33 +296,54 @@ impl App {
         }
     }
 
-    /// `Enter` in the code overlay: copy the selected block to the clipboard.
+    /// `Enter` in the code overlay: probe tools on a worker, then send any
+    /// OSC 52 sequence from the terminal loop after the worker completes.
     pub fn copy_selected_code(&mut self) {
-        let Some(Overlay::Code { selected }) = self.overlay else {
+        let Some(Overlay::Code { selected }) = self.overlay else { return; };
+        if self.clipboard_task.is_some() {
+            self.push_notice("clipboard copy is already in progress".into());
+            self.overlay = None;
             return;
-        };
+        }
         let blocks = self.code_blocks();
         let Some(block) = blocks.get(selected) else {
             self.overlay = None;
             return;
         };
-        let lang = if block.lang.is_empty() {
-            "code".to_string()
-        } else {
-            block.lang.clone()
+        let lang = if block.lang.is_empty() { "code".to_string() } else { block.lang.clone() };
+        let text = block.code.clone();
+        let lines = text.lines().count();
+        self.clipboard_pending = Some(crate::app::ClipboardPending {
+            text: text.clone(), lang, lines,
+        });
+        self.clipboard_task = Some(tokio::task::spawn_blocking(move || {
+            crate::clipboard::try_system_clipboard(&text)
+        }));
+        self.push_notice("copying code block…".into());
+        self.overlay = None;
+    }
+
+    pub async fn receive_clipboard(&mut self) {
+        let Some(task) = self.clipboard_task.as_ref() else { return; };
+        if !task.is_finished() { return; }
+        let task = self.clipboard_task.take().expect("checked above");
+        let Some(pending) = self.clipboard_pending.take() else { return; };
+        let method = match task.await {
+            Ok(method) => method,
+            Err(error) => {
+                self.push_error(format!("clipboard worker failed: {error}"));
+                return;
+            }
         };
-        let line_count = block.code.lines().count();
-        match crate::clipboard::copy(&block.code) {
+        match crate::clipboard::finish_copy(&pending.text, method) {
             Ok(outcome) if outcome.verified => self.push_notice(format!(
-                "copied {lang} block ({line_count} lines) via {}",
-                outcome.method
+                "copied {} block ({} lines) via {}",
+                pending.lang, pending.lines, outcome.method
             )),
             Ok(outcome) => {
-                // Best-effort OSC 52 path: the terminal may have ignored it,
-                // so say "sent" instead of "copied" and point at the fix.
                 let mut message = format!(
-                    "sent {lang} block ({line_count} lines) via {} — paste to confirm",
-                    outcome.method
+                    "sent {} block ({} lines) via {} — paste to confirm",
+                    pending.lang, pending.lines, outcome.method
                 );
                 if let Some(hint) = outcome.hint {
                     message.push_str(&format!(" ({hint})"));
@@ -312,8 +352,8 @@ impl App {
             }
             Err(error) => self.push_error(format!("clipboard failed: {error}")),
         }
-        self.overlay = None;
     }
+
 }
 
 #[cfg(test)]
@@ -369,6 +409,28 @@ mod tests {
         assert!(items[0].lines.contains(&"+ y2".to_string()));
         assert!(items[1].title.starts_with("$ ls -la"));
         assert!(items[1].lines.iter().any(|l| l == "total 8"));
+    }
+
+    #[test]
+    fn tool_inspector_does_not_confuse_results_when_ids_repeat() {
+        let mut app = test_app();
+        for content in ["first", "second"] {
+            app.cells.push(Cell::ToolCall {
+                name: "bash".into(),
+                args: r#"{"command":"echo hi"}"#.into(),
+                id: "reused".into(),
+            });
+            app.cells.push(Cell::ToolResult {
+                id: "reused".into(),
+                content: content.into(),
+                is_error: false,
+            });
+        }
+        let items = app.tool_details();
+        assert_eq!(items.len(), 2);
+        assert!(items[0].lines.iter().any(|line| line == "first"));
+        assert!(!items[0].lines.iter().any(|line| line == "second"));
+        assert!(items[1].lines.iter().any(|line| line == "second"));
     }
 
     #[test]
@@ -429,8 +491,8 @@ mod tests {
     #[test]
     fn history_overlay_moves_and_clamps() {
         let mut app = test_app();
-        app.sessions.new_session();
-        app.sessions.new_session();
+        app.sessions.new_session().unwrap();
+        app.sessions.new_session().unwrap();
         app.open_history();
         app.move_history_selection(5);
         if let Some(Overlay::History { selected }) = app.overlay {

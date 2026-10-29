@@ -86,6 +86,13 @@ pub enum Failure {
     Fatal(String),
 }
 
+/// Whole-pipeline limits. Do not rely on SSE framing or the tool's display
+/// truncation alone: builders and UI buffers retain their own copies.
+pub const MAX_RESPONSE_TEXT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_TOOL_ARGUMENT_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_TOOL_CALLS_PER_TURN: usize = 32;
+pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+
 /// How many models a single message may try before giving up: the requested
 /// model plus up to three fallbacks.
 pub const MAX_MODELS_PER_SEND: usize = 4;

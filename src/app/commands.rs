@@ -124,6 +124,10 @@ impl App {
         if text.is_empty() {
             return;
         }
+        if text.len() > crate::app::MAX_COMPOSER_BYTES {
+            self.push_error("message exceeds the 1 MiB composer limit".into());
+            return;
+        }
         self.composer.clear();
         self.cursor = 0;
         self.history_nav = None;
@@ -133,7 +137,8 @@ impl App {
         }
         self.prompt_history.push(text.clone());
         self.cells.push(Cell::User(text.clone()));
-        self.sessions.add_message("user", text);
+        let saved = self.sessions.add_message("user", text);
+        self.report_save(saved);
         if let Err(error) = self.start_stream() {
             self.push_error(error.to_string());
         }
@@ -190,7 +195,7 @@ impl App {
                 let notice = if manual {
                     "approval: manual — you will be asked before the agent writes or edits files or runs shell commands (y approve, n deny)"
                 } else {
-                    "approval: auto — the agent runs its tools without asking"
+                    "approval: auto — no extra prompts (ask-before-* permission modes still require approval)"
                 };
                 self.push_notice(notice.into());
             }
@@ -293,12 +298,17 @@ impl App {
     }
 
     pub fn new_chat(&mut self) {
+        if self.streaming {
+            self.push_error("interrupt the current run before starting a new conversation".into());
+            return;
+        }
         if self.sessions.current().messages.is_empty() {
             self.push_notice("already in a new conversation".into());
             return;
         }
-        self.sessions.new_session();
+        let saved = self.sessions.new_session();
         self.rebuild_cells();
+        self.report_save(saved);
         self.scroll_from_bottom = 0;
         self.agent_iterations = 0;
         self.pending_tool_calls.clear();

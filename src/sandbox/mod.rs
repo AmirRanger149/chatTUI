@@ -60,11 +60,12 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
 use std::process::Stdio;
-#[cfg(unix)] // used by the sandboxed worker thread only
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc};
 use std::time::Duration;
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 
 pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 30;
 /// Lower bound for the enforced shell timeout so a tool call can never be
@@ -72,6 +73,8 @@ pub const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 30;
 pub const MIN_SHELL_TIMEOUT_SECS: u64 = 1;
 /// Tool output larger than this is truncated before it reaches the model.
 const MAX_TOOL_OUTPUT_BYTES: usize = 20_000;
+const MAX_DIRECTORY_ENTRIES: usize = 1_000;
+static FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Default line window for ranged reads. Reading files window by window
 /// keeps a 10,000-line file from flooding the conversation context — the
@@ -271,14 +274,15 @@ impl Sandbox {
         if !metadata.is_file() {
             return Err(anyhow!("not a file: {}", path));
         }
-        if metadata.len() as usize > self.config.max_file_size {
+        if metadata.len() > self.config.max_file_size as u64 {
             return Err(anyhow!(
                 "file too large ({} bytes > {} limit)",
                 metadata.len(),
                 self.config.max_file_size
             ));
         }
-        let content = fs::read_to_string(&full).await.context("reading file")?;
+        let content = read_limited_file(&full, self.config.max_file_size)
+            .await.context("reading file")?;
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
 
@@ -305,7 +309,12 @@ impl Sandbox {
             } else {
                 (*line).to_string()
             };
-            out.push_str(&format!("{:>6}│{}\n", start + index + 1, display));
+            let row = format!("{:>6}│{}\n", start + index + 1, display);
+            if out.len().saturating_add(row.len()) > MAX_TOOL_OUTPUT_BYTES {
+                out.push_str("… output limit reached — read a smaller line window\n");
+                break;
+            }
+            out.push_str(&row);
         }
         if end < total {
             out.push_str(&format!(
@@ -321,27 +330,20 @@ impl Sandbox {
         self.authorize(ToolKind::Write)?;
         let full = self.resolve_path(path)?;
         self.check_access(&full, Access::Write)?;
+        self.ensure_content_size(content)?;
         if let Some(parent) = full.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .context("creating parent dirs")?;
-            // Re-validate after creating the parents: create_dir_all follows
-            // symlinks, so make sure the directory we are about to write
-            // into still resolves inside the workspace. (A symlink swapped
-            // in after this check remains a TOCTOU race — see module docs.)
-            let canonical_parent = parent.canonicalize().context("resolving parent")?;
-            if !canonical_parent.starts_with(&self.config.workspace_root) {
-                return Err(anyhow!("path escapes workspace: {}", path));
-            }
+            fs::create_dir_all(parent).await.context("creating parent dirs")?;
+            self.check_parent(parent)?;
         }
-        // Line stats for the report: how many lines the file had before
-        // (if it existed) and how many it has now.
-        let old_lines = fs::read_to_string(&full)
-            .await
-            .map(|old| old.lines().count())
-            .unwrap_or(0);
+        let old_lines = match fs::metadata(&full).await {
+            Ok(metadata) if metadata.is_file() => read_limited_file(&full, self.config.max_file_size)
+                .await.context("reading old file")?.lines().count(),
+            Ok(_) => return Err(anyhow!("not a file: {path}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error).context("checking old file"),
+        };
         let new_lines = content.lines().count();
-        fs::write(&full, content).await.context("writing file")?;
+        self.atomic_write_file(full, content.to_string()).await?;
         if old_lines > 0 {
             Ok(format!("wrote {path} (+{new_lines} -{old_lines})"))
         } else {
@@ -358,13 +360,11 @@ impl Sandbox {
         self.authorize(ToolKind::Edit)?;
         let full = self.resolve_path(path)?;
         self.check_access(&full, Access::Write)?;
-        let current = fs::read_to_string(&full)
-            .await
-            .context("reading file for edit")?;
-        if !current.contains(old_string) {
+        let current = read_limited_file(&full, self.config.max_file_size)
+            .await.context("reading file for edit")?;
+        if old_string.is_empty() || !current.contains(old_string) {
             return Err(anyhow!("old_string not found in file"));
         }
-        // Ensure unique occurrence or allow first?
         let count = current.matches(old_string).count();
         if count > 1 {
             return Err(anyhow!(
@@ -373,12 +373,36 @@ impl Sandbox {
             ));
         }
         let new_content = current.replacen(old_string, new_string, 1);
+        self.ensure_content_size(&new_content)?;
         let removed = old_string.lines().count();
         let added = new_string.lines().count();
-        fs::write(&full, &new_content)
-            .await
-            .context("writing edited file")?;
+        self.atomic_write_file(full, new_content).await?;
         Ok(format!("edited {path} (+{added} -{removed})"))
+    }
+
+    fn ensure_content_size(&self, content: &str) -> Result<()> {
+        if content.len() > self.config.max_file_size {
+            return Err(anyhow!("file content too large ({} bytes > {} limit)",
+                content.len(), self.config.max_file_size));
+        }
+        Ok(())
+    }
+
+    fn check_parent(&self, parent: &Path) -> Result<()> {
+        let canonical = parent.canonicalize().context("resolving parent directory")?;
+        if !canonical.starts_with(&self.config.workspace_root) {
+            return Err(anyhow!("path escapes workspace: {}", parent.display()));
+        }
+        Ok(())
+    }
+
+    async fn atomic_write_file(&self, path: PathBuf, content: String) -> Result<()> {
+        let workspace = self.config.workspace_root.clone();
+        // A complete write/flush/rename operation on one worker cannot be
+        // cancelled halfway through by dropping a Tokio filesystem future.
+        // The UI waits for its result on interruption before changing chats.
+        tokio::task::spawn_blocking(move || atomic_write_file(&path, content.as_bytes(), &workspace))
+            .await.context("file writer failed")?
     }
 
     pub async fn list_files(&self, path: &str) -> Result<String> {
@@ -392,7 +416,12 @@ impl Sandbox {
         }
         let mut entries = fs::read_dir(&full).await.context("reading dir")?;
         let mut lines = Vec::new();
+        let mut limited = false;
         while let Some(entry) = entries.next_entry().await? {
+            if lines.len() >= MAX_DIRECTORY_ENTRIES {
+                limited = true;
+                break;
+            }
             let name = entry.file_name().to_string_lossy().to_string();
             // Keep the sensitive-file inventory out of directory listings.
             if is_sensitive_name(&name, &self.config.extra_sensitive_names) {
@@ -400,9 +429,16 @@ impl Sandbox {
             }
             let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
             let prefix = if is_dir { "dir " } else { "file" };
+            if lines.iter().map(String::len).sum::<usize>() + name.len() + 16 > MAX_TOOL_OUTPUT_BYTES {
+                limited = true;
+                break;
+            }
             lines.push(format!("{} {}", prefix, name));
         }
         lines.sort();
+        if limited {
+            lines.push("… directory listing limited; specify a narrower path".into());
+        }
         if lines.is_empty() {
             Ok("(empty directory)".to_string())
         } else {
@@ -431,74 +467,53 @@ impl Sandbox {
     ///   command with exactly the warning that names what is missing in the
     ///   output and `require` mode refuses to run; neither pretends the
     ///   command was confined, and neither can panic the worker.
+    #[cfg(test)]
     pub async fn bash(&self, command: &str) -> Result<String> {
-        let cmd = self.prepare_shell(command)?;
-        let timeout = self.config.effective_shell_timeout();
+        self.bash_cancellable(command, Arc::new(AtomicBool::new(false))).await
+    }
 
+    async fn bash_cancellable(&self, command: &str, cancel: Arc<AtomicBool>) -> Result<String> {
+        let cmd = self.prepare_shell(command)?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(anyhow!("command interrupted before it started"));
+        }
         #[cfg(unix)]
         {
             let workspace = self.config.workspace_root.clone();
             let roots = os_isolation::writable_roots(&workspace);
-            let mode = self.config.os_isolation;
-            let cmd_owned = cmd.to_string();
-
-            let (otx, orx) = tokio::sync::oneshot::channel::<Result<ShellOutcome, String>>();
-            let pid_slot = std::sync::Arc::new(AtomicI32::new(-1));
-            let pid_for_thread = pid_slot.clone();
-
-            let worker = std::thread::Builder::new()
-                .name("sandboxed-shell".into())
-                .spawn(move || {
-                    let outcome =
-                        run_shell_process(&cmd_owned, &workspace, &pid_for_thread, mode, &roots);
-                    let _ = otx.send(outcome);
-                });
-
-            if let Err(error) = worker {
-                return Err(anyhow!(
-                    "could not start the sandboxed shell worker: {error}"
-                ));
-            }
-
-            let outcome = match tokio::time::timeout(timeout, orx).await {
-                Ok(Ok(inner)) => inner,
-                Ok(Err(_worker_gone)) => Err("shell worker exited without reporting".to_string()),
-                Err(_elapsed) => {
-                    let pid = pid_slot.load(Ordering::SeqCst);
-                    if pid > 0 {
-                        kill_process_group(pid as u32).await;
-                    }
-                    return Err(anyhow!(
-                        "command timed out after {}s and was killed: {}",
-                        timeout.as_secs(),
-                        cmd
-                    ));
-                }
-            };
-
-            let outcome = outcome.map_err(|error| anyhow!("{error}"))?;
-            Ok(format_shell_parts(
+            let isolation = self.config.os_isolation;
+            let cmd = cmd.to_owned();
+            let timeout = self.config.effective_shell_timeout();
+            // The worker alone owns spawn, process-group signals and wait.
+            // Dropping this future sets the flag even when the Tokio task is
+            // aborted; it cannot miss a PID publication between threads.
+            let _cancel_on_drop = CancelOnDrop(cancel.clone());
+            let outcome = tokio::task::spawn_blocking(move || {
+                run_shell_process(&cmd, &workspace, isolation, &roots, &cancel, timeout)
+            })
+            .await
+            .context("shell worker failed")?
+            .map_err(|message| anyhow!("{message}"))?;
+            let text = format_shell_parts(
                 &outcome.stdout,
                 &outcome.stderr,
-                &outcome.status_text,
-            ))
+                &outcome.status.to_string(),
+                !outcome.status.success(),
+            );
+            if !outcome.status.success() {
+                return Err(anyhow!("command failed ({}):\n{text}", outcome.status));
+            }
+            Ok(text)
         }
-
         #[cfg(not(unix))]
         {
-            let output = tokio::process::Command::new("sh")
-                .arg("-c")
-                .arg(cmd)
-                .current_dir(&self.config.workspace_root)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .output()
-                .await
-                .context("executing command")?;
-            let _ = timeout; // no timeout on this platform yet; documented gap
-            Ok(format_shell_output(output))
+            let _ = cmd;
+            // Windows has no process-group supervision or kernel isolation
+            // in this backend. Never run a model-generated shell command
+            // with inherited credentials and an unenforced `require` flag.
+            Err(anyhow!(
+                "shell execution is unavailable on this platform until bounded, isolated process-tree supervision is implemented"
+            ))
         }
     }
 
@@ -569,7 +584,29 @@ impl Sandbox {
 
     /// Execute a ToolCall by name, after the permission layer approves the
     /// tool's capability class.
+    #[cfg(test)]
     pub async fn execute_tool(&self, tool_call: &ToolCall) -> Result<String> {
+        self.execute_tool_cancellable(tool_call, false, Arc::new(AtomicBool::new(false)))
+            .await
+    }
+
+    pub async fn execute_tool_cancellable(
+        &self,
+        tool_call: &ToolCall,
+        approved: bool,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String> {
+        let mut sandbox = self.clone();
+        if approved {
+            sandbox.config.permission_mode = sandbox.config.permission_mode.approved();
+        }
+        sandbox.execute_tool_inner(tool_call, cancel).await
+    }
+
+    async fn execute_tool_inner(&self, tool_call: &ToolCall, cancel: Arc<AtomicBool>) -> Result<String> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(anyhow!("tool interrupted before it started"));
+        }
         let kind = ToolKind::from_tool_name(&tool_call.name)
             .ok_or_else(|| anyhow!("unknown tool: {}", tool_call.name))?;
         self.authorize(kind)?;
@@ -625,21 +662,10 @@ impl Sandbox {
                 let cmd = args["command"]
                     .as_str()
                     .ok_or_else(|| anyhow!("missing command"))?;
-                self.bash(cmd).await
+                self.bash_cancellable(cmd, cancel).await
             }
             other => Err(anyhow!("unknown tool: {}", other)),
         }
-    }
-
-    /// Execute a tool call the user has approved: whatever the permission
-    /// mode asks about (`ask-*`) is granted for this call. Everything else
-    /// still applies unchanged — kinds the mode denies outright,
-    /// `allow_shell`, workspace paths, the sensitive-file policy and shell
-    /// isolation — so an approval can never widen what the config permits.
-    pub async fn execute_approved_tool(&self, tool_call: &ToolCall) -> Result<String> {
-        let mut approved = self.clone();
-        approved.config.permission_mode = approved.config.permission_mode.approved();
-        approved.execute_tool(tool_call).await
     }
 }
 
@@ -791,17 +817,23 @@ fn canonicalize_deepest(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-#[cfg(not(unix))] // the unix path renders through `ShellOutcome` instead
-fn format_shell_output(output: std::process::Output) -> String {
-    format_shell_parts(&output.stdout, &output.stderr, &output.status.to_string())
+/// Cancelling an async task must also stop its non-abortable shell worker.
+#[cfg(unix)]
+struct CancelOnDrop(Arc<AtomicBool>);
+
+#[cfg(unix)]
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
-/// Raw result of one sandboxed shell run, before rendering.
+/// Raw result of one shell run, before rendering.
 #[cfg(unix)]
 struct ShellOutcome {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
-    status_text: String,
+    status: std::process::ExitStatus,
 }
 
 /// Spawn `sh -c <cmd>` on the current (unrestricted) worker thread, in its
@@ -816,13 +848,19 @@ struct ShellOutcome {
 fn run_shell_process(
     cmd: &str,
     workspace: &Path,
-    pid_slot: &AtomicI32,
     isolation: OsIsolation,
     writable_roots: &[PathBuf],
+    cancel: &AtomicBool,
+    timeout: Duration,
 ) -> Result<ShellOutcome, String> {
-    use std::io::Read;
+    use std::sync::mpsc::{self, TryRecvError};
+    use std::time::Instant;
     use std::os::unix::process::CommandExt;
 
+    let started = Instant::now();
+    if cancel.load(Ordering::SeqCst) {
+        return Err("command interrupted before it started".into());
+    }
     let mut builder = std::process::Command::new("sh");
     builder
         .arg("-c")
@@ -899,53 +937,150 @@ fn run_shell_process(
             return Err(format!("spawning sh: {error}"));
         }
     };
-    pid_slot.store(child.id() as i32, Ordering::SeqCst);
-
-    // Drain both pipes concurrently so a chatty child can never fill them
-    // and deadlock while `wait()` runs.
-    let mut stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or_else(|| "stdout unavailable".to_string())?;
-    let mut stderr_pipe = child
-        .stderr
-        .take()
-        .ok_or_else(|| "stderr unavailable".to_string())?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buffer);
-        buffer
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buffer);
-        buffer
-    });
-
-    let status = child
-        .wait()
-        .map_err(|error| format!("waiting on sh: {error}"))?;
-    let stdout = stdout_reader.join().unwrap_or_default();
-    let stderr = stderr_reader.join().unwrap_or_default();
-    Ok(ShellOutcome {
-        stdout,
-        stderr,
-        status_text: status.to_string(),
-    })
+    // The child remains owned (and unreaped) until the worker knows both its
+    // status and the fate of its pipes. Its PID cannot be recycled during a
+    // timeout/cancellation signal. Background children that keep a pipe open
+    // are subject to the same deadline as the group leader.
+    let pid = child.id();
+    let stdout_pipe = match child.stdout.take() {
+        Some(pipe) => pipe,
+        None => {
+            kill_and_reap(&mut child, pid);
+            return Err("stdout unavailable".into());
+        }
+    };
+    let stderr_pipe = match child.stderr.take() {
+        Some(pipe) => pipe,
+        None => {
+            kill_and_reap(&mut child, pid);
+            return Err("stderr unavailable".into());
+        }
+    };
+    let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
+    let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+    if let Err(error) = std::thread::Builder::new()
+        .spawn(move || { let _ = stdout_tx.send(read_capped(stdout_pipe)); })
+    {
+        kill_and_reap(&mut child, pid);
+        return Err(format!("starting stdout reader: {error}"));
+    }
+    if let Err(error) = std::thread::Builder::new()
+        .spawn(move || { let _ = stderr_tx.send(read_capped(stderr_pipe)); })
+    {
+        kill_and_reap(&mut child, pid);
+        return Err(format!("starting stderr reader: {error}"));
+    }
+    let mut stdout = None;
+    let mut stderr = None;
+    loop {
+        if cancel.load(Ordering::SeqCst) || started.elapsed() >= timeout {
+            // libc is used from the owning worker: there is no separate PID
+            // publication or unbounded `sh -c kill ...` helper to race with.
+            kill_and_reap(&mut child, pid);
+            if cancel.load(Ordering::SeqCst) {
+                return Err("command interrupted; process group was killed".into());
+            }
+            return Err(format!("command timed out after {}s; process group was killed", timeout.as_secs()));
+        }
+        if stdout.is_none() {
+            match stdout_rx.try_recv() {
+                Ok(data) => stdout = Some(data),
+                Err(TryRecvError::Disconnected) => {
+                    kill_and_reap(&mut child, pid);
+                    return Err("stdout reader stopped".into());
+                },
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if stderr.is_none() {
+            match stderr_rx.try_recv() {
+                Ok(data) => stderr = Some(data),
+                Err(TryRecvError::Disconnected) => {
+                    kill_and_reap(&mut child, pid);
+                    return Err("stderr reader stopped".into());
+                },
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if stdout.is_some() && stderr.is_some() {
+            // Poll/reap only after the pipes close, keeping the original
+            // child PID reserved until any background descendants finish or
+            // are killed on timeout. Never signal a recycled process group.
+            let status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    kill_and_reap(&mut child, pid);
+                    return Err(format!("waiting on sh: {error}"));
+                }
+            };
+            if let Some(status) = status {
+                let (stdout, stdout_cut) = stdout.take().expect("checked above");
+                let (stderr, stderr_cut) = stderr.take().expect("checked above");
+                let mut result = ShellOutcome { stdout, stderr, status };
+                if stdout_cut || stderr_cut {
+                    result.stderr.extend_from_slice(b"\n(output truncated while reading)\n");
+                }
+                return Ok(result);
+            }
+        }
+        // If one pipe is ready first, keep its bounded buffer until both
+        // finish; never wait on an exited shell while descendants hold it.
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
-fn format_shell_parts(stdout: &[u8], stderr: &[u8], status_text: &str) -> String {
+#[cfg(unix)]
+fn read_capped(mut pipe: impl std::io::Read) -> (Vec<u8>, bool) {
+    let mut captured = Vec::new();
+    let mut buf = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let keep = n.min(MAX_TOOL_OUTPUT_BYTES.saturating_sub(captured.len()));
+                captured.extend_from_slice(&buf[..keep]);
+                truncated |= keep < n;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    (captured, truncated)
+}
+
+#[cfg(unix)]
+fn kill_and_reap(child: &mut std::process::Child, pid: u32) {
+    kill_process_group(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    if pid != 0 && pid <= i32::MAX as u32 {
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+    }
+}
+
+fn format_shell_parts(stdout: &[u8], stderr: &[u8], status_text: &str, failure: bool) -> String {
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
     let mut result = String::new();
-    if !stdout.is_empty() {
-        result.push_str(&stdout);
-    }
-    if !stderr.is_empty() {
-        if !result.is_empty() {
-            result.push_str("\n--- stderr ---\n");
+    // On failure stderr is the diagnostic: do not truncate it away behind
+    // thousands of bytes of noisy stdout.
+    let parts = if failure {
+        [(&*stderr, "stderr"), (&*stdout, "stdout")]
+    } else {
+        [(&*stdout, "stdout"), (&*stderr, "stderr")]
+    };
+    for (part, label) in parts {
+        if !part.is_empty() {
+            if !result.is_empty() {
+                result.push_str(&format!("\n--- {label} ---\n"));
+            }
+            result.push_str(part);
         }
-        result.push_str(&stderr);
     }
     if result.is_empty() {
         result = format!("(command exited with status {status_text})");
@@ -963,29 +1098,91 @@ fn format_shell_parts(stdout: &[u8], stderr: &[u8], status_text: &str) -> String
     result
 }
 
-/// Best-effort SIGKILL for a whole process group. Uses the shell builtin so
-/// no extra crates are needed. Group members that escaped into their own
-/// session (double-fork / setsid) survive — a documented limitation.
-#[cfg(unix)]
-async fn kill_process_group(pid: u32) {
-    if pid == 0 {
-        // `-0` would mean "my own process group" — never kill that.
-        return;
+/// The metadata check is only a fast rejection: enforce the limit again as
+/// bytes are read so a concurrently growing file cannot exhaust memory.
+async fn read_limited_file(path: &Path, max: usize) -> Result<String> {
+    let file = fs::File::open(path).await?;
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1).read_to_end(&mut bytes).await?;
+    if bytes.len() > max {
+        return Err(anyhow!("file exceeds the {max}-byte limit"));
     }
-    let script = format!("kill -9 -{pid} 2>/dev/null || true");
-    let kill = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(&script)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let _ = tokio::time::timeout(Duration::from_secs(2), kill).await;
+    Ok(String::from_utf8(bytes).context("file is not UTF-8")?)
 }
 
-#[cfg(not(unix))]
-async fn kill_process_group(_pid: u32) {}
+struct FileTemp(PathBuf);
+impl Drop for FileTemp {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
+/// Atomic replacement within the validated parent. Cross-process symlink
+/// swaps remain a TOCTOU risk on platforms without handle-relative openat2;
+/// this is an integrity improvement, not an OS sandbox. Reject hard links
+/// instead of silently changing their semantics with a rename.
+fn atomic_write_file(path: &Path, bytes: &[u8], workspace: &Path) -> Result<()> {
+    use std::io::Write;
+    let parent = path.parent().context("missing parent directory")?;
+    if !parent.canonicalize()?.starts_with(workspace) {
+        return Err(anyhow!("parent moved outside workspace"));
+    }
+    let original = match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if !meta.is_file() || meta.file_type().is_symlink() {
+                return Err(anyhow!("refusing to replace a link or non-file"));
+            }
+            #[cfg(unix)] {
+                use std::os::unix::fs::MetadataExt;
+                if meta.nlink() > 1 {
+                    return Err(anyhow!("refusing to replace a multiply linked file"));
+                }
+            }
+            Some(meta)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("checking target file"),
+    };
+    let mut tmp = None;
+    for _ in 0..16 {
+        let candidate = parent.join(format!(".chat-tui-{}-{}.tmp", std::process::id(),
+            FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&candidate) {
+            Ok(file) => { tmp = Some((candidate, file)); break; }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("creating replacement file"),
+        }
+    }
+    let (temp_path, mut file) = tmp.context("could not create unique replacement file")?;
+    let mut guard = FileTemp(temp_path.clone());
+    if let Some(meta) = &original {
+        file.set_permissions(meta.permissions())?;
+    }
+    file.write_all(bytes).context("writing replacement file")?;
+    file.sync_all().context("syncing replacement file")?;
+    drop(file);
+    if !parent.canonicalize()?.starts_with(workspace) {
+        return Err(anyhow!("parent moved outside workspace before rename"));
+    }
+    // Check for a newly swapped symlink. A second change between this check
+    // and rename is still possible without directory-handle syscalls.
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(anyhow!("target became a symlink before rename"));
+    }
+    std::fs::rename(&temp_path, path).context("renaming replacement file")?;
+    guard.0.clear();
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all().context("syncing parent directory")?;
+    Ok(())
+}
 
 fn expand_user_path(raw: &str) -> Result<PathBuf> {
     let trimmed = raw.trim();
@@ -1021,7 +1218,15 @@ mod tests {
         let mut cfg = SandboxConfig::default();
         cfg.workspace_root = root.canonicalize().unwrap_or(root);
         cfg.shell_timeout = Duration::from_secs(secs);
+        cfg.permission_mode = PermissionMode::FullAuto;
         Sandbox::new(cfg)
+    }
+
+    #[test]
+    fn default_permissions_restore_full_auto() {
+        let config = SandboxConfig::default();
+        assert!(config.auto_approve && config.allow_shell);
+        assert_eq!(config.permission_mode, PermissionMode::FullAuto);
     }
 
     #[test]
@@ -1101,9 +1306,9 @@ mod tests {
         std::os::unix::fs::symlink("/etc/hosts", dir.join("escape.txt")).unwrap();
         std::os::unix::fs::symlink("/", dir.join("out")).unwrap();
         // Symlinked file pointing outside.
-        assert!(sandbox.read_file("escape.txt").await.is_err());
+        assert!(sandbox.read_file("escape.txt", 1, DEFAULT_READ_LIMIT).await.is_err());
         // Directory symlink: read through it.
-        assert!(sandbox.read_file("out/etc/hosts").await.is_err());
+        assert!(sandbox.read_file("out/etc/hosts", 1, DEFAULT_READ_LIMIT).await.is_err());
         // Directory symlink: write through it.
         assert!(sandbox
             .write_file("out/escape-write.txt", "x")
@@ -1118,24 +1323,25 @@ mod tests {
         std::fs::create_dir_all(dir.join("a")).unwrap();
         std::os::unix::fs::symlink("/etc", dir.join("a").join("b")).unwrap();
         let sandbox = Sandbox::with_root(dir);
-        assert!(sandbox.read_file("a/b/passwd").await.is_err());
+        assert!(sandbox.read_file("a/b/passwd", 1, DEFAULT_READ_LIMIT).await.is_err());
     }
 
     #[tokio::test]
     async fn reading_nonexistent_paths_fails_cleanly() {
         let dir = unique_root("missing");
         let sandbox = Sandbox::with_root(dir);
-        let err = sandbox.read_file("does/not/exist.txt").await.unwrap_err();
+        let err = sandbox.read_file("does/not/exist.txt", 1, DEFAULT_READ_LIMIT).await.unwrap_err();
         assert!(!err.to_string().contains("panic"));
         // And writing into a non-existent nested directory still works.
         sandbox
             .write_file("does/new/file.txt", "created")
             .await
             .unwrap();
-        assert_eq!(
-            sandbox.read_file("does/new/file.txt").await.unwrap(),
-            "created"
-        );
+        assert!(sandbox
+            .read_file("does/new/file.txt", 1, DEFAULT_READ_LIMIT)
+            .await
+            .unwrap()
+            .contains("created"));
     }
 
     #[tokio::test]
@@ -1143,17 +1349,17 @@ mod tests {
         let dir = unique_root("sensitive");
         let sandbox = Sandbox::with_root(dir.clone());
         // dotenv-style names
-        assert!(sandbox.read_file(".env").await.is_err());
+        assert!(sandbox.read_file(".env", 1, DEFAULT_READ_LIMIT).await.is_err());
         assert!(sandbox.write_file(".env", "X=1").await.is_err());
         assert!(sandbox.edit_file(".env", "A", "B").await.is_err());
-        assert!(sandbox.read_file("config/.env.local").await.is_err());
-        assert!(sandbox.read_file("production.env").await.is_err());
+        assert!(sandbox.read_file("config/.env.local", 1, DEFAULT_READ_LIMIT).await.is_err());
+        assert!(sandbox.read_file("production.env", 1, DEFAULT_READ_LIMIT).await.is_err());
         // key material
-        assert!(sandbox.read_file("server.pem").await.is_err());
+        assert!(sandbox.read_file("server.pem", 1, DEFAULT_READ_LIMIT).await.is_err());
         assert!(sandbox.write_file("tls/host.key", "x").await.is_err());
-        assert!(sandbox.read_file("id_ed25519").await.is_err());
+        assert!(sandbox.read_file("id_ed25519", 1, DEFAULT_READ_LIMIT).await.is_err());
         // git internals: reads of config/credentials, all writes
-        assert!(sandbox.read_file(".git/config").await.is_err());
+        assert!(sandbox.read_file(".git/config", 1, DEFAULT_READ_LIMIT).await.is_err());
         assert!(sandbox
             .write_file(".git/hooks/pre-commit", "#!/bin/sh")
             .await
@@ -1161,10 +1367,10 @@ mod tests {
         // non-sensitive git internals stay readable
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join(".git").join("HEAD"), "ref: refs/heads/main").unwrap();
-        assert!(sandbox.read_file(".git/HEAD").await.is_ok());
+        assert!(sandbox.read_file(".git/HEAD", 1, DEFAULT_READ_LIMIT).await.is_ok());
         // normal files keep working
         sandbox.write_file("normal.txt", "fine").await.unwrap();
-        assert_eq!(sandbox.read_file("normal.txt").await.unwrap(), "fine");
+        assert!(sandbox.read_file("normal.txt", 1, DEFAULT_READ_LIMIT).await.unwrap().contains("fine"));
     }
 
     #[tokio::test]
@@ -1190,9 +1396,9 @@ mod tests {
         cfg.workspace_root = dir.canonicalize().unwrap();
         cfg.extra_sensitive_names = vec!["secrets.json".into(), ".token".into()];
         let sandbox = Sandbox::new(cfg);
-        assert!(sandbox.read_file("secrets.json").await.is_err());
-        assert!(sandbox.read_file("token.txt").await.is_err()); // suffix match
-        assert!(sandbox.read_file("anything-else.txt").await.is_ok());
+        assert!(sandbox.read_file("secrets.json", 1, DEFAULT_READ_LIMIT).await.is_err());
+        assert!(sandbox.read_file("token.txt", 1, DEFAULT_READ_LIMIT).await.is_err()); // suffix match
+        assert!(sandbox.read_file("anything-else.txt", 1, DEFAULT_READ_LIMIT).await.is_ok());
     }
 
     #[cfg(unix)]
@@ -1211,8 +1417,8 @@ mod tests {
         let dir = unique_root("rw");
         let sandbox = Sandbox::with_root(dir.clone());
         sandbox.write_file("test.txt", "hello").await.unwrap();
-        let content = sandbox.read_file("test.txt").await.unwrap();
-        assert_eq!(content, "hello");
+        let content = sandbox.read_file("test.txt", 1, DEFAULT_READ_LIMIT).await.unwrap();
+        assert!(content.contains("hello"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1237,6 +1443,33 @@ mod tests {
         assert!(written.starts_with(&target));
         assert!(!crate_root.join("hello_agent.txt").exists());
         let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn shell_failure_keeps_stderr_even_if_stdout_floods() {
+        let formatted = format_shell_parts(&vec![b'x'; 25_000], b"important failure", "7", true);
+        assert!(formatted.contains("important failure"));
+        assert!(formatted.contains("truncated"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_shell_exit_is_an_error_even_with_output() {
+        let sandbox = Sandbox::with_root(unique_root("nonzero-shell"));
+        let err = sandbox.bash("echo broken >&2; exit 7").await.unwrap_err();
+        assert!(err.to_string().contains("exit status: 7"));
+        assert!(err.to_string().contains("broken"));
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_refuse_oversize_content_without_replacing_the_file() {
+        let root = unique_root("write-limit");
+        let mut sandbox = Sandbox::with_root(root.clone());
+        sandbox.config.max_file_size = 8;
+        sandbox.write_file("a.txt", "ok").await.unwrap();
+        assert!(sandbox.write_file("a.txt", "123456789").await.is_err());
+        assert!(sandbox.edit_file("a.txt", "ok", "123456789").await.is_err());
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "ok");
     }
 
     #[cfg(unix)]
@@ -1323,7 +1556,7 @@ mod tests {
         let dir = unique_root("env");
         let sandbox = Sandbox::with_root(dir);
         std::env::set_var("CHATTUI_SECRET_TEST", "top-secret-value");
-        let secret = sandbox.bash("printenv CHATTUI_SECRET_TEST").await.unwrap();
+        let secret = sandbox.bash(r#"printf '%s' "$CHATTUI_SECRET_TEST""#).await.unwrap();
         assert!(
             !secret.contains("top-secret-value"),
             "credentials leaked into the shell environment"
@@ -1379,21 +1612,22 @@ mod tests {
         let mut cfg = SandboxConfig::default();
         cfg.workspace_root = dir.canonicalize().unwrap();
         cfg.os_isolation = OsIsolation::Require;
+        cfg.permission_mode = PermissionMode::FullAuto;
         let sandbox = Sandbox::new(cfg);
 
         let escape = home.join("chattui_iso_escape_probe");
         let _ = std::fs::remove_file(&escape);
 
-        // Write outside the workspace: the kernel must refuse it. The shell
-        // still exits normally, so the denial shows up in stderr output.
-        let out = sandbox
+        // Write outside the workspace: the kernel must refuse it, and
+        // nonzero shell status must propagate instead of faking success.
+        let err = sandbox
             .bash(&format!("touch '{}'", escape.display()))
             .await
-            .expect("the shell itself must run");
-        let lower = out.to_ascii_lowercase();
+            .unwrap_err();
+        let lower = err.to_string().to_ascii_lowercase();
         assert!(
             lower.contains("permission denied") || lower.contains("operation not permitted"),
-            "expected a filesystem denial, got: {out}"
+            "expected a filesystem denial, got: {err}"
         );
         assert!(
             !escape.exists(),
@@ -1420,18 +1654,15 @@ mod tests {
         let dir = unique_root("iso-net");
         let sandbox = Sandbox::with_root(dir);
         // `ping` needs a socket; under isolation the kernel refuses it.
-        let out = sandbox
-            .bash("ping -c1 -W1 127.0.0.1")
-            .await
-            .expect("the shell itself must run");
-        let lower = out.to_ascii_lowercase();
+        let err = sandbox.bash("ping -c1 -W1 127.0.0.1").await.unwrap_err();
+        let lower = err.to_string().to_ascii_lowercase();
         if lower.contains("not found") {
             eprintln!("skipping: ping is not installed");
             return;
         }
         assert!(
             lower.contains("permitted") || lower.contains("denied"),
-            "expected a socket permission failure, got: {out}"
+            "expected a socket permission failure, got: {err}"
         );
     }
 
@@ -1456,6 +1687,7 @@ mod tests {
         assert!(out.contains("hi"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_require_mode_fails_closed_when_isolation_unsupported() {
         // Only meaningful on machines without kernel support; elsewhere the
@@ -1465,6 +1697,7 @@ mod tests {
         let mut cfg = SandboxConfig::default();
         cfg.workspace_root = dir.canonicalize().unwrap();
         cfg.os_isolation = OsIsolation::Require;
+        cfg.permission_mode = PermissionMode::FullAuto;
         let sandbox = Sandbox::new(cfg);
         let result = sandbox.bash("echo hi").await;
         if os_isolation::os_isolation_supported() {
@@ -1494,7 +1727,7 @@ mod tests {
         cfg.workspace_root = dir.canonicalize().unwrap();
         cfg.permission_mode = PermissionMode::ReadOnly;
         let sandbox = Sandbox::new(cfg);
-        let err = sandbox.read_file("missing.txt").await.unwrap_err();
+        let err = sandbox.read_file("missing.txt", 1, DEFAULT_READ_LIMIT).await.unwrap_err();
         assert!(err.to_string().contains("file not found"));
         let err = sandbox.write_file("x.txt", "y").await.unwrap_err();
         assert!(err.to_string().contains("permission denied"), "{err}");
@@ -1509,12 +1742,12 @@ mod tests {
         cfg.permission_mode = PermissionMode::WorkspaceWrite;
         let sandbox = Sandbox::new(cfg);
         sandbox.write_file("x.txt", "y").await.unwrap();
-        assert_eq!(sandbox.read_file("x.txt").await.unwrap(), "y");
+        assert!(sandbox.read_file("x.txt", 1, DEFAULT_READ_LIMIT).await.unwrap().contains("y"));
         let err = sandbox.bash("echo hi").await.unwrap_err();
         assert!(err.to_string().contains("permission denied"));
 
         // ask-before-write denies a write that was not approved (the app asks
-        // first and runs approved calls via `execute_approved_tool`).
+        // first and runs approved calls via `execute_tool_cancellable`).
         let mut cfg = SandboxConfig::default();
         cfg.workspace_root = dir.canonicalize().unwrap();
         cfg.permission_mode = PermissionMode::AskBeforeWrite;
@@ -1557,7 +1790,7 @@ mod tests {
         let write = ToolCall::new("1", "write_file", r#"{"path":"a.txt","content":"hello"}"#);
         sandbox.execute_tool(&write).await.unwrap();
         let read = ToolCall::new("2", "read_file", r#"{"path":"a.txt"}"#);
-        assert_eq!(sandbox.execute_tool(&read).await.unwrap(), "hello");
+        assert!(sandbox.execute_tool(&read).await.unwrap().contains("hello"));
         let list = ToolCall::new("3", "list_files", "{}");
         assert!(sandbox.execute_tool(&list).await.unwrap().contains("a.txt"));
     }
@@ -1635,7 +1868,7 @@ mod tests {
         while stdout.len() < MAX_TOOL_OUTPUT_BYTES + 16 {
             stdout.extend_from_slice("é".as_bytes());
         }
-        let truncated = format_shell_parts(&stdout, &[], "0");
+        let truncated = format_shell_parts(&stdout, &[], "0", false);
         assert!(truncated.len() <= MAX_TOOL_OUTPUT_BYTES + "\n... truncated".len());
         assert!(truncated.ends_with("... truncated"));
     }

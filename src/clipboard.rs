@@ -7,7 +7,7 @@
 //! length limits), so that path is always reported as best-effort, with a hint
 //! on how to get reliable copies.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use std::borrow::Cow;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 /// (stale `$DISPLAY` / `$WAYLAND_DISPLAY` pointing at a dead socket) and
 /// moving on to the next candidate. Utilities normally return in milliseconds.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const COPY_BUDGET: Duration = Duration::from_secs(5);
+const MAX_OSC52_BYTES: usize = 100_000;
 
 /// Outcome of a copy attempt.
 pub struct CopyOutcome {
@@ -30,40 +32,32 @@ pub struct CopyOutcome {
     pub hint: Option<String>,
 }
 
-/// Copy `text` to the clipboard.
-pub fn copy(text: &str) -> Result<CopyOutcome> {
+/// Probe local system clipboard utilities on a background worker. In SSH
+/// sessions a successful remote clipboard is not the user's clipboard, so
+/// skip those probes entirely and use OSC 52 on the UI thread instead.
+pub fn try_system_clipboard(text: &str) -> Option<String> {
     let env = Env::gather();
-    let system = platform_commands(&env)
+    if env.ssh { return None; }
+    let deadline = Instant::now() + COPY_BUDGET;
+    platform_commands(&env)
         .iter()
-        .find_map(|argv| try_command(argv, text));
+        .find_map(|argv| try_command_with_deadline(argv, text, deadline))
+}
 
-    if env.ssh {
-        // Over SSH a remote clipboard utility copies to the *remote* machine,
-        // which the user cannot paste from, but the terminal forwards OSC 52
-        // to the machine in front of them. So always emit OSC 52 there, even
-        // when a remote tool also succeeded.
-        write_osc52(text, &env)?;
-        return match system {
-            Some(method) => Ok(CopyOutcome {
-                method: format!("{method} + terminal clipboard (OSC 52)"),
-                verified: false,
-                hint: install_hint(&env),
-            }),
-            None => Ok(osc52_outcome(&env)),
-        };
-    }
-
-    match system {
-        Some(method) => Ok(CopyOutcome {
-            method,
-            verified: true,
-            hint: None,
-        }),
-        None => {
-            write_osc52(text, &env)?;
-            Ok(osc52_outcome(&env))
+/// Called by the UI loop after the worker reports a result. Only this path
+/// writes OSC 52 to terminal stdout, so it cannot interleave with drawing.
+pub fn finish_copy(text: &str, system: Option<String>) -> Result<CopyOutcome> {
+    let env = Env::gather();
+    if !env.ssh {
+        if let Some(method) = system {
+            return Ok(CopyOutcome { method, verified: true, hint: None });
         }
     }
+    if text.len() > MAX_OSC52_BYTES {
+        bail!("code block is too large for the terminal clipboard fallback; install a system clipboard tool or copy a smaller block");
+    }
+    write_osc52(text, &env)?;
+    Ok(osc52_outcome(&env))
 }
 
 /// Best-effort outcome for the OSC 52 fallback path.
@@ -197,8 +191,14 @@ fn clipboard_payload<'a>(program: &str, text: &'a str) -> Cow<'a, str> {
 /// Pipe `text` into a clipboard utility; report the method on success.
 /// Returns `None` when the tool is missing, fails, or hangs past
 /// [`COMMAND_TIMEOUT`]; the caller then tries the next candidate.
+#[cfg(test)]
 fn try_command(argv: &[String], text: &str) -> Option<String> {
+    try_command_with_deadline(argv, text, Instant::now() + COMMAND_TIMEOUT)
+}
+
+fn try_command_with_deadline(argv: &[String], text: &str, deadline: Instant) -> Option<String> {
     let (program, args) = argv.split_first()?;
+    if Instant::now() >= deadline { return None; }
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
@@ -206,28 +206,36 @@ fn try_command(argv: &[String], text: &str) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        // Ignore pipe errors: the tool may have exited early, successfully or
-        // not. Its exit status below is the verdict, not the pipe.
-        let _ = stdin.write_all(clipboard_payload(program, text).as_bytes());
-    }
-    let started = Instant::now();
+    let stdin = child.stdin.take()?;
+    let payload = clipboard_payload(program, text).into_owned();
+    // Pipe writes can block when a utility never reads stdin. Own the write
+    // on another thread so the same deadline covers stdin as well as wait().
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut stdin = stdin;
+        let wrote = stdin.write_all(payload.as_bytes()).is_ok();
+        drop(stdin);
+        let _ = tx.send(wrote);
+    });
+    let command_deadline = (Instant::now() + COMMAND_TIMEOUT).min(deadline);
     loop {
+        if Instant::now() >= command_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
         match child.try_wait() {
             Ok(Some(status)) => {
-                return status
-                    .success()
+                let remaining = command_deadline.saturating_duration_since(Instant::now());
+                return (status.success() && rx.recv_timeout(remaining).ok() == Some(true))
                     .then(|| format!("system clipboard ({program})"));
             }
-            Ok(None) => {
-                if started.elapsed() >= COMMAND_TIMEOUT {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(10));
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
             }
-            Err(_) => return None,
         }
     }
 }

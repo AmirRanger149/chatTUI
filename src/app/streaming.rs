@@ -2,7 +2,10 @@
 //! token events frame by frame, and reporting elapsed time while it runs.
 //! Now with agent loop for tool calling.
 
-use crate::api::types::{Message, Role, StreamEvent, ToolCall, ToolDefinition};
+use crate::api::types::{
+    Message, Role, StreamEvent, ToolCall, ToolDefinition, MAX_RESPONSE_TEXT_BYTES,
+    MAX_TOOL_ARGUMENT_BYTES, MAX_TOOL_CALLS_PER_TURN, MAX_REQUEST_BYTES,
+};
 use crate::app::{
     App, Cell, RetryView, ToolRound, AGENT_CONSECUTIVE_FAILURE_LIMIT, AGENT_STAGNATION_LIMIT,
 };
@@ -11,6 +14,7 @@ use crate::session::manager::ToolCallRecord;
 use crate::tools;
 use anyhow::Result;
 use std::collections::HashSet;
+use std::sync::{atomic::AtomicBool, Arc};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
@@ -43,7 +47,15 @@ impl App {
         let mut repaired_args = 0usize;
         for m in &self.sessions.current().messages {
             let role = Role::from(m.role.as_str());
-            let mut msg = Message::new(role, crate::ui::thinking::strip(&m.content));
+            // Only assistant output may contain our reasoning markers. User
+            // input and tool output are opaque data: stripping them corrupts
+            // literal <think> text in a prompt or a file.
+            let content = if role == Role::Assistant {
+                crate::ui::thinking::strip(&m.content)
+            } else {
+                m.content.clone()
+            };
+            let mut msg = Message::new(role, content);
             if let Some(id) = &m.tool_call_id {
                 msg = msg.with_tool_call_id(id.clone());
             }
@@ -56,7 +68,8 @@ impl App {
                     .iter()
                     .map(|tc| {
                         let arguments =
-                            if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_ok() {
+                            if tc.arguments.len() <= MAX_TOOL_ARGUMENT_BYTES
+                                && serde_json::from_str::<serde_json::Value>(&tc.arguments).is_ok() {
                                 tc.arguments.clone()
                             } else {
                                 repaired_args += 1;
@@ -80,42 +93,12 @@ impl App {
             messages.push(msg);
         }
 
-        // History integrity: every assistant tool call needs a paired tool
-        // result, or OpenAI-compatible APIs reject the whole conversation.
-        // Backfill anything an interrupted round left unanswered.
-        let answered: HashSet<String> = messages
-            .iter()
-            .filter(|m| m.role == Role::Tool)
-            .filter_map(|m| m.tool_call_id.clone())
-            .collect();
-        let mut backfilled = 0usize;
-        let mut paired: Vec<Message> = Vec::with_capacity(messages.len());
-        for message in messages {
-            let missing: Vec<String> = if message.role == Role::Assistant {
-                message
-                    .tool_calls
-                    .as_ref()
-                    .map(|calls| {
-                        calls
-                            .iter()
-                            .map(|tc| tc.id.clone())
-                            .filter(|id| !answered.contains(id))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            paired.push(message);
-            for id in missing {
-                paired.push(Message::tool_result(
-                    id,
-                    "interrupted before this tool could run",
-                ));
-                backfilled += 1;
-            }
-        }
-        let mut messages = paired;
+        // Pair results with their OWN assistant turn, not a global set of
+        // ids: gateways may reuse the same id in later turns. Orphaned or
+        // duplicate results are excluded from the API request, not from the
+        // saved transcript. A missing result may mean the tool ran before a
+        // crash, so never claim it definitely did not run.
+        let (mut messages, backfilled, excluded, repaired_ids) = pair_history_tools(messages);
         if repaired_args > 0 {
             self.push_notice(format!(
                 "repaired {repaired_args} truncated tool call(s) in history before replay"
@@ -124,6 +107,16 @@ impl App {
         if backfilled > 0 {
             self.push_notice(format!(
                 "backfilled {backfilled} missing tool result(s) from an interrupted round"
+            ));
+        }
+        if repaired_ids > 0 {
+            self.push_notice(format!(
+                "repaired {repaired_ids} duplicate or empty tool call id(s) for API replay"
+            ));
+        }
+        if excluded > 0 {
+            self.push_notice(format!(
+                "excluded {excluded} orphan or duplicate tool result(s) from API replay; saved history is unchanged"
             ));
         }
 
@@ -174,6 +167,20 @@ impl App {
             Vec::new()
         };
 
+        let request_bytes: usize = messages.iter()
+            .map(|message| message.content.len() + message.tool_call_id.as_ref().map_or(0, String::len)
+                + message.tool_calls.as_ref().map_or(0, |calls| calls.iter()
+                    .map(|call| call.arguments.len() + call.name.len() + call.id.len()
+                        + call.signature.as_ref().map_or(0, String::len)).sum::<usize>()))
+            .sum::<usize>()
+            + tool_defs.iter().map(|tool| tool.name.len() + tool.description.len()
+                + tool.parameters.to_string().len()).sum::<usize>();
+        if request_bytes > MAX_REQUEST_BYTES {
+            return Err(anyhow::anyhow!(
+                "conversation exceeds the 8 MiB request limit — start a new session or shorten the history"
+            ));
+        }
+
         let task = tokio::spawn(async move {
             if let Err(error) = client
                 .stream_chat(&messages, &model, temperature, tool_defs, tx.clone())
@@ -192,19 +199,31 @@ impl App {
     pub async fn receive_token(&mut self) {
         // A tool round parked on an approval prompt resumes as soon as the
         // user has answered; until then there is nothing to do.
-        if matches!(&self.tool_round, Some(round) if round.answer.is_some()) {
+        if self.tool_round.is_some() {
+            // Poll one in-flight tool without awaiting unfinished work. Keys,
+            // redraws and cancellation keep running on the terminal loop.
             self.run_tool_round().await;
             return;
         }
         let Some(mut rx) = self.tokens.take() else {
             return;
         };
-        let mut has_tool_calls = false;
         loop {
             match rx.try_recv() {
                 Ok(StreamEvent::Delta(token)) => {
                     // Tokens are flowing again: the retry countdown is over.
                     self.retry_state = None;
+                    if self.response.len().saturating_add(token.len()) > MAX_RESPONSE_TEXT_BYTES {
+                        if let Some(task) = self.stream_task.take() {
+                            task.abort();
+                        }
+                        self.tokens = None;
+                        self.pending_tool_calls.clear();
+                        self.truncated_tool_calls.clear();
+                        self.finish_run();
+                        self.push_error("response exceeded the size limit; stopped before using any tool calls".into());
+                        return;
+                    }
                     self.response.push_str(&token);
                 }
                 Ok(StreamEvent::ToolCall(tc)) => {
@@ -213,11 +232,32 @@ impl App {
                     // that do not parse were cut mid-stream. Record the id
                     // so execution returns an explicit error and the stored
                     // record keeps replayable JSON.
+                    let existing_bytes: usize = self.pending_tool_calls.iter()
+                        .map(|call| call.id.len() + call.name.len() + call.arguments.len()
+                            + call.signature.as_ref().map_or(0, String::len)).sum();
+                    if self.pending_tool_calls.len() >= MAX_TOOL_CALLS_PER_TURN
+                        || existing_bytes.saturating_add(tc.id.len())
+                            .saturating_add(tc.name.len()).saturating_add(tc.arguments.len())
+                            .saturating_add(tc.signature.as_ref().map_or(0, String::len)) > MAX_REQUEST_BYTES
+                        || tc.arguments.len() > MAX_TOOL_ARGUMENT_BYTES
+                        || tc.id.is_empty() || tc.id.len() > 256 || tc.name.len() > 256
+                        || tc.signature.as_ref().is_some_and(|signature| signature.len() > 64 * 1024)
+                        || self.pending_tool_calls.iter().any(|previous| previous.id == tc.id)
+                    {
+                        if let Some(task) = self.stream_task.take() {
+                            task.abort();
+                        }
+                        self.tokens = None;
+                        self.pending_tool_calls.clear();
+                        self.truncated_tool_calls.clear();
+                        self.finish_run();
+                        self.push_error("invalid, duplicate or oversized tool call — none were executed".into());
+                        return;
+                    }
                     if serde_json::from_str::<serde_json::Value>(&tc.arguments).is_err() {
                         self.truncated_tool_calls.insert(tc.id.clone());
                     }
                     self.pending_tool_calls.push(tc);
-                    has_tool_calls = true;
                 }
                 Ok(StreamEvent::Notice(message)) => {
                     self.push_notice(message);
@@ -244,6 +284,7 @@ impl App {
                     self.streaming = false;
                     self.stream_started = None;
                     self.pending_tool_calls.clear();
+                    self.truncated_tool_calls.clear();
                     self.reset_agent_health();
                     self.push_error(error);
                     return;
@@ -260,7 +301,7 @@ impl App {
         self.retry_state = None;
 
         // Stream finished - check for agent loop
-        if self.streaming && has_tool_calls && !self.pending_tool_calls.is_empty() {
+        if self.streaming && !self.pending_tool_calls.is_empty() {
             // Save assistant message with tool calls
             let response_text = std::mem::take(&mut self.response);
             let pending = std::mem::take(&mut self.pending_tool_calls);
@@ -286,8 +327,20 @@ impl App {
             for tc in &pending {
                 self.push_tool_call(tc);
             }
-            self.sessions
-                .add_assistant_with_tools(response_text, tool_records);
+            let saved = self.sessions.add_assistant_with_tools(response_text, tool_records);
+            if !self.report_save(saved) {
+                // Never perform a side effect when we cannot first record
+                // the model's intent for crash-safe history replay.
+                for call in &pending {
+                    let note = "not run: assistant tool calls could not be saved".to_string();
+                    self.push_tool_result(call.id.clone(), note.clone(), true);
+                    let saved = self.sessions.add_tool_result(call.id.clone(), note, true);
+                    self.report_save(saved);
+                }
+                self.push_error("tools not run because the conversation could not be saved".into());
+                self.finish_run();
+                return;
+            }
 
             // Run the round's tools. A call that needs the user's OK parks
             // the round (see `run_tool_round`); it resumes from the top of
@@ -297,6 +350,9 @@ impl App {
                 next: 0,
                 failures: 0,
                 answer: None,
+                in_flight: None,
+                cancelled: false,
+                cancel: Arc::new(AtomicBool::new(false)),
             });
             self.run_tool_round().await;
             return;
@@ -325,7 +381,7 @@ impl App {
     pub fn approval_request(&self) -> Option<&ToolCall> {
         self.tool_round
             .as_ref()
-            .filter(|round| round.answer.is_none())
+            .filter(|round| round.in_flight.is_none() && !round.cancelled && round.answer.is_none())
             .and_then(|round| round.calls.get(round.next))
     }
 
@@ -334,68 +390,124 @@ impl App {
         self.approval_request().is_some()
     }
 
+    pub fn has_inflight_tool(&self) -> bool {
+        self.tool_round.as_ref().is_some_and(|round| round.in_flight.is_some())
+    }
+
+    pub fn is_stopping_tool(&self) -> bool {
+        self.tool_round.as_ref().is_some_and(|round| round.cancelled && round.in_flight.is_some())
+    }
+
     /// `y` / `n` on the approval prompt: record the answer. The paused round
     /// acts on it at the next `receive_token`.
     pub fn answer_approval(&mut self, approved: bool) {
         if let Some(round) = self
             .tool_round
             .as_mut()
-            .filter(|round| round.answer.is_none())
+            .filter(|round| round.in_flight.is_none() && !round.cancelled && round.answer.is_none())
         {
             round.answer = Some(approved);
         }
     }
 
-    /// Run the round in `self.tool_round` until it finishes or needs the
-    /// user's answer. Tools are permission-gated inside the sandbox. Each
-    /// error — including timeouts, path escapes, permission denials and
-    /// declined approvals — is returned to the model as a structured tool
-    /// error result instead of aborting the loop.
+    /// Drive one tool round without waiting for a subprocess or filesystem
+    /// operation on the UI loop. Only one call runs at a time, preserving the
+    /// model's order. Esc signals the shell worker or waits for a file tool's
+    /// actual result, then records errors for calls never started.
     async fn run_tool_round(&mut self) {
         let Some(mut round) = self.tool_round.take() else {
             return;
         };
-        let sandbox = self.sandbox.clone();
-        while round.next < round.calls.len() {
+        loop {
+            if let Some(task) = round.in_flight.as_ref() {
+                if !task.is_finished() {
+                    self.tool_round = Some(round);
+                    return;
+                }
+                let task = round.in_flight.take().expect("checked above");
+                let outcome = match task.await {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!("tool task stopped unexpectedly: {error}")),
+                };
+                let id = round.calls[round.next].id.clone();
+                if !self.record_tool_outcome(&id, outcome, &mut round.failures) {
+                    round.cancelled = true;
+                }
+                round.next += 1;
+                continue;
+            }
+
+            if round.cancelled {
+                for call in round.calls.iter().skip(round.next) {
+                    let note = "interrupted by the user before this tool could run".to_string();
+                    self.push_tool_result(call.id.clone(), note.clone(), true);
+                    let saved = self.sessions.add_tool_result(call.id.clone(), note, true);
+                    self.report_save(saved);
+                }
+                self.truncated_tool_calls.clear();
+                self.push_notice("agent stopped before running the remaining tool calls".into());
+                self.finish_run();
+                return;
+            }
+            if round.next == round.calls.len() {
+                self.finish_tool_round(&round);
+                return;
+            }
+
             let call = round.calls[round.next].clone();
-            // An answer belongs to the call it was given for; never carry
-            // it over to the next one.
             let answer = round.answer.take();
             let outcome = if self.truncated_tool_calls.contains(&call.id) {
-                Err(anyhow::anyhow!(
+                Some(Err(anyhow::anyhow!(
                     "tool call arguments arrived truncated (the stream was cut mid-call) — retry with smaller edits"
-                ))
-            } else if !self.needs_approval(&call) {
-                sandbox.execute_tool(&call).await
-            } else {
+                )))
+            } else if self.needs_approval(&call) {
                 match answer {
-                    Some(true) => sandbox.execute_approved_tool(&call).await,
-                    Some(false) => Err(anyhow::anyhow!(
+                    Some(false) => Some(Err(anyhow::anyhow!(
                         "the user declined to approve this {} call, so it was not run — do not repeat it as-is; ask the user how to proceed",
                         call.name
-                    )),
+                    ))),
+                    Some(true) => {
+                        self.start_tool_task(round, call, true);
+                        return;
+                    }
                     None => {
-                        // Not asked yet: park the round. The prompt shows
-                        // and the UI keeps running until the user answers.
                         self.tool_round = Some(round);
                         return;
                     }
                 }
+            } else {
+                self.start_tool_task(round, call, false);
+                return;
             };
-            let (content, is_error) = match outcome {
-                Ok(output) => (output, false),
-                Err(e) => (format!("Error: {}", e), true),
-            };
-            round.failures += usize::from(is_error);
-            // Record each result as soon as it exists, so the user sees it
-            // before being asked about the next call.
-            self.push_tool_result(call.id.clone(), content.clone(), is_error);
-            self.sessions.add_tool_result(call.id.clone(), content);
-            // The truncation verdict for this call has been consumed.
-            self.truncated_tool_calls.remove(&call.id);
-            round.next += 1;
+            if let Some(outcome) = outcome {
+                if !self.record_tool_outcome(&call.id, outcome, &mut round.failures) {
+                    round.cancelled = true;
+                }
+                round.next += 1;
+            }
         }
-        self.finish_tool_round(&round);
+    }
+
+    fn start_tool_task(&mut self, mut round: ToolRound, call: ToolCall, approved: bool) {
+        let sandbox = self.sandbox.clone();
+        let cancel = round.cancel.clone();
+        round.in_flight = Some(tokio::spawn(async move {
+            sandbox.execute_tool_cancellable(&call, approved, cancel).await
+        }));
+        self.tool_round = Some(round);
+    }
+
+    fn record_tool_outcome(&mut self, id: &str, outcome: anyhow::Result<String>, failures: &mut usize) -> bool {
+        let (content, is_error) = match outcome {
+            Ok(output) => (output, false),
+            Err(error) => (format!("Error: {error}"), true),
+        };
+        *failures += usize::from(is_error);
+        self.push_tool_result(id.to_string(), content.clone(), is_error);
+        let saved = self.sessions.add_tool_result(id.to_string(), content, is_error);
+        let persisted = self.report_save(saved);
+        self.truncated_tool_calls.remove(id);
+        persisted
     }
 
     /// Every call of the round has run: decide whether the agent loop may
@@ -470,7 +582,66 @@ impl App {
         self.finish_partial();
         self.reset_agent_health();
         self.pending_tool_calls.clear();
+        self.truncated_tool_calls.clear();
     }
+}
+
+
+/// Normalize a saved transcript for API replay without modifying the on-disk
+/// history. Results must immediately follow the assistant turn that requested
+/// them, including when ids were reused in a later turn or a crash cut a
+/// round short. Matching uses the original id before any duplicate-id repair.
+fn pair_history_tools(messages: Vec<Message>) -> (Vec<Message>, usize, usize, usize) {
+    let mut iter = messages.into_iter().peekable();
+    let mut paired = Vec::new();
+    let (mut backfilled, mut excluded, mut repaired_ids) = (0, 0, 0);
+    while let Some(mut message) = iter.next() {
+        if message.role == Role::Tool {
+            excluded += 1;
+            continue;
+        }
+        if message.role != Role::Assistant
+            || message.tool_calls.as_ref().map_or(true, Vec::is_empty)
+        {
+            paired.push(message);
+            continue;
+        }
+        let mut results = Vec::new();
+        while iter.peek().is_some_and(|next| next.role == Role::Tool) {
+            results.push(iter.next().expect("peeked a tool result"));
+        }
+        let mut seen = HashSet::new();
+        let turn = paired.len();
+        let mut ordered = Vec::new();
+        for (index, call) in message.tool_calls.as_mut().expect("checked above").iter_mut().enumerate() {
+            let original_id = call.id.clone();
+            if call.id.is_empty() || !seen.insert(call.id.clone()) {
+                call.id = format!("{}:replay_{turn}_{index}", call.name);
+                // A malformed legacy history might already contain that id.
+                while !seen.insert(call.id.clone()) {
+                    call.id.push('_');
+                }
+                repaired_ids += 1;
+            }
+            if let Some(pos) = results.iter().position(|result: &Message| {
+                result.tool_call_id.as_deref() == Some(original_id.as_str())
+            }) {
+                let mut result = results.remove(pos);
+                result.tool_call_id = Some(call.id.clone());
+                ordered.push(result);
+            } else {
+                ordered.push(Message::tool_result(
+                    call.id.clone(),
+                    "result unavailable after interrupted history; the tool may have run — verify before retrying",
+                ));
+                backfilled += 1;
+            }
+        }
+        excluded += results.len();
+        paired.push(message);
+        paired.extend(ordered);
+    }
+    (paired, backfilled, excluded, repaired_ids)
 }
 
 #[cfg(test)]
@@ -541,11 +712,95 @@ mod tests {
         assert_eq!(app.cells[1], Cell::Assistant("hel".into()));
     }
 
+    #[test]
+    fn replay_pairs_reused_ids_with_their_own_turn_only() {
+        let a = Message::new(Role::Assistant, "")
+            .with_tool_calls(vec![ToolCall::new("same", "read_file", "{}")]);
+        let (paired, backfilled, excluded, repaired) = pair_history_tools(vec![
+            a.clone(), Message::tool_result("same", "first result"),
+            a, Message::new(Role::User, "next question"),
+            Message::tool_result("same", "orphaned late result"),
+        ]);
+        assert_eq!((backfilled, excluded, repaired), (1, 1, 0));
+        assert_eq!(paired.len(), 5);
+        assert_eq!(paired[1].content, "first result");
+        assert_eq!(paired[2].role, Role::Assistant);
+        assert!(paired[3].content.contains("may have run"));
+        assert_eq!(paired[4].role, Role::User);
+    }
+
+    #[test]
+    fn replay_repairs_duplicate_ids_and_reorders_results() {
+        let assistant = Message::new(Role::Assistant, "").with_tool_calls(vec![
+            ToolCall::new("same", "read_file", "{}"),
+            ToolCall::new("same", "write_file", "{}"),
+        ]);
+        let (paired, backfilled, excluded, repaired) = pair_history_tools(vec![
+            assistant,
+            Message::tool_result("same", "first"),
+            Message::tool_result("same", "second"),
+        ]);
+        assert_eq!((backfilled, excluded, repaired), (0, 0, 1));
+        let calls = paired[0].tool_calls.as_ref().unwrap();
+        assert_ne!(calls[0].id, calls[1].id);
+        assert_eq!(paired[1].tool_call_id.as_deref(), Some(calls[0].id.as_str()));
+        assert_eq!(paired[2].tool_call_id.as_deref(), Some(calls[1].id.as_str()));
+    }
+
+    /// Background tools need further UI ticks, but never block one tick.
+    async fn settle(app: &mut App) {
+        for _ in 0..200 {
+            app.receive_token().await;
+            if app.tool_round.is_none() || app.awaiting_approval() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("tool round did not settle");
+    }
+
+    #[tokio::test]
+    async fn tool_call_survives_a_split_poll_and_runs_once() {
+        let mut app = agent_app("split-poll");
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        app.tokens = Some(rx);
+        app.streaming = true;
+        tx.send(tool_call_event("c1", "list_files", "{}"))
+            .await.unwrap();
+        app.receive_token().await;
+        assert_eq!(app.pending_tool_calls.len(), 1);
+        assert!(app.cells.iter().all(|cell| !matches!(cell, Cell::ToolResult { .. })));
+        drop(tx);
+        settle(&mut app).await;
+        assert_eq!(saved_tool_result_ids(&app), vec!["c1"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn esc_during_a_shell_command_keeps_the_ui_responsive() {
+        let mut app = agent_app("shell-interrupt");
+        app.sandbox.config.permission_mode = PermissionMode::FullAuto;
+        app.sandbox.config.shell_timeout = Duration::from_secs(3);
+        feed(&mut app, vec![tool_call_event("c1", "bash", r#"{"command":"sleep 30"}"#)]);
+        app.receive_token().await; // schedules work, does not await sleep
+        assert!(app.streaming);
+        app.interrupt();
+        assert!(app.streaming); // wait for the actual outcome, not a fake denial
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while app.streaming {
+                app.receive_token().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("shell cancellation should complete promptly");
+        assert_eq!(saved_tool_result_ids(&app), vec!["c1"]);
+        assert!(app.cells.iter().any(|cell| matches!(cell, Cell::ToolResult { is_error: true, .. })));
+    }
+
     #[tokio::test]
     async fn tool_rounds_execute_and_stop_predictably_when_restart_fails() {
         let mut app = agent_app("restart-fail");
         feed(&mut app, vec![tool_call_event("c1", "list_files", "{}")]);
-        app.receive_token().await;
+        settle(&mut app).await;
 
         // The tool actually ran.
         assert!(app.cells.iter().any(|c| matches!(
@@ -567,7 +822,7 @@ mod tests {
         let mut app = agent_app("ceiling");
         app.agent_iterations = app.agent_max_rounds;
         feed(&mut app, vec![tool_call_event("c1", "list_files", "{}")]);
-        app.receive_token().await;
+        settle(&mut app).await;
 
         // The final round's tool still ran and its result was recorded…
         assert!(app
@@ -612,7 +867,7 @@ mod tests {
                 &mut app,
                 vec![tool_call_event(&format!("c{rounds}"), "list_files", "{}")],
             );
-            app.receive_token().await;
+            settle(&mut app).await;
             rounds += 1;
             assert!(rounds < 100, "agent loop failed to terminate");
             if !app.streaming {
@@ -645,7 +900,7 @@ mod tests {
                     r#"{"path":"x","content":"y"}"#,
                 )],
             );
-            app.receive_token().await;
+            settle(&mut app).await;
             assert!(!app.streaming);
             assert!(app.cells.iter().any(|c| matches!(
                 c,
@@ -664,7 +919,7 @@ mod tests {
             &mut app,
             vec![tool_call_event("c1", "bash", r#"{"command":"echo hi"}"#)],
         );
-        app.receive_token().await;
+        settle(&mut app).await;
         assert!(app.cells.iter().any(|c| matches!(
             c,
             Cell::ToolResult { is_error: true, content, .. }
@@ -684,7 +939,7 @@ mod tests {
                 r#"{"new_string": "#,
             ))],
         );
-        app.receive_token().await;
+        settle(&mut app).await;
 
         // The model sees an error that names the real problem…
         assert!(app.cells.iter().any(|c| matches!(
@@ -714,7 +969,7 @@ mod tests {
                 arguments: r#"{"new_string": "#.into(),
                 signature: None,
             }],
-        );
+        ).unwrap();
 
         app.start_stream().expect("stream starts");
 
@@ -759,7 +1014,7 @@ mod tests {
                     r#"{"path":"x","content":"y"}"#,
                 )],
             );
-            app.receive_token().await;
+            settle(&mut app).await;
         }
 
         // Third identical failing round: the stagnation guard stops the run.
@@ -785,7 +1040,7 @@ mod tests {
                     &format!(r#"{{"path":"f{round}","content":"y"}}"#),
                 )],
             );
-            app.receive_token().await;
+            settle(&mut app).await;
         }
 
         assert!(!app.streaming);
@@ -796,6 +1051,32 @@ mod tests {
     }
 
     // ---- manual approval (`/approve`) and the `ask-*` permission modes ----
+
+    #[test]
+    fn default_shell_approval_gate_tracks_manual_and_explicit_ask_modes() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        let mut app = App::new(config, SessionManager::for_tests());
+        let shell = ToolCall::new("c1", "bash", r#"{"command":"echo ok"}"#);
+        assert_eq!(app.sandbox.config.permission_mode, PermissionMode::FullAuto);
+        assert!(!app.manual_approval);
+        assert!(!app.needs_approval(&shell));
+
+        app.composer = "/approve manual".into();
+        app.submit();
+        assert!(app.needs_approval(&shell));
+        app.composer = "/approve auto".into();
+        app.submit();
+        assert!(!app.needs_approval(&shell));
+
+        let config: Config =
+            serde_json::from_str(r#"{"sandbox":{"permission_mode":"ask-before-shell"}}"#).unwrap();
+        let app = App::new(config, SessionManager::for_tests());
+        assert_eq!(
+            app.sandbox.config.permission_mode,
+            PermissionMode::AskBeforeShell
+        );
+        assert!(app.needs_approval(&shell));
+    }
 
     /// A manual-approval agent whose first round is parked on a `write_file`
     /// prompt (`a.txt` ← "hi").
@@ -810,7 +1091,7 @@ mod tests {
                 r#"{"path":"a.txt","content":"hi"}"#,
             )],
         );
-        app.receive_token().await;
+        settle(&mut app).await;
         app
     }
 
@@ -868,8 +1149,8 @@ mod tests {
         assert!(shown.contains("Waiting for your approval"), "{shown}");
 
         // More ticks change nothing while the user decides.
-        app.receive_token().await;
-        app.receive_token().await;
+        settle(&mut app).await;
+        settle(&mut app).await;
         assert!(app.awaiting_approval());
         assert!(!file.exists());
 
@@ -879,7 +1160,7 @@ mod tests {
         app.answer_approval(true);
         assert!(!app.awaiting_approval());
         assert!(!file.exists());
-        app.receive_token().await;
+        settle(&mut app).await;
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hi");
         assert!(app.cells.iter().any(|c| matches!(
             c,
@@ -901,7 +1182,7 @@ mod tests {
         let file = app.sandbox.config.workspace_root.join("a.txt");
 
         app.answer_approval(false);
-        app.receive_token().await;
+        settle(&mut app).await;
 
         assert!(!file.exists());
         assert!(app.cells.iter().any(|c| matches!(
@@ -926,7 +1207,7 @@ mod tests {
         let mut app = agent_app("manual-read");
         app.manual_approval = true;
         feed(&mut app, vec![tool_call_event("c1", "list_files", "{}")]);
-        app.receive_token().await;
+        settle(&mut app).await;
         assert!(!app.awaiting_approval());
         assert!(app.cells.iter().any(|c| matches!(
             c,
@@ -949,7 +1230,7 @@ mod tests {
                 r#"{"path":"a.txt","content":"hi"}"#,
             )],
         );
-        app.receive_token().await;
+        settle(&mut app).await;
         assert!(!app.awaiting_approval());
         assert!(app.cells.iter().any(|c| matches!(
             c,
@@ -972,7 +1253,7 @@ mod tests {
                 tool_call_event("c3", "bash", r#"{"command":"echo hi"}"#),
             ],
         );
-        app.receive_token().await;
+        settle(&mut app).await;
         // The read ran; the write waits, with the shell queued behind it.
         assert_eq!(
             app.approval_request().map(|call| call.id.as_str()),
@@ -992,7 +1273,7 @@ mod tests {
         // saved conversation can be replayed to the API later.
         assert_eq!(saved_tool_result_ids(&app), vec!["c1", "c2", "c3"]);
         // And nothing resumes afterwards.
-        app.receive_token().await;
+        settle(&mut app).await;
         assert!(!file.exists());
         assert_eq!(saved_tool_result_ids(&app).len(), 3);
     }
@@ -1004,8 +1285,8 @@ mod tests {
         // A second, empty conversation exists (index 0); back to the first
         // one (now index 1), where the round is paused, then pick the new
         // one in the history list.
-        app.sessions.new_session();
-        app.sessions.select(1);
+        app.sessions.new_session().unwrap();
+        app.sessions.select(1).unwrap();
         app.overlay = Some(crate::app::Overlay::History { selected: 0 });
         app.load_selected_session();
 
@@ -1019,7 +1300,7 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("c1")));
-        app.receive_token().await;
+        settle(&mut app).await;
         assert!(!file.exists());
         assert!(app.sessions.current().messages.is_empty());
     }
@@ -1037,7 +1318,7 @@ mod tests {
                 tool_call_event("c2", "bash", r#"{"command":"echo hi"}"#),
             ],
         );
-        app.receive_token().await;
+        settle(&mut app).await;
         // The mode asks about writes, so the write waits for a yes — even
         // though approval is on auto.
         assert_eq!(
@@ -1047,7 +1328,7 @@ mod tests {
         assert!(!file.exists());
 
         app.answer_approval(true);
-        app.receive_token().await;
+        settle(&mut app).await;
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hi");
         // The shell is not something this mode asks about, so approving the
         // write did not unlock it: refused, and without a prompt.
@@ -1090,7 +1371,7 @@ mod tests {
             press(KeyCode::Char('Y'), KeyModifiers::SHIFT)
         ));
         assert!(!app.awaiting_approval());
-        app.receive_token().await;
+        settle(&mut app).await;
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hi");
 
         // `n` declines.
@@ -1100,7 +1381,7 @@ mod tests {
             &mut app,
             press(KeyCode::Char('n'), KeyModifiers::NONE)
         ));
-        app.receive_token().await;
+        settle(&mut app).await;
         assert!(!file.exists());
         assert!(app.cells.iter().any(|c| matches!(
             c,

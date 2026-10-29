@@ -32,6 +32,7 @@ use crate::sandbox::{Sandbox, SandboxConfig};
 use crate::session::manager::SessionManager;
 use anyhow::Result;
 use std::collections::HashSet;
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Receiver;
@@ -40,6 +41,7 @@ use tokio::task::JoinHandle;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PLACEHOLDER: &str = "Ask chatTUI to do anything";
 pub const MAX_COMPOSER_ROWS: usize = 8;
+pub const MAX_COMPOSER_BYTES: usize = 1024 * 1024;
 /// Number of rows visible inside overlay lists (history / models / code); also
 /// the page size for pgup/pgdn navigation within an overlay.
 pub const OVERLAY_ROWS: usize = 12;
@@ -94,11 +96,15 @@ pub struct RetryView {
     pub reason: String,
 }
 
-/// A tool round paused on an approval prompt. A round's calls run in order;
-/// when one needs the user's OK the round is parked in `App::tool_round` and
-/// the UI keeps running, so the prompt can be drawn and answered. It resumes
-/// from `receive_token` once `answer` is set. A round only lives in `App`
-/// while it is paused: one that needs no answers runs to the end in one go.
+/// A clipboard request whose utility probe is still running on a worker.
+pub(crate) struct ClipboardPending {
+    pub text: String,
+    pub lang: String,
+    pub lines: usize,
+}
+
+/// One ordered agent tool round. Either parked on approval or polling one
+/// background task; terminal input and redraws never await the task.
 struct ToolRound {
     calls: Vec<ToolCall>,
     /// Index of the call that runs next — while parked, the one being asked about.
@@ -107,6 +113,12 @@ struct ToolRound {
     failures: usize,
     /// The user's answer for `calls[next]`; `None` while the prompt is up.
     answer: Option<bool>,
+    /// At most one tool at a time; results are recorded in model order.
+    in_flight: Option<JoinHandle<Result<String>>>,
+    /// Esc requests cancellation. The current file operation is allowed to
+    /// finish so we can report its actual outcome before closing the round.
+    cancelled: bool,
+    cancel: Arc<AtomicBool>,
 }
 
 pub struct App {
@@ -145,9 +157,9 @@ pub struct App {
     /// Tool rounds completed in the current agent run (display + ceiling).
     pub agent_iterations: usize,
     pub agent_mode: bool,
-    /// `/approve`: `false` = auto (tools run on their own), `true` = manual
-    /// (the agent pauses for the user's OK before it writes, edits or runs
-    /// shell commands). Always starts in auto.
+    /// `/approve`: `false` = auto (no extra prompts; configured `ask-*`
+    /// modes still ask), `true` = manual (the agent pauses for the user's OK
+    /// before it writes, edits or runs shell commands). Starts in auto.
     pub manual_approval: bool,
     /// The tool round parked on an approval prompt, if any.
     tool_round: Option<ToolRound>,
@@ -167,14 +179,20 @@ pub struct App {
     /// Live retry state for the animated status row; `None` outside a
     /// same-model retry backoff.
     pub retry_state: Option<RetryView>,
+    /// Last persistence error, to avoid flooding the transcript while still
+    /// making unsaved history impossible to mistake for a successful save.
+    save_failure: Option<String>,
+    pub(crate) clipboard_task: Option<JoinHandle<Option<String>>>,
+    pub(crate) clipboard_pending: Option<ClipboardPending>,
 }
 
 impl App {
     pub fn new(config: Config, sessions: SessionManager) -> Self {
         // Build sandbox from config — never default to process cwd.
         // An explicit `permission_mode` wins; when it is unset the legacy
-        // auto_approve/allow_shell flags decide, as they always did. An
-        // unknown mode fails closed to read-only until the config is fixed.
+        // auto_approve/allow_shell flags decide. Their default true/true
+        // combination retains the historical full-auto behavior.
+        // An unknown mode fails closed to read-only until config is fixed.
         let (permission_mode, mode_error) = match config.sandbox.permission_mode.as_deref() {
             Some(raw) if !raw.trim().is_empty() => match PermissionMode::parse(raw) {
                 Some(mode) => (mode, None),
@@ -264,6 +282,9 @@ impl App {
             agent_consecutive_failures: 0,
             truncated_tool_calls: HashSet::new(),
             retry_state: None,
+            save_failure: None,
+            clipboard_task: None,
+            clipboard_pending: None,
         };
         app.rebuild_cells();
         if let Some(error) = target_error {
@@ -313,7 +334,7 @@ impl App {
                     self.cells.push(Cell::ToolResult {
                         id,
                         content: message.content.clone(),
-                        is_error: false,
+                        is_error: message.is_error,
                     });
                 }
                 "user" => {
@@ -343,25 +364,31 @@ impl App {
     }
 
     pub fn interrupt(&mut self) {
-        // Abort the in-flight LLM request: dropping its future closes the
-        // HTTP stream. Tool execution runs inline on this loop and is
-        // bounded by the shell timeout, so no separate tool process can
-        // outlive the interrupt.
         if let Some(task) = self.stream_task.take() {
             task.abort();
         }
         self.tokens = None;
+        // Do not pretend an in-flight file write was never run: the OS may
+        // finish it even after its async future is dropped. Keep the round
+        // and the UI alive until its result is known; the shell checks this
+        // cancellation signal and kills its process group promptly.
+        if let Some(round) = self.tool_round.as_mut() {
+            round.cancelled = true;
+            round.cancel.store(true, Ordering::SeqCst);
+            if round.in_flight.is_some() {
+                self.push_notice("stopping agent — waiting for the current tool to finish".into());
+                return;
+            }
+        }
         self.streaming = false;
         self.stream_started = None;
         self.pending_tool_calls.clear();
-        // A round paused on an approval prompt never ran its remaining
-        // calls: answer each one so the saved history keeps its
-        // assistant/tool pairing and can be replayed.
         if let Some(round) = self.tool_round.take() {
             for call in round.calls.iter().skip(round.next) {
                 let note = "interrupted by the user before this tool could run".to_string();
                 self.push_tool_result(call.id.clone(), note.clone(), true);
-                self.sessions.add_tool_result(call.id.clone(), note);
+                let saved = self.sessions.add_tool_result(call.id.clone(), note, true);
+                self.report_save(saved);
             }
         }
         self.reset_agent_health();
@@ -436,7 +463,29 @@ impl App {
                 }
             }
             self.cells.push(Cell::Assistant(text.clone()));
-            self.sessions.add_message("assistant", text);
+            let saved = self.sessions.add_message("assistant", text);
+            self.report_save(saved);
+        }
+    }
+
+    pub(crate) fn report_save(&mut self, result: Result<()>) -> bool {
+        match result {
+            Ok(()) => {
+                if self.save_failure.take().is_some() {
+                    self.push_notice("conversation history is saving again".into());
+                }
+                true
+            }
+            Err(error) => {
+                let detail = format!("{error:#}");
+                if self.save_failure.as_deref() != Some(detail.as_str()) {
+                    self.push_error(format!(
+                        "HISTORY NOT SAVED: {detail} — changes remain in memory only"
+                    ));
+                }
+                self.save_failure = Some(detail);
+                false
+            }
         }
     }
 
@@ -505,5 +554,22 @@ mod tests {
         assert!(!app.should_quit);
         app.prime_quit();
         assert!(app.should_quit);
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(round) = &self.tool_round {
+            round.cancel.store(true, Ordering::SeqCst);
+            if let Some(task) = &round.in_flight {
+                task.abort();
+            }
+        }
+        if let Some(task) = &self.stream_task {
+            task.abort();
+        }
+        if let Some(task) = &self.clipboard_task {
+            task.abort();
+        }
     }
 }

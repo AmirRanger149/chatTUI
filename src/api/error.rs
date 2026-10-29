@@ -52,10 +52,24 @@ pub(crate) fn classify_failure(status: u16, body: &str) -> Failure {
         ));
     }
 
+    // An oversized conversation is not fixed by trying another model: it
+    // repeats the same payload (sometimes with an even smaller window).
+    if status == 413 || (matches!(status, 400 | 422)
+        && ["context length", "context window", "maximum context", "too many tokens",
+            "prompt too long", "input too long", "payload too large", "request too large"]
+            .iter().any(|phrase| lower.contains(phrase)))
+    {
+        return Failure::Fatal(compact_failure(
+            "conversation exceeds the model's context or request limit — start a new session",
+            status,
+            body,
+        ));
+    }
+
     // These statuses are the API saying "not this model / not right now":
     // bad requests against the model, missing models, payload problems. A
     // different model may well work.
-    if matches!(status, 400 | 404 | 409 | 413 | 422 | 425) {
+    if matches!(status, 400 | 404 | 409 | 422 | 425) {
         return Failure::Retryable(compact_failure(
             "the model rejected the request",
             status,
@@ -156,6 +170,7 @@ mod tests {
             classify_failure(429, "slow down"),
             Failure::Transient(_)
         ));
+        assert!(matches!(classify_failure(413, ""), Failure::Fatal(_)));
         assert!(matches!(
             classify_failure(500, "oops"),
             Failure::Transient(_)

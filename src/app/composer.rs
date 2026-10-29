@@ -1,7 +1,7 @@
 //! Composer text editing: character insertion, backspace, letter/word cursor
 //! navigation, home/end, bracketed paste, and prompt-history recall.
 
-use crate::app::App;
+use crate::app::{App, MAX_COMPOSER_BYTES};
 
 impl App {
     pub fn on_composer_changed(&mut self) {
@@ -16,7 +16,15 @@ impl App {
     }
 
     /// Replace the composer text and park the cursor at its end.
-    pub(crate) fn set_composer_text(&mut self, text: String) {
+    pub(crate) fn set_composer_text(&mut self, mut text: String) {
+        if text.len() > MAX_COMPOSER_BYTES {
+            let mut cut = MAX_COMPOSER_BYTES;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+            self.push_notice("recalled prompt truncated to the 1 MiB composer limit".into());
+        }
         self.cursor = text.len();
         self.composer = text;
     }
@@ -30,6 +38,9 @@ impl App {
     /// Insert a character at the cursor position.
     pub fn insert_char(&mut self, ch: char) {
         self.clamp_cursor();
+        if self.composer.len().saturating_add(ch.len_utf8()) > MAX_COMPOSER_BYTES {
+            return;
+        }
         self.composer.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
     }
@@ -140,6 +151,10 @@ impl App {
 
     pub fn paste(&mut self, text: &str) {
         self.clamp_cursor();
+        if self.composer.len().saturating_add(text.len()) > MAX_COMPOSER_BYTES {
+            self.push_error("paste exceeds the 1 MiB composer limit — paste a smaller excerpt".into());
+            return;
+        }
         let cleaned = text.replace("\r\n", "\n");
         self.composer.insert_str(self.cursor, &cleaned);
         self.cursor += cleaned.len();
@@ -183,7 +198,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use crate::app::App;
+    use crate::app::{App, MAX_COMPOSER_BYTES};
     use crate::config::Config;
     use crate::session::manager::SessionManager;
 

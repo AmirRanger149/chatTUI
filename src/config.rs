@@ -129,8 +129,8 @@ pub struct SandboxConfigFile {
     pub shell_timeout_secs: u64,
     /// Explicit permission mode: "read-only", "workspace-write",
     /// "ask-before-write", "ask-before-shell" or "full-auto". When unset,
-    /// the mode is derived from the legacy `auto_approve` / `allow_shell`
-    /// flags exactly as in earlier versions.
+    /// the mode is derived from the legacy flags: the default true/true
+    /// combination allows shell without approval, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     /// Kernel-level isolation for shell commands: "auto" (default — apply
@@ -202,10 +202,8 @@ pub struct Config {
         skip_serializing_if = "is_default_connect_timeout_secs"
     )]
     pub connect_timeout_secs: u64,
-    /// How long an API stream may stay quiet between chunks, in seconds,
-    /// before the connection is treated as dead (clamped to at least 1s at
-    /// use). This is *not* a cap on the total generation time — a stream
-    /// that keeps producing tokens may run as long as it needs.
+    /// Maximum gap without model progress (answer text or tool data), in
+    /// seconds. Heartbeat chunks do not reset it. Not a total generation cap.
     #[serde(
         default = "default_idle_timeout_secs",
         skip_serializing_if = "is_default_idle_timeout_secs"
@@ -685,8 +683,8 @@ mod tests {
 
     #[test]
     fn sandbox_config_defaults_are_backward_compatible() {
-        // A config without any sandbox keys keeps the historical behavior:
-        // enabled, auto-approved, shell allowed, 30s timeout.
+        // A config without sandbox keys keeps the legacy flags, which map
+        // to full-auto when no permission mode is explicitly set.
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(config.sandbox.enabled);
         assert!(config.sandbox.auto_approve);

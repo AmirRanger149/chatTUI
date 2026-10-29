@@ -17,10 +17,13 @@
 //!   full `models/{name}` path).
 //! - Tool calling uses `functionDeclarations` and `functionCall`/`functionResponse`.
 
-use super::{ChatBackend, HttpTimeouts};
+use super::{bounded_body, check_request_size, ChatBackend, HttpTimeouts};
 use crate::api::error::{classify_failure, error_detail};
 use crate::api::sse::{SseReader, MAX_CONSECUTIVE_SSE_PARSE_FAILURES};
-use crate::api::types::{CompletionRequest, Failure, Role, StreamEvent, ToolCall};
+use crate::api::types::{
+    CompletionRequest, Failure, Role, StreamEvent, ToolCall, MAX_RESPONSE_TEXT_BYTES,
+    MAX_TOOL_ARGUMENT_BYTES, MAX_TOOL_CALLS_PER_TURN,
+};
 use crate::tools;
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
@@ -83,16 +86,16 @@ impl GeminiBackend {
         })?
         .context("sending GET /models request")?;
         let status = response.status();
+        let bytes = bounded_body(response, self.idle_timeout).await
+            .context("reading the model list response")?;
         if !status.is_success() {
             return Err(anyhow!(
                 "model list request failed (HTTP {}): {}",
                 status,
-                error_detail(&response.text().await.unwrap_or_default())
+                error_detail(&String::from_utf8_lossy(&bytes))
             ));
         }
-        let value: Value = response
-            .json()
-            .await
+        let value: Value = serde_json::from_slice(&bytes)
             .context("parsing the model list response")?;
         let mut ids = value["models"]
             .as_array()
@@ -201,6 +204,8 @@ impl GeminiBackend {
             body["tools"] = tools::to_gemini_tools(&tool_defs);
         }
 
+        check_request_size(&body)?;
+
         let model = Self::path_model(&request.model);
         let url = format!(
             "{}/models/{model}:streamGenerateContent?alt=sse",
@@ -211,24 +216,35 @@ impl GeminiBackend {
             .post(url)
             .header("x-goog-api-key", &self.api_key)
             .json(&body)
-            .send()
+            .send();
+        let response = tokio::time::timeout(self.idle_timeout, response)
             .await
+            .map_err(|_| Failure::Transient(format!(
+                "request headers timed out after {}s", self.idle_timeout.as_secs()
+            )))?
             .map_err(|error| Failure::Transient(format!("request failed: {error}")))?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = bounded_body(response, self.idle_timeout).await
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_else(|error| format!("reading error response failed: {error}"));
             return Err(classify_failure(status.as_u16(), &body));
         }
         let mut stream = response.bytes_stream();
         let mut reader = SseReader::new();
+        // Keep-alive pings do not count as progress: require actual answer
+        // text or tool-call data within the configured progress window.
+        let mut progress_deadline = std::time::Instant::now() + self.idle_timeout;
         // Cumulative text of the CURRENT answer segment (see text_delta).
         let mut segment_text = String::new();
         let mut any_text = false;
         let mut finish_reason = String::new();
         let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
+        let mut previous_frame_calls: Vec<ToolCall> = Vec::new();
         let mut bad_lines = 0usize;
 
         let mut stream_ended = false;
+        let mut saw_done = false;
         loop {
             // Idle-timeout guard: a stream may run as long as it keeps
             // producing chunks, but a connection that stays quiet past
@@ -240,10 +256,12 @@ impl GeminiBackend {
             let payloads = if stream_ended {
                 break;
             } else {
-                match tokio::time::timeout(self.idle_timeout, stream.next()).await {
-                    Ok(Some(Ok(chunk))) => reader.feed(&chunk),
+                let remaining = progress_deadline.saturating_duration_since(std::time::Instant::now());
+                match tokio::time::timeout(remaining, stream.next()).await {
+                    Ok(Some(Ok(chunk))) => reader.feed(&chunk)
+                        .map_err(|error| Failure::Fatal(error.into()))?,
                     Ok(Some(Err(error))) => {
-                        return Err(if any_text || !pending_tool_calls.is_empty() {
+                        return Err(if any_text {
                             Failure::Fatal(format!(
                                 "stream interrupted after output started: {error}"
                             ))
@@ -259,13 +277,13 @@ impl GeminiBackend {
                     }
                     Err(_elapsed) => {
                         let secs = self.idle_timeout.as_secs();
-                        return Err(if any_text || !pending_tool_calls.is_empty() {
+                        return Err(if any_text {
                             Failure::Fatal(format!(
-                                "the connection went quiet for {secs}s after output started"
+                                "no model progress for {secs}s after output started"
                             ))
                         } else {
                             Failure::Transient(format!(
-                                "the connection went quiet for {secs}s before any output"
+                                "no model progress for {secs}s before any output"
                             ))
                         });
                     }
@@ -273,10 +291,9 @@ impl GeminiBackend {
             };
             for data in payloads {
                 if data == "[DONE]" {
-                    for tc in pending_tool_calls.drain(..) {
-                        let _ = tx.send(StreamEvent::ToolCall(tc)).await;
-                    }
-                    return Ok(());
+                    saw_done = true;
+                    stream_ended = true;
+                    break;
                 }
                 let value: Value = match serde_json::from_str(&data) {
                     Ok(value) => {
@@ -311,19 +328,28 @@ impl GeminiBackend {
                     finish_reason = reason.to_string();
                 }
 
-                // Check for functionCall
+                // Collect one frame first: Gemini may repeat cumulative
+                // functionCall parts in later frames. A completed call must
+                // appear once in the executable result, not once per chunk.
+                let mut frame_calls = Vec::new();
                 if let Some(parts) = value["candidates"][0]["content"]["parts"].as_array() {
                     for part in parts {
                         if let Some(func_call) = part.get("functionCall") {
                             if let Some(name) = func_call["name"].as_str() {
                                 let args = func_call["args"].clone();
+                                if name.len() > 256 || frame_calls.len() >= MAX_TOOL_CALLS_PER_TURN {
+                                    return Err(Failure::Fatal("tool call exceeded the response limit".into()));
+                                }
                                 let args_str = if args.is_object() {
                                     serde_json::to_string(&args)
                                         .unwrap_or_else(|_| "{}".to_string())
                                 } else {
                                     "{}".to_string()
                                 };
-                                let id = format!("{}:{}", name, pending_tool_calls.len());
+                                if args_str.len() > MAX_TOOL_ARGUMENT_BYTES {
+                                    return Err(Failure::Fatal("tool arguments exceeded the size limit".into()));
+                                }
+                                let id = format!("{}:{}", name, frame_calls.len());
                                 let mut tc = ToolCall::new(id, name, args_str);
                                 // The part's opaque reasoning signature is the
                                 // only carrier of the model's thinking state;
@@ -331,12 +357,20 @@ impl GeminiBackend {
                                 // (Gemini rejects turns that omit it: HTTP 400
                                 // "missing a thought_signature").
                                 if let Some(signature) = part["thoughtSignature"].as_str() {
+                                    if signature.len() > 64 * 1024 {
+                                        return Err(Failure::Fatal("tool signature exceeded the size limit".into()));
+                                    }
                                     tc = tc.with_signature(signature.to_string());
                                 }
-                                pending_tool_calls.push(tc);
+                                frame_calls.push(tc);
                             }
                         }
                     }
+                }
+                if !frame_calls.is_empty()
+                    && append_new_frame_calls(&mut pending_tool_calls, &mut previous_frame_calls, frame_calls)?
+                {
+                    progress_deadline = std::time::Instant::now() + self.idle_timeout;
                 }
 
                 // Text handling. Gemini normally streams cumulative text:
@@ -356,6 +390,9 @@ impl GeminiBackend {
                             continue; // Skip function calls for text
                         }
                         if let Some(text) = part["text"].as_str() {
+                            if full.len().saturating_add(text.len()) > MAX_RESPONSE_TEXT_BYTES {
+                                return Err(Failure::Fatal("response exceeded the size limit".into()));
+                            }
                             full.push_str(text);
                         }
                     }
@@ -366,24 +403,27 @@ impl GeminiBackend {
                         .map_err(|_| Failure::Fatal("stream receiver closed".into()))?;
                     segment_text = full;
                     any_text = true;
+                    progress_deadline = std::time::Instant::now() + self.idle_timeout;
                 }
             }
         }
 
-        // Emit pending tool calls at end
-        for tc in pending_tool_calls.drain(..) {
-            let _ = tx.send(StreamEvent::ToolCall(tc)).await;
-            any_text = true;
+        if !finish_reason.is_empty() && finish_reason != "STOP" {
+            return Err(Failure::Fatal(format!(
+                "Gemini stopped before completing its response ({finish_reason}); tool calls were not run"
+            )));
         }
-
-        if !any_text {
-            if !finish_reason.is_empty() && finish_reason != "STOP" && finish_reason != "MAX_TOKENS"
-            {
-                return Err(Failure::Fatal(format!(
-                    "Gemini stopped without an answer ({finish_reason})"
-                )));
-            }
+        if !pending_tool_calls.is_empty() && finish_reason.is_empty() && !saw_done {
+            return Err(Failure::Fatal("tool-call stream closed without a completion marker; no calls were run".into()));
+        }
+        if !any_text && pending_tool_calls.is_empty() {
             return Err(Failure::Fatal("Gemini returned an empty response".into()));
+        }
+        // Publish executable calls only on successful completion. Buffered
+        // function calls from a failed attempt can now be discarded safely.
+        for tc in pending_tool_calls {
+            tx.send(StreamEvent::ToolCall(tc)).await
+                .map_err(|_| Failure::Fatal("stream receiver closed".into()))?;
         }
         Ok(())
     }
@@ -401,6 +441,67 @@ impl ChatBackend for GeminiBackend {
     ) -> Pin<Box<dyn Future<Output = Result<(), Failure>> + Send + '_>> {
         Box::pin(self.stream_inner(request.clone(), tx))
     }
+}
+
+/// Compare function-call identity without the opaque thought signature: some
+/// cumulative frames add that signature only after an earlier frame.
+fn same_frame_call(a: &ToolCall, b: &ToolCall) -> bool {
+    a.name == b.name && a.arguments == b.arguments
+}
+
+/// Ignore repeated/cumulative function-call parts across frames, including
+/// a sliding window of already-seen parts. Keep duplicates within one frame:
+/// they can be distinct intended calls. Contradictory cumulative prefixes
+/// fail closed rather than executing both versions of an ambiguous call.
+fn append_new_frame_calls(
+    pending: &mut Vec<ToolCall>,
+    previous: &mut Vec<ToolCall>,
+    frame: Vec<ToolCall>,
+) -> Result<bool, Failure> {
+    let with_pending = frame.iter().zip(pending.iter())
+        .take_while(|(a, b)| same_frame_call(a, b)).count();
+    let with_previous = frame.iter().zip(previous.iter())
+        .take_while(|(a, b)| same_frame_call(a, b)).count();
+    let (fresh_start, match_start) = if with_pending == frame.len()
+        || with_pending == pending.len()
+    {
+        (with_pending, 0)
+    } else if with_previous == frame.len() || with_previous == previous.len() {
+        (with_previous, pending.len().saturating_sub(previous.len()))
+    } else if with_pending > 0 || with_previous > 0 {
+        return Err(Failure::Fatal("inconsistent cumulative tool-call frames; no calls were run".into()));
+    } else {
+        let overlap = (1..=previous.len().min(frame.len())).rev()
+            .find(|&n| previous[previous.len() - n..].iter()
+                .zip(&frame[..n]).all(|(a, b)| same_frame_call(a, b)))
+            .unwrap_or(0);
+        (overlap, pending.len().saturating_sub(overlap))
+    };
+    let fresh = &frame[fresh_start..];
+    if pending.len().saturating_add(fresh.len()) > MAX_TOOL_CALLS_PER_TURN {
+        return Err(Failure::Fatal("too many tool calls in one response".into()));
+    }
+    // Retain a signature received in a later cumulative frame, even though
+    // the executable call was already buffered by an earlier frame.
+    let mut signature_updated = false;
+    for (index, call) in frame[..fresh_start].iter().enumerate() {
+        if let (Some(target), Some(signature)) =
+            (pending.get_mut(match_start + index), call.signature.as_ref())
+        {
+            if target.signature.as_deref() != Some(signature) {
+                target.signature = Some(signature.clone());
+                signature_updated = true;
+            }
+        }
+    }
+    let had_new = !fresh.is_empty();
+    for call in fresh {
+        let mut call = call.clone();
+        call.id = format!("{}:{}", call.name, pending.len());
+        pending.push(call);
+    }
+    *previous = frame;
+    Ok(had_new || signature_updated)
 }
 
 /// Advance the streaming-text state with one frame's visible text and
@@ -442,6 +543,31 @@ fn function_call_part(tc: &ToolCall) -> Value {
         part["thoughtSignature"] = json!(signature);
     }
     part
+}
+
+#[cfg(test)]
+mod cumulative_call_tests {
+    use super::*;
+
+    #[test]
+    fn cumulative_frames_do_not_duplicate_an_executable_call() {
+        let mut pending = Vec::new();
+        let mut previous = Vec::new();
+        let a = ToolCall::new("a:0", "a", "{}");
+        let b = ToolCall::new("b:1", "b", "{}");
+        assert!(append_new_frame_calls(&mut pending, &mut previous, vec![a.clone()]).unwrap());
+        assert!(append_new_frame_calls(&mut pending, &mut previous, vec![a.clone().with_signature("sig")]).unwrap());
+        assert_eq!(pending[0].signature.as_deref(), Some("sig"));
+        assert!(append_new_frame_calls(&mut pending, &mut previous, vec![a, b.clone()]).unwrap());
+        assert!(!append_new_frame_calls(&mut pending, &mut previous, vec![b]).unwrap());
+        assert_eq!(pending.iter().map(|call| call.name.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+        assert_eq!(pending[0].id, "a:0");
+        assert_eq!(pending[1].id, "b:1");
+        // A fresh non-cumulative frame also receives a distinct id.
+        let c = ToolCall::new("c:0", "c", "{}");
+        assert!(append_new_frame_calls(&mut pending, &mut previous, vec![c]).unwrap());
+        assert_eq!(pending[2].id, "c:2");
+    }
 }
 
 #[cfg(test)]

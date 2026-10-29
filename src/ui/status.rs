@@ -17,6 +17,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         render_approval(frame, area, app);
         return;
     }
+    if app.is_stopping_tool() {
+        frame.render_widget(Paragraph::new("Stopping current tool… waiting for its outcome"), area);
+        return;
+    }
     if let Some(retry) = &app.retry_state {
         render_retry(frame, area, app, retry);
         return;
